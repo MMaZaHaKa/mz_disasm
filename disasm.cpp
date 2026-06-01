@@ -1127,19 +1127,22 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
     uintptr_t mapSize = AlignUp(nSize, 0x1000);
     uc_err err = uc_mem_map(m_uc, pAddr, mapSize, UC_PROT_READ | UC_PROT_WRITE);
     if (err == UC_ERR_MAP) {
-        Log("[!] UC_ERR_MAP map zero page failed: %s", uc_strerror(err));
+        if (m_bLogRunner)
+            Log("[!] UC_ERR_MAP map zero page failed: %s", uc_strerror(err));
         return;
     }
 
     if (err != UC_ERR_OK) {
-        Log("[!] map zero page failed: %s", uc_strerror(err));
+        if (m_bLogRunner)
+            Log("[!] map zero page failed: %s", uc_strerror(err));
         return;
     }
 
     uint32_t seh_head = 0;
     err = uc_mem_write(m_uc, pAddr, &seh_head, sizeof(seh_head));
     if (err != UC_ERR_OK) {
-        Log("[!] write zero page failed: %s", uc_strerror(err));
+        if (m_bLogRunner)
+            Log("[!] write zero page failed: %s", uc_strerror(err));
     }
     m_bInitedSehFS = true;
 }
@@ -1163,7 +1166,9 @@ void AsmRunner::CopyModule(const char* szModule, uintptr_t nSize)
         Shutdown();
         return;
     }
-    Log("[%s] base=0x%p end=0x%p size=0x%zx\n", szModule, (void*)pStart, (void*)pEnd, (size_t)iSize);
+
+    if (m_bLogRunner)
+        Log("[%s] base=0x%p end=0x%p size=0x%zx\n", szModule, (void*)pStart, (void*)pEnd, (size_t)iSize);
 
     uintptr_t copySize = (nSize == 0) ? iSize : nSize;
     if (!CopyModuleUC(pStart, pStart, copySize)) {
@@ -1174,10 +1179,13 @@ void AsmRunner::CopyModule(const char* szModule, uintptr_t nSize)
     m_modStart = pStart;
     m_modEnd = pEnd;
 
-    //Log("=== %s ===", szModule);
-    //Log("pStart: 0x%p", (void*)pStart);
-    //Log("pEnd:   0x%p", (void*)pEnd);
-    //Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(iSize), static_cast<size_t>(iSize / (1024 * 1024)));
+    //if (m_bLogRunner)
+    //{
+    //    Log("=== %s ===", szModule);
+    //    Log("pStart: 0x%p", (void*)pStart);
+    //    Log("pEnd:   0x%p", (void*)pEnd);
+    //    Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(iSize), static_cast<size_t>(iSize / (1024 * 1024)));
+    //}
 }
 
 void AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize)
