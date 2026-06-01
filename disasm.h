@@ -63,11 +63,22 @@ public:
 	AsmRunner(bool bX64 = false);
 	~AsmRunner();
 
-	// logger
 	void SetLogging(bool enabled) { m_bLogEnabled = enabled; }
 	bool IsLogging() const { return m_bLogEnabled; }
 	void SetDisasmAfterCB(bool enabled) { m_bDisasmAfterCB = enabled; }
 	bool IsDisasmAfterCB() const { return m_bDisasmAfterCB; }
+	void SetDisasmRVA(bool enabled, uintptr_t disasmCustomASLR = 0) { m_bDisasmRVA = enabled; m_DisasmCustomASLR = disasmCustomASLR; }
+	bool IsDisasmRVA() const { return m_bDisasmRVA; }
+	void SetLogDisasm(bool enabled) { m_bLogDisasm = enabled; }
+	bool IsLogDisasm() const { return m_bLogDisasm; }
+	void SetLogMemRW(bool enabled) { m_bLogMemRW = enabled; }
+	bool IsLogMemRW() const { return m_bLogMemRW; }
+	void SetLogAnyJmp(bool enabled) { m_bLogAnyJmp = enabled; }
+	bool IsLogAnyJmp() const { return m_bLogAnyJmp; }
+	void SetLogRunner(bool enabled) { m_bLogRunner = enabled; }
+	bool IsLogRunner() const { return m_bLogRunner; }
+	void SetX64(bool isX64) { m_bX64 = isX64; }
+	bool IsX64() const { return m_bX64; }
 
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
@@ -92,6 +103,7 @@ public:
 	void DumpMemory(uintptr_t pNativeStart, uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
 	bool IsModuleAddr(uintptr_t pAddr);
+	bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
 
 	// asm / registers / stack
 	void SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg); // bLogRunner log st ptr // default // 0=ebp+4?
@@ -167,6 +179,8 @@ private:
 	bool m_bInitedSehFS = false;
 	bool m_bX64 = false;
 	bool m_bDisasmAfterCB = false;
+	bool m_bDisasmRVA = false;
+	uintptr_t m_DisasmCustomASLR = 0;
 
 	std::vector<tFuncNode> m_sym;
 
