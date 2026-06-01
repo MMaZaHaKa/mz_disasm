@@ -507,12 +507,12 @@ void AsmRunner::DisassembleWithZydis()
     uintptr_t pc = CurrentPc(m_uc);
     std::array<uint8_t, 16> bytes{};
     if (uc_mem_read(m_uc, pc, bytes.data(), bytes.size()) != UC_ERR_OK) {
-        Log("[DISASM] 0x%p: [READ ERROR]", (void*)(m_bDisasmRVA ? (pc - m_modStart) : pc));
+        Log("[DISASM] 0x%p: [READ ERROR]", (void*)(m_bDisasmRVA ? (pc - m_modStart + m_DisasmCustomASLR) : pc));
         return;
     }
 
     std::string s = MakeDisasmLine(bytes.data(), bytes.size(), pc);
-    Log("[DISASM] 0x%p (%s): %s", (void*)(m_bDisasmRVA ? (pc - m_modStart) : pc), FormatRuntimeAddressWithSymbol(pc).c_str(), s.c_str());
+    Log("[DISASM] 0x%p (%s): %s", (void*)(m_bDisasmRVA ? (pc - m_modStart + m_DisasmCustomASLR) : pc), FormatRuntimeAddressWithSymbol(pc).c_str(), s.c_str());
 }
 
 void AsmRunner::DisassembleWithCapstone()
