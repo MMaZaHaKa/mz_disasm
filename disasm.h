@@ -71,6 +71,7 @@ public:
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
 	void Shutdown();
 	uc_engine* GetCTX();
+	uintptr_t GetInstructionCount() const { return m_instrCount; }
 
 	// tools
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
