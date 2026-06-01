@@ -600,8 +600,26 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
+    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+
+#ifdef ZYDIS
+    ZydisDecodedInstruction instr{};
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+
+    if (readOk && !bytes.empty()) {
+        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
+            bytes.data(),
+            static_cast<ZyanUSize>(bytes.size()),
+            &instr,
+            operands)))
+        {
+            mnemonic = instr.mnemonic;
+        }
+    }
+#endif
+
     if (m_cbOpcode) {
-        if (!m_cbOpcode(uc, curPc, size, m_cbOpcodeData)) {
+        if (!m_cbOpcode(uc, curPc, size, mnemonic, m_cbOpcodeData)) {
             uc_emu_stop(uc);
             return;
         }
@@ -682,6 +700,28 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
     bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
     bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT);
 
+    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+
+#ifdef ZYDIS
+    {
+        uintptr_t pc = CurrentPc(uc);
+        std::array<uint8_t, 16> bytes{};
+        if (uc_mem_read(uc, pc, bytes.data(), bytes.size()) == UC_ERR_OK) {
+            ZydisDecodedInstruction instr{};
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+
+            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
+                bytes.data(),
+                static_cast<ZyanUSize>(bytes.size()),
+                &instr,
+                operands)))
+            {
+                mnemonic = instr.mnemonic;
+            }
+        }
+    }
+#endif
+
     for (auto it = m_breakpoints.begin(); it != m_breakpoints.end(); ++it) {
         tBpInfo& bp = it->second;
         if (bp.type == BP_CODE) continue;
@@ -753,7 +793,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
     }
 
     if (m_cbMem) {
-        if (!m_cbMem(uc, static_cast<int32_t>(type), addr, sz, static_cast<uintptr_t>(value), m_cbMemData)) {
+        if (!m_cbMem(uc, static_cast<int32_t>(type), addr, sz, static_cast<uintptr_t>(value), mnemonic, m_cbMemData)) {
             uc_emu_stop(uc);
             return false;
         }
@@ -1491,8 +1531,8 @@ void TestUsage1()
 
     //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", "mdl.dll", (void*)pStart, (void*)pEnd, (size_t)nSize);
 
-    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, void* user_data) -> bool {
-        printf("OpcodeCb 0x%p\n", (void*)address);
+    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
 
         std::vector<uint8_t> bytes(size);
         if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) {
@@ -1500,7 +1540,7 @@ void TestUsage1()
             return true; // продолжаем, но логируем ошибку
         }
 
-        //if (bytes[0] == 0xC3) {
+        //if (bytes[0] == 0xC3) { // tmp
         //	printf("[RET] at 0x%p\n", (void*)address);
         //	return false; // если хочешь остановиться на RET
         //}
@@ -1509,7 +1549,7 @@ void TestUsage1()
         return true;
     };
 
-    auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, void* user_data) -> bool {
+    auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
         //printf("MemCb 0x%p\n", (void*)address);
 
         return true;

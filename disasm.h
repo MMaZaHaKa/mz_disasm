@@ -45,11 +45,11 @@ class AsmRunner // x86 x64 with macro
 public:
 	// Тип колбэка для опкода: вызывается перед выполнением инструкции
 	// ctx - контекст Unicorn, address - адрес инструкции, size - размер инструкции, user_data - пользовательские данные
-	using OnOpcodeCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t size, void* user_data)>;
+	using OnOpcodeCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data)>;
 
 	// Тип колбэка для памяти: вызывается при чтении/записи памяти
 	// type - UC_MEM_READ/UC_MEM_WRITE, address - адрес доступа, size - размер, value - значение (для записи)
-	using OnMemCb = std::function<bool(uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, void* user_data)>;
+	using OnMemCb = std::function<bool(uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data)>;
 
 	// Тип колбэка для перехода: вызывается при jmp/call/ret
 	using OnJmpCb = std::function<bool(uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic, void* user_data)>;
