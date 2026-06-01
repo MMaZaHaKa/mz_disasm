@@ -301,6 +301,9 @@ void AsmRunner::Shutdown()
     m_bStopped = false;
     m_bInitedStack = false;
     m_bInitedSehFS = false;
+    m_bDisasmAfterCB = false;
+    m_bDisasmRVA = false;
+    m_DisasmCustomASLR = 0;
 }
 
 uc_engine* AsmRunner::GetCTX()

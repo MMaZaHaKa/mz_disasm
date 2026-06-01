@@ -133,6 +133,7 @@ public:
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
+	const tFuncNode* FindSymbolByRuntime(uintptr_t rtAddr) const;
 	tFuncNode GetSymByName(const char* szName);
 	tFuncNode GetSymByAddr(uintptr_t pAddr);
 	void DisassembleWithZydis();
@@ -248,7 +249,6 @@ private:
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
 
 	// symbol helpers
-	const tFuncNode* FindSymbolByRuntime(uintptr_t rtAddr) const;
 	std::string FormatRuntimeAddress(uintptr_t rtAddr) const;
 	std::string FormatRuntimeAddressWithSymbol(uintptr_t rtAddr) const;
 	std::string FormatCurrentSymbolSuffix(uintptr_t rtAddr) const;
