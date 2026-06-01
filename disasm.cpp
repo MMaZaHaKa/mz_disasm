@@ -182,24 +182,29 @@ bool AsmRunner::CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t 
     if (!m_uc) return false;
 
     uintptr_t mapSize = AlignUp(size, 0x1000);
-    Log("[*] Copying module: 0x%p -> 0x%p (0x%zx bytes, mapped 0x%zx)", (void*)real_base, (void*)emu_base, static_cast<size_t>(size), static_cast<size_t>(mapSize));
+    if(m_bLogRunner)
+        Log("[*] Copying module: 0x%p -> 0x%p (0x%zx bytes, mapped 0x%zx)", (void*)real_base, (void*)emu_base, static_cast<size_t>(size), static_cast<size_t>(mapSize));
 
     uc_err err = uc_mem_map(m_uc, emu_base, mapSize, UC_PROT_ALL);
     if (err != UC_ERR_OK) {
-        Log("[!] Memory mapping error: %s", uc_strerror(err));
+        if (m_bLogRunner)
+            Log("[!] Memory mapping error: %s", uc_strerror(err));
         return false;
     }
 
     err = uc_mem_write(m_uc, emu_base, reinterpret_cast<void*>(real_base), size);
     if (err != UC_ERR_OK) {
-        Log("[!] Write to emulator error: %s", uc_strerror(err));
+        if (m_bLogRunner)
+            Log("[!] Write to emulator error: %s", uc_strerror(err));
         return false;
     }
 
-    Log("[+] Copied %zu bytes", static_cast<size_t>(size));
-
-    Log("pStart: 0x%p", (void*)real_base);
-    Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(size), static_cast<size_t>(size / (1024 * 1024)));
+    if (m_bLogRunner)
+    {
+        Log("[+] Copied %zu bytes", static_cast<size_t>(size));
+        Log("pStart: 0x%p", (void*)real_base);
+        Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(size), static_cast<size_t>(size / (1024 * 1024)));
+    }
 
     return true;
 }
