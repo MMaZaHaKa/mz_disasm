@@ -66,6 +66,8 @@ public:
 	// logger
 	void SetLogging(bool enabled) { m_bLogEnabled = enabled; }
 	bool IsLogging() const { return m_bLogEnabled; }
+	void SetDisasmAfterCB(bool enabled) { m_bDisasmAfterCB = enabled; }
+	bool IsDisasmAfterCB() const { return m_bDisasmAfterCB; }
 
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
@@ -164,6 +166,7 @@ private:
 	bool m_bInitedStack = false;
 	bool m_bInitedSehFS = false;
 	bool m_bX64 = false;
+	bool m_bDisasmAfterCB = false;
 
 	std::vector<tFuncNode> m_sym;
 

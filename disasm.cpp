@@ -568,7 +568,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     //    Log("%s", oss.str().c_str());
     //}
 
-    if (m_bLogDisasm || m_bLogRunner) {
+    if (!m_bDisasmAfterCB && (m_bLogDisasm || m_bLogRunner)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
         oss << "0x" << std::hex << std::uppercase << curPc;
@@ -687,6 +687,28 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 #endif
+
+    if (m_bDisasmAfterCB && (m_bLogDisasm || m_bLogRunner)) {
+        std::ostringstream oss;
+        oss << "[" << m_instrCount << "] ";
+        oss << "0x" << std::hex << std::uppercase << curPc;
+        oss << ": " << disasm;
+
+        std::string line = oss.str();
+
+        constexpr size_t kSymbolColumn = 70;
+        if (line.size() < kSymbolColumn) {
+            line += std::string(kSymbolColumn - line.size(), ' ');
+        }
+        else {
+            line += "  ";
+        }
+
+        if (!curSym.empty())
+            line += "; " + curSym;
+
+        Log("%s", line.c_str());
+    }
 
     uintptr_t pcAfter = CurrentPc(uc);
     if (m_modStart != 0 && m_modEnd != 0 && (pcAfter < m_modStart || pcAfter >= m_modEnd)) {
