@@ -110,6 +110,7 @@ public:
 	uintptr_t DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize);
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
 	bool IsModuleAddr(uintptr_t pAddr);
+	bool IsRetHaltOrNull(uintptr_t pAddr);
 	bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
 
 	// asm / registers / stack
@@ -136,7 +137,7 @@ public:
 	void Resume();
 	void Stop();
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
-	void DumpRegisters(); // and flags
+	void DumpRegisters(bool bCol = true); // and flags
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
@@ -243,8 +244,10 @@ private:
 
 	uintptr_t m_stackBase = 0x00100000;
 	uintptr_t m_stackSize = 0x00100000;
+	uintptr_t m_stackEPSize = 0x100; // m_bX64 ? 0x20 : 8
 	uintptr_t m_allocBase = 0x20000000;
 	uintptr_t m_allocCursor = 0x20000000;
+	uintptr_t m_halt = 0;
 
 	uintptr_t m_instrCount = 0;
 	uc_hook m_hkCode = 0;

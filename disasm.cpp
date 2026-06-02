@@ -555,8 +555,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if (m_modStart != 0 && m_modEnd != 0) {
         uintptr_t pc = CurrentPc(uc);
         if (pc < m_modStart || pc >= m_modEnd) {
-            Log("\n[!] %s (0x%p) out of bounds [0x%p - 0x%p]",
-                m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
+            if(m_bLogRunner && !IsRetHaltOrNull(pc))
+                Log("\n[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
             uc_emu_stop(uc);
             return;
         }
@@ -733,8 +733,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
     uintptr_t pcAfter = CurrentPc(uc);
     if (m_modStart != 0 && m_modEnd != 0 && (pcAfter < m_modStart || pcAfter >= m_modEnd)) {
-        Log("[!] %s (0x%p) out of bounds [0x%p - 0x%p]",
-            m_bX64 ? "RIP" : "EIP", (void*)pcAfter, (void*)m_modStart, (void*)m_modEnd);
+        if (m_bLogRunner && !IsRetHaltOrNull(pcAfter))
+            Log("[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pcAfter, (void*)m_modStart, (void*)m_modEnd);
         uc_emu_stop(uc);
     }
 }
@@ -1226,6 +1226,11 @@ bool AsmRunner::IsModuleAddr(uintptr_t pAddr)
     return IsInAddr(pAddr, m_modStart, m_modEnd);
 }
 
+bool AsmRunner::IsRetHaltOrNull(uintptr_t pAddr)
+{
+    return pAddr == m_halt;
+}
+
 bool AsmRunner::IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd)
 {
     if (pStart == 0 || pEnd == 0)
@@ -1255,8 +1260,11 @@ void AsmRunner::SetStack(uintptr_t pStack, uintptr_t nSize)
     if (!m_uc) return;
     uintptr_t mapSize = AlignUp(nSize, 0x1000);
     if (uc_mem_map(m_uc, pStack, mapSize, UC_PROT_READ | UC_PROT_WRITE) != UC_ERR_OK) return;
-    uintptr_t sp = pStack + mapSize - (m_bX64 ? 0x20 : 8);
+    //uintptr_t sp = pStack + mapSize - (m_bX64 ? 0x20 : 8);
+    uintptr_t sp = pStack + mapSize - m_stackEPSize; // call emu + ep args
     uc_reg_write(m_uc, SpReg(), &sp);
+    //uc_mem_write(m_uc, GetRegister(SpReg()), &m_halt, sizeof(m_halt)); // same
+    uc_mem_write(m_uc, sp, &m_halt, sizeof(m_halt));
     m_bInitedStack = true;
 }
 
@@ -1575,7 +1583,7 @@ void AsmRunner::B(intptr_t nOps)
     uc_emu_start(m_uc, pc, m_modEnd ? m_modEnd : 0, 0, count);
 }
 
-void AsmRunner::DumpRegisters()
+void AsmRunner::DumpRegisters(bool bCol)
 {
     if (!m_uc) return;
 
@@ -1602,10 +1610,23 @@ void AsmRunner::DumpRegisters()
         return oss.str();
     };
 
-    Log("=== REGISTERS ===");
-    Log("EAX/RAX=%s EBX/RBX=%s ECX/RCX=%s EDX/RDX=%s", fmt(eax).c_str(), fmt(ebx).c_str(), fmt(ecx).c_str(), fmt(edx).c_str());
-    Log("ESI/RSI=%s EDI/RDI=%s ESP/RSP=%s EBP/RBP=%s", fmt(esi).c_str(), fmt(edi).c_str(), fmt(esp).c_str(), fmt(ebp).c_str());
-    Log("%s=%s", m_bX64 ? "RIP" : "EIP", fmt(eip).c_str());
+    if (bCol) {
+        Log("=== REGISTERS ===");
+        Log("%-12s = %s", "EAX/RAX", fmt(eax).c_str());
+        Log("%-12s = %s", "EBX/RBX", fmt(ebx).c_str());
+        Log("%-12s = %s", "ECX/RCX", fmt(ecx).c_str());
+        Log("%-12s = %s", "EDX/RDX", fmt(edx).c_str());
+        Log("%-12s = %s", "ESI/RSI", fmt(esi).c_str());
+        Log("%-12s = %s", "EDI/RDI", fmt(edi).c_str());
+        Log("%-12s = %s", "ESP/RSP", fmt(esp).c_str());
+        Log("%-12s = %s", "EBP/RBP", fmt(ebp).c_str());
+        Log("%-12s = %s", m_bX64 ? "RIP" : "EIP", fmt(eip).c_str());
+    } else {
+        Log("=== REGISTERS ===");
+        Log("EAX/RAX=%s EBX/RBX=%s ECX/RCX=%s EDX/RDX=%s", fmt(eax).c_str(), fmt(ebx).c_str(), fmt(ecx).c_str(), fmt(edx).c_str());
+        Log("ESI/RSI=%s EDI/RDI=%s ESP/RSP=%s EBP/RBP=%s", fmt(esi).c_str(), fmt(edi).c_str(), fmt(esp).c_str(), fmt(ebp).c_str());
+        Log("%s=%s", m_bX64 ? "RIP" : "EIP", fmt(eip).c_str());
+    }
 }
 
 void AsmRunner::TrimInPlace(std::string& s)
@@ -2190,20 +2211,17 @@ void TestUsage1()
     //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", "mdl.dll", (void*)pStart, (void*)pEnd, (size_t)nSize);
 
     auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
         printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
+        self->DumpRegisters(true);
+        return true;
 
-        std::vector<uint8_t> bytes(size);
-        if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) {
-            printf("[!] Failed to read bytes at 0x%p\n", (void*)address);
-            return true; // продолжаем, но логируем ошибку
-        }
-
-        //if (bytes[0] == 0xC3) { // tmp
-        //	printf("[RET] at 0x%p\n", (void*)address);
-        //	return false; // если хочешь остановиться на RET
+        //std::vector<uint8_t> bytes(size);
+        //if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) {
+        //    printf("[!] Failed to read bytes at 0x%p\n", (void*)address);
+        //    return true;
         //}
 
-        // Ничего не делаем, просто возвращаем true (продолжаем выполнение)
         return true;
     };
 
@@ -2218,8 +2236,8 @@ void TestUsage1()
 
         printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
-        if (!self->IsModuleAddr(to)) {
-            //MboxSTD("module escape", "asm runner");
+        if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
+            MboxSTD("module escape", "asm runner");
             return false;
         }
 
@@ -2302,5 +2320,74 @@ void TestUsage2()
 
     runner.Run(reinterpret_cast<uintptr_t>(pEntry), 100); // 0 = без лимита по шагам
     runner.Shutdown();
+}
+
+void TestStackArgs()
+{
+    HMODULE hDll = LoadLibraryA("c_export_test_dll.dll");
+
+    if (hDll == NULL)
+    {
+        printf("Failed to load DLL\n");
+        return;
+    }
+
+    printf("DLL loaded successfully at address: %p\n", hDll);
+    void* f = GetProcAddress(hDll, "_MyMemcpy@12");
+    if (f == NULL) {
+        printf("Function not found! Error: %d\n", GetLastError());
+        return;
+    }
+    void* f2 = GetProcAddress(hDll, "_PrintMessage@4");
+    if (f2 == NULL) {
+        printf("_PrintMessage Function not found! Error: %d\n", GetLastError());
+        return;
+    }
+
+    AsmRunner runner(false);
+    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        //printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
+        self->DumpRegisters(true);
+        return true;
+    };
+
+    auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        //printf("MemCb 0x%p\n", (void*)address);
+        return true;
+    };
+
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+
+        printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+
+        if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
+            MboxSTD("module escape", "asm runner");
+            return false;
+        }
+
+        return true;
+    };
+
+    runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
+    runner.CopyModule("c_export_test_dll.dll");
+    runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
+    const char* pArg = "AZAZIN";
+    uintptr_t pEntryArg = runner.AddMemory((uintptr_t)pArg, strlen(pArg) + 1, UC_PROT_READ | UC_PROT_WRITE);
+    uintptr_t pEntryArg2 = runner.AddMemory(strlen(pArg) + 1, UC_PROT_READ | UC_PROT_WRITE);
+    printf("pEntryArg (src) = 0x%p\n", (void*)pEntryArg);
+    printf("pEntryArg2 (dest) = 0x%p\n", (void*)pEntryArg2);
+    char* buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntryArg2, strlen(pArg) + 1);
+    printf("bf from uc %s\n", buf);
+    //MyMemcpy(void *dest, const void *src, unsigned int count)
+    runner.SetEntryPointStackArg(0, pEntryArg2); // dst
+    runner.SetEntryPointStackArg(1, pEntryArg); // src
+    runner.SetEntryPointStackArg(2, strlen(pArg) + 1); // sz
+    runner.Run(reinterpret_cast<uintptr_t>(f), 300); // 0 = без лимита по шагам
+    buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntryArg2, strlen(pArg) + 1);
+    printf("af from uc %s\n", buf);
+    runner.Shutdown();
+    MboxSTD("halt", "hold");
 }
 #endif
