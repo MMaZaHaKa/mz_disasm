@@ -1505,6 +1505,43 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 
     if (m_bLogRunner) {
         Log("[*] emu end, err=%s, instr=%zu", uc_strerror(err), static_cast<size_t>(m_instrCount));
+
+        if (err != UC_ERR_OK) {
+            SetConsoleColor(0);
+            const char* errMsg = uc_strerror(err);
+            uintptr_t pc_stop = CurrentPc(m_uc);
+
+            Log("[!] emu stopped with error: %s (code: %d)", errMsg, err);
+            Log("[!] Stopped at PC = 0x%p (%s)", (void*)pc_stop, FormatRuntimeAddressWithSymbol(pc_stop).c_str());
+
+            switch (err)
+            {
+                case UC_ERR_FETCH_UNMAPPED:
+                    Log("[!] Cause: Attempt to execute code from unmapped memory");
+                    break;
+                case UC_ERR_READ_UNMAPPED:
+                    Log("[!] Cause: Attempt to read from unmapped memory");
+                    break;
+                case UC_ERR_WRITE_UNMAPPED:
+                    Log("[!] Cause: Attempt to write to unmapped memory");
+                    break;
+                case UC_ERR_FETCH_PROT:
+                    Log("[!] Cause: Attempt to execute from non-executable memory");
+                    break;
+                case UC_ERR_READ_PROT:
+                    Log("[!] Cause: Attempt to read from non-readable memory");
+                    break;
+                case UC_ERR_WRITE_PROT:
+                    Log("[!] Cause: Attempt to write to non-writable memory");
+                    break;
+                case UC_ERR_INSN_INVALID:
+                    Log("[!] Cause: Invalid instruction encountered");
+                    break;
+            }
+
+            DumpRegisters();
+            SetConsoleColor(6);
+        }
     }
 }
 
