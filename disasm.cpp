@@ -1875,7 +1875,10 @@ std::string AsmRunner::get_func_name(uintptr_t pAddr)
 FILE* AsmRunner::FileOpen(const char* filename, const char* mode)
 {
     if (!filename || !mode) return nullptr;
-    return fopen(filename, mode);
+
+    FILE* file = nullptr;
+    errno_t err = fopen_s(&file, filename, mode);
+    return err != 0 ? nullptr : file;
 }
 
 void AsmRunner::FileAdd(FILE* file, const char* fmt, ...)
