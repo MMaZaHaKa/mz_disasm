@@ -1731,28 +1731,28 @@ std::string AsmRunner::ClearStr(std::string input, std::string charsToRemove)
 std::string AsmRunner::SetName(uintptr_t pAddr, std::string name, bool snt)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "set_name(0x%X, \"%s\", SN_AUTO);", pAddr, (snt ? SanitizeIdaName(name) : name).c_str());
+    sprintf_s(buff, sizeof(buff), "set_name(0x%X, \"%s\", SN_AUTO);", pAddr, (snt ? SanitizeIdaName(name) : name).c_str());
     return std::string(buff);
 }
 
 std::string AsmRunner::SetComment(uintptr_t pAddr, std::string comment, uint32_t nType)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "set_cmt(0x%X, \"%s\", %d);", pAddr, comment.c_str(), nType);
+    sprintf_s(buff, sizeof(buff), "set_cmt(0x%X, \"%s\", %d);", pAddr, comment.c_str(), nType);
     return std::string(buff);
 }
 
 std::string AsmRunner::MakeArray(uintptr_t pAddr, uint32_t nArraySize)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "MakeArray(0x%X, %d);", pAddr, nArraySize); // kek need before define each element as type
+    sprintf_s(buff, sizeof(buff), "MakeArray(0x%X, %d);", pAddr, nArraySize); // kek need before define each element as type
     return std::string(buff);
 }
 
 std::string AsmRunner::SetType(uintptr_t pAddr, std::string type)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "SetType(0x%X, \"%s\");", pAddr, type.c_str());
+    sprintf_s(buff, sizeof(buff), "SetType(0x%X, \"%s\");", pAddr, type.c_str());
     return std::string(buff);
 }
 
@@ -1760,14 +1760,14 @@ std::string AsmRunner::SetColor(uintptr_t pAddr, uint8_t r, uint8_t g, uint8_t b
 {
     char buff[BUFF_SIZE];
     uint32_t color = (b << 16) | (g << 8) | r;
-    sprintf(buff, "SetColor(0x%X, CIC_FUNC, 0x%X);", pAddr, color); // BGR
+    sprintf_s(buff, sizeof(buff), "SetColor(0x%X, CIC_FUNC, 0x%X);", pAddr, color); // BGR
     return std::string(buff);
 }
 
 std::string AsmRunner::CreateSegment(uintptr_t pStart, uintptr_t pEnd, std::string name, bool snt)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff,
+    sprintf_s(buff, sizeof(buff),
         "AddSegEx(0x%X, 0x%X, 0, 1, 3, 2, ADDSEG_QUIET);"
         "SetSegmentAttr(0x%X, SEGATTR_PERM, 7);"
         "SegClass(0x%X, \"CODE\");"
@@ -1782,84 +1782,84 @@ std::string AsmRunner::CreateSegment(uintptr_t pStart, uintptr_t pEnd, std::stri
 std::string AsmRunner::PatchByte(uintptr_t pAddr, uint8_t val)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "PatchByte(0x%X, 0x%02X);", pAddr, val);
+    sprintf_s(buff, sizeof(buff), "PatchByte(0x%X, 0x%02X);", pAddr, val);
     return std::string(buff);
 }
 
 std::string AsmRunner::AddFunc(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "add_func(0x%X, BADADDR);", pAddr);
+    sprintf_s(buff, sizeof(buff), "add_func(0x%X, BADADDR);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::MakeCode(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "MakeCode(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "MakeCode(0x%X);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::Message(std::string message)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "Message(\"%s\");", message.c_str());
+    sprintf_s(buff, sizeof(buff), "Message(\"%s\");", message.c_str());
     return std::string(buff);
 }
 
 std::string AsmRunner::DelItems(uintptr_t pAddr, uintptr_t nSize)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "del_items(0x%X, DELIT_SIMPLE, 0x%X);", pAddr, nSize);
+    sprintf_s(buff, sizeof(buff), "del_items(0x%X, DELIT_SIMPLE, 0x%X);", pAddr, nSize);
     return std::string(buff);
 }
 
 std::string AsmRunner::get_type(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "get_type(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "get_type(0x%X);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::GetType(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "GetType(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "GetType(0x%X);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::Name(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "Name(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "Name(0x%X);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::isCode(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "isCode(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "isCode(0x%X);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::isData(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "isData(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "isData(0x%X);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::isASCII(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "isASCII(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "isASCII(0x%X);", pAddr);
     return std::string(buff);
 }
 
 std::string AsmRunner::get_func_name(uintptr_t pAddr)
 {
     char buff[BUFF_SIZE];
-    sprintf(buff, "get_func_name(0x%X);", pAddr);
+    sprintf_s(buff, sizeof(buff), "get_func_name(0x%X);", pAddr);
     return std::string(buff);
 }
 #undef BUFF_SIZE
