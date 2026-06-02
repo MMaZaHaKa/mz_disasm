@@ -25,6 +25,9 @@
 #include <sstream>
 #include <algorithm>
 
+#define ARP(p) ((uintptr_t)p)
+#define ARV(p) ((void*)p)
+
 struct tFuncNode
 {
 	uintptr_t rva = 0;
@@ -79,6 +82,7 @@ public:
 	bool IsLogRunner() const { return m_bLogRunner; }
 	void SetX64(bool isX64) { m_bX64 = isX64; }
 	bool IsX64() const { return m_bX64; }
+	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
 
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
@@ -90,6 +94,8 @@ public:
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
 	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
 	void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output);
+	void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, const uint16_t* byteColors, const uint16_t* asciiColors);
+	void SetConsoleColor(int32_t mode);
 
 	// Mem
 	uintptr_t AddMemory(uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/);
@@ -101,7 +107,8 @@ public:
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
 	void DumpMemory(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
 	void DumpMemory(uintptr_t pNativeStart, uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
-	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
+	uintptr_t DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize);
+	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
 	bool IsModuleAddr(uintptr_t pAddr);
 	bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
 
@@ -142,6 +149,52 @@ public:
 	void SetBreakpoint(uintptr_t pAddr, eBpType type = BP_CODE, uint32_t size = 1, OnBreakpointCb cb = nullptr, void* data = nullptr);
 	void RemoveBreakpoint(uintptr_t pAddr);
 	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr); // 0 until end, cb can null autofalse
+
+	// IDA 7.6 IDC // https://docs.hex-rays.com/9.0/developer-guide/idc/idc-api-reference/alphabetical-list-of-idc-functions/686
+	std::string SanitizeIdaName(const std::string& in);
+	std::string ClearStr(std::string input, std::string charsToRemove);
+	std::string SetName(uintptr_t pAddr, std::string name, bool snt = true);
+	std::string SetComment(uintptr_t pAddr, std::string comment, uint32_t nType = 0);
+	std::string MakeArray(uintptr_t pAddr, uint32_t nArraySize);
+	std::string SetType(uintptr_t pAddr, std::string type);
+	std::string SetColor(uintptr_t pAddr, uint8_t r = 0x28, uint8_t g = 0x53, uint8_t b = 0x68);
+	std::string CreateSegment(uintptr_t pStart, uintptr_t pEnd, std::string name, bool snt = true);
+	std::string PatchByte(uintptr_t pAddr, uint8_t val);
+	std::string AddFunc(uintptr_t pAddr);
+	std::string MakeCode(uintptr_t pAddr);
+	std::string Message(std::string message);
+	std::string DelItems(uintptr_t pAddr, uintptr_t nSize);
+	std::string get_type(uintptr_t pAddr);
+	std::string GetType(uintptr_t pAddr);
+	std::string Name(uintptr_t pAddr);
+	std::string isCode(uintptr_t pAddr);
+	std::string isData(uintptr_t pAddr);
+	std::string isASCII(uintptr_t pAddr);
+	std::string get_func_name(uintptr_t pAddr);
+
+	//MakeCode-AddFunc-SetName
+
+	// Проверка допустимых режимов:
+	// "r"  - чтение (файл должен существовать)
+	// "w"  - запись (создает новый или перезаписывает)
+	// "a"  - добавление (в конец файла)
+	// "r+" - чтение и запись (файл должен существовать)
+	// "w+" - чтение и запись (создает новый или перезаписывает)
+	// "a+" - чтение и добавление (создает новый, если не существует)
+	FILE* FileOpen(const char* filename, const char* mode = "w");
+	void FileAdd(FILE* file, const char* fmt, ...);
+	void FileClose(FILE* file);
+
+	// Snapshot
+	struct tMemSnapshot
+	{
+		uintptr_t pStart = 0;
+		size_t size = 0;
+		std::vector<uint8_t> data;
+	};
+	tMemSnapshot MakeSnapshot(uintptr_t pStart, uintptr_t pEnd);
+	tMemSnapshot MakeSnapshotS(uintptr_t pStart, uintptr_t nSize);
+	void CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly = true);
 
 private:
 	// точки останова: addr info
@@ -237,11 +290,6 @@ private:
 	bool CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size);
 
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
-	// _OnInstructionStep // for disasm // +call user cb // before perform eip // + breakpoint?
-	// _OnMemory // for bLogMemRW // +call user cb
-	// _OnJmp // on non next op? like any ret call jmp
-	// _OnBreakpoint
-	// _OnTraceStep
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
 	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
 	void _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic);        // jmp/call/ret детектируется в _OnInstructionStep

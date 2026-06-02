@@ -1008,6 +1008,117 @@ void AsmRunner::DataToHexString(int indent, uintptr_t startAddr, const uint8_t* 
     }
 }
 
+void AsmRunner::DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size,
+    const uint16_t* byteColors, const uint16_t* asciiColors)
+{
+    if (!data || size == 0)
+        return;
+
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    bool haveConsole = (hConsole != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hConsole, &csbi);
+    WORD oldAttr = haveConsole ? csbi.wAttributes : (WORD)(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+
+    const WORD kWhite = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+
+    auto setColor = [&](WORD c)
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, c);
+    };
+
+    auto putStr = [&](const std::string& s)
+    {
+        std::cout << s;
+    };
+
+    auto putChar = [&](char c)
+    {
+        std::cout.put(c);
+    };
+
+    const int addr_width = static_cast<int>(sizeof(uintptr_t) * 2);
+    char buf[64]{};
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        if ((i % 16) == 0)
+        {
+            if (i != 0)
+            {
+                setColor(kWhite);
+                putStr(" ");
+
+                size_t lineStart = i - 16;
+                for (size_t j = lineStart; j < i; ++j)
+                {
+                    WORD c = (asciiColors && asciiColors[j]) ? static_cast<WORD>(asciiColors[j]) : kWhite;
+                    setColor(c);
+                    putChar(IsPrintableAscii(data[j]) ? static_cast<char>(data[j]) : '.');
+                }
+                putStr("\n");
+            }
+
+            if (indent > 0)
+                putStr(std::string(static_cast<size_t>(indent), ' '));
+
+            std::ostringstream a;
+            a << std::uppercase << std::hex << std::setw(addr_width) << std::setfill('0') << (startAddr + static_cast<uintptr_t>(i));
+            setColor(kWhite);
+            putStr(a.str());
+            putStr("  ");
+        }
+
+        std::snprintf(buf, sizeof(buf), "%02x ", data[i]);
+        WORD c = (byteColors && byteColors[i]) ? static_cast<WORD>(byteColors[i]) : kWhite;
+        setColor(c);
+        putStr(buf);
+    }
+
+    if (size & 15)
+    {
+        size_t padded_size = ((size - 1) | 15) + 1;
+        setColor(kWhite);
+        for (size_t j = size; j < padded_size; ++j)
+            putStr("   ");
+    }
+
+    setColor(kWhite);
+    putStr(" ");
+
+    size_t base = (size - 1) & ~static_cast<size_t>(0xF);
+    for (size_t j = base; j < size; ++j)
+    {
+        WORD c = (asciiColors && asciiColors[j]) ? static_cast<WORD>(asciiColors[j]) : kWhite;
+        setColor(c);
+        putChar(IsPrintableAscii(data[j]) ? static_cast<char>(data[j]) : '.');
+    }
+
+    setColor(oldAttr);
+}
+
+void AsmRunner::SetConsoleColor(int32_t mode)
+{
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (mode == 0)
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED);
+    else if (mode == 1)
+        SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN);
+    else if (mode == 2)
+        SetConsoleTextAttribute(hConsole, FOREGROUND_BLUE);
+    else if (mode == 3)
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN);
+    else if (mode == 4)
+        SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_BLUE);
+    else if (mode == 5)
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_BLUE);
+    else if (mode == 6)
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    else if (mode == 7)
+        SetConsoleTextAttribute(hConsole, 0);
+}
+
+
 uintptr_t AsmRunner::AddMemory(uintptr_t nSize, uint32_t nType)
 {
     if (!m_uc || nSize == 0) return 0;
@@ -1079,6 +1190,25 @@ void AsmRunner::DumpMemory(uintptr_t pNativeStart, uintptr_t pStart, uintptr_t n
     DumpMemory(pStart, nSize);
 }
 
+uintptr_t AsmRunner::DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize)
+{
+    if (!m_uc || !pStart || !nSize)
+        return 0;
+
+    void* p = std::malloc(static_cast<size_t>(nSize));
+    if (!p)
+        return 0;
+
+    if (uc_mem_read(m_uc, pStart, p, static_cast<size_t>(nSize)) != UC_ERR_OK)
+    {
+        std::free(p);
+        return 0;
+    }
+
+    return reinterpret_cast<uintptr_t>(p);
+}
+
+// todo: ??
 uintptr_t AsmRunner::DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize)
 {
     if (!m_uc || !pStart || !nSize) return 0;
@@ -1572,6 +1702,433 @@ void AsmRunner::TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStar
     m_trace.file.close();
 }
 
+std::string AsmRunner::SanitizeIdaName(const std::string& in)
+{
+    std::string s = in;
+    for (char& c : s)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (!(std::isalnum(uc) || c == '_'))
+            c = '_';
+    }
+    if (s.empty())
+        s = "unk";
+    if (std::isdigit(static_cast<unsigned char>(s[0])))
+        s = "_" + s;
+    return s;
+}
+
+std::string AsmRunner::ClearStr(std::string input, std::string charsToRemove)
+{
+    std::string result = input;
+    result.erase(std::remove_if(result.begin(), result.end(),
+        [&charsToRemove](char c) { return charsToRemove.find(c) != std::string::npos; }),
+        result.end());
+    return result;
+}
+
+#define BUFF_SIZE (512)
+std::string AsmRunner::SetName(uintptr_t pAddr, std::string name, bool snt)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "set_name(0x%X, \"%s\", SN_AUTO);", pAddr, (snt ? SanitizeIdaName(name) : name).c_str());
+    return std::string(buff);
+}
+
+std::string AsmRunner::SetComment(uintptr_t pAddr, std::string comment, uint32_t nType)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "set_cmt(0x%X, \"%s\", %d);", pAddr, comment.c_str(), nType);
+    return std::string(buff);
+}
+
+std::string AsmRunner::MakeArray(uintptr_t pAddr, uint32_t nArraySize)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "MakeArray(0x%X, %d);", pAddr, nArraySize); // kek need before define each element as type
+    return std::string(buff);
+}
+
+std::string AsmRunner::SetType(uintptr_t pAddr, std::string type)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "SetType(0x%X, \"%s\");", pAddr, type.c_str());
+    return std::string(buff);
+}
+
+std::string AsmRunner::SetColor(uintptr_t pAddr, uint8_t r, uint8_t g, uint8_t b)
+{
+    char buff[BUFF_SIZE];
+    uint32_t color = (b << 16) | (g << 8) | r;
+    sprintf(buff, "SetColor(0x%X, CIC_FUNC, 0x%X);", pAddr, color); // BGR
+    return std::string(buff);
+}
+
+std::string AsmRunner::CreateSegment(uintptr_t pStart, uintptr_t pEnd, std::string name, bool snt)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff,
+        "AddSegEx(0x%X, 0x%X, 0, 1, 3, 2, ADDSEG_QUIET);"
+        "SetSegmentAttr(0x%X, SEGATTR_PERM, 7);"
+        "SegClass(0x%X, \"CODE\");"
+        "RenameSeg(0x%X, \"API_SEG_%s\");",
+        pStart, pEnd,
+        pStart,
+        pStart,
+        pStart, (snt ? SanitizeIdaName(name) : name).c_str());
+    return std::string(buff);
+}
+
+std::string AsmRunner::PatchByte(uintptr_t pAddr, uint8_t val)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "PatchByte(0x%X, 0x%02X);", pAddr, val);
+    return std::string(buff);
+}
+
+std::string AsmRunner::AddFunc(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "add_func(0x%X, BADADDR);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::MakeCode(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "MakeCode(0x%X);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::Message(std::string message)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "Message(\"%s\");", message.c_str());
+    return std::string(buff);
+}
+
+std::string AsmRunner::DelItems(uintptr_t pAddr, uintptr_t nSize)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "del_items(0x%X, DELIT_SIMPLE, 0x%X);", pAddr, nSize);
+    return std::string(buff);
+}
+
+std::string AsmRunner::get_type(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "get_type(0x%X);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::GetType(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "GetType(0x%X);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::Name(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "Name(0x%X);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::isCode(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "isCode(0x%X);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::isData(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "isData(0x%X);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::isASCII(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "isASCII(0x%X);", pAddr);
+    return std::string(buff);
+}
+
+std::string AsmRunner::get_func_name(uintptr_t pAddr)
+{
+    char buff[BUFF_SIZE];
+    sprintf(buff, "get_func_name(0x%X);", pAddr);
+    return std::string(buff);
+}
+#undef BUFF_SIZE
+
+// Проверка допустимых режимов:
+// "r"  - чтение (файл должен существовать)
+// "w"  - запись (создает новый или перезаписывает)
+// "a"  - добавление (в конец файла)
+// "r+" - чтение и запись (файл должен существовать)
+// "w+" - чтение и запись (создает новый или перезаписывает)
+// "a+" - чтение и добавление (создает новый, если не существует)
+
+FILE* AsmRunner::FileOpen(const char* filename, const char* mode)
+{
+    if (!filename || !mode) return nullptr;
+    return fopen(filename, mode);
+}
+
+void AsmRunner::FileAdd(FILE* file, const char* fmt, ...)
+{
+    if (!file) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(file, fmt, ap);
+    std::fputc('\n', file);
+    va_end(ap);
+}
+
+void AsmRunner::FileClose(FILE* file)
+{
+    if (file)
+        fclose(file);
+}
+
+AsmRunner::tMemSnapshot AsmRunner::MakeSnapshot(uintptr_t pStart, uintptr_t pEnd)
+{
+    tMemSnapshot s;
+    if (!m_uc || pEnd <= pStart)
+        return s;
+
+    s.pStart = pStart;
+    s.size = static_cast<size_t>(pEnd - pStart);
+    s.data.resize(s.size);
+
+    if (s.size == 0)
+        return s;
+
+    if (uc_mem_read(m_uc, pStart, s.data.data(), static_cast<size_t>(s.size)) != UC_ERR_OK)
+    {
+        s.data.clear();
+        s.size = 0;
+        s.pStart = 0;
+    }
+
+    return s;
+}
+
+AsmRunner::tMemSnapshot AsmRunner::MakeSnapshotS(uintptr_t pStart, uintptr_t nSize)
+{
+    tMemSnapshot s;
+    if (!m_uc || nSize == 0)
+        return s;
+
+    s.pStart = pStart;
+    s.size = static_cast<size_t>(nSize);
+    s.data.resize(s.size);
+
+    if (uc_mem_read(m_uc, pStart, s.data.data(), static_cast<size_t>(s.size)) != UC_ERR_OK)
+    {
+        s.data.clear();
+        s.size = 0;
+        s.pStart = 0;
+    }
+
+    return s;
+}
+
+void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly)
+{
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    bool haveConsole = (hConsole != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hConsole, &csbi);
+    WORD oldAttr = haveConsole ? csbi.wAttributes : (WORD)(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+
+    const WORD kWhite = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+    const WORD kRed = FOREGROUND_RED | FOREGROUND_INTENSITY;
+    const WORD kGreen = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+
+    auto setColor = [&](WORD c)
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, c);
+    };
+
+    auto restoreColor = [&]()
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, oldAttr);
+    };
+
+    const size_t cmpSize = min(a.data.size(), b.data.size());
+
+    if (a.data.size() != b.data.size() && m_bLogRunner)
+    {
+        Log("[!] CompareSnapshots: sizes differ, compare only first 0x%zx bytes (A=0x%zx, B=0x%zx)",
+            cmpSize, a.data.size(), b.data.size());
+    }
+
+    size_t diffCount = 0;
+    size_t firstDiff = static_cast<size_t>(-1);
+    size_t lastDiff = 0;
+
+    std::vector<uint16_t> colorsA(cmpSize, 0);
+    std::vector<uint16_t> colorsB(cmpSize, 0);
+
+    for (size_t i = 0; i < cmpSize; ++i)
+    {
+        if (a.data[i] != b.data[i])
+        {
+            if (firstDiff == static_cast<size_t>(-1))
+                firstDiff = i;
+
+            lastDiff = i;
+            ++diffCount;
+
+            colorsA[i] = kRed;
+            colorsB[i] = kGreen;
+        }
+    }
+
+    std::ostringstream info;
+    info << "[SNAP] A=0x" << std::hex << std::uppercase << a.pStart
+        << " size=0x" << a.data.size()
+        << " | B=0x" << std::hex << std::uppercase << b.pStart
+        << " size=0x" << b.data.size()
+        << " | compare=0x" << std::hex << std::uppercase << cmpSize;
+    std::cout << info.str() << '\n';
+
+    std::ostringstream diffInfo;
+    diffInfo << "[SNAP] changed=" << std::dec << diffCount;
+
+    if (cmpSize == 0)
+    {
+        diffInfo << " | empty compare range";
+        std::cout << diffInfo.str() << '\n';
+        restoreColor();
+        return;
+    }
+
+    if (diffCount == 0)
+    {
+        diffInfo << " | snapshots identical in compared range";
+    }
+    else
+    {
+        diffInfo
+            << " | first=A+0x" << std::hex << std::uppercase << firstDiff
+            << " (0x" << (a.pStart + firstDiff) << ")"
+            << " / B+0x" << firstDiff
+            << " (0x" << (b.pStart + firstDiff) << ")"
+            << " | last=A+0x" << std::hex << std::uppercase << lastDiff
+            << " (0x" << (a.pStart + lastDiff) << ")"
+            << " / B+0x" << lastDiff
+            << " (0x" << (b.pStart + lastDiff) << ")";
+    }
+
+    if (a.data.size() != b.data.size())
+    {
+        diffInfo << " | tail not compared: A+" << std::dec << (a.data.size() - cmpSize)
+            << " / B+" << (b.data.size() - cmpSize) << " bytes";
+    }
+
+    std::cout << diffInfo.str() << '\n';
+
+    auto printBlockDiffOnly = [&](const char* title, const tMemSnapshot& s, const std::vector<uint16_t>& cols)
+    {
+        std::cout << title << '\n';
+
+        bool printedAnyLine = false;
+        size_t prevPrintedEnd = 0;
+
+        for (size_t lineStart = 0; lineStart < cmpSize; lineStart += 16)
+        {
+            const size_t lineLen = std::min<size_t>(16, cmpSize - lineStart);
+
+            bool lineHasDiff = false;
+            for (size_t j = 0; j < lineLen; ++j)
+            {
+                if (a.data[lineStart + j] != b.data[lineStart + j])
+                {
+                    lineHasDiff = true;
+                    break;
+                }
+            }
+
+            if (!lineHasDiff)
+                continue;
+
+            if (printedAnyLine && lineStart > prevPrintedEnd)
+            {
+                std::cout << "...\n";
+            }
+
+            DataToHexString(
+                0,
+                s.pStart + lineStart,
+                s.data.data() + lineStart,
+                lineLen,
+                cols.data() + lineStart,
+                cols.data() + lineStart
+            );
+            std::cout << '\n';
+
+            printedAnyLine = true;
+            prevPrintedEnd = lineStart + lineLen;
+        }
+
+        if (!printedAnyLine)
+            std::cout << "(no differences)\n";
+    };
+
+    if (bDiffOnly)
+    {
+        if (diffCount == 0)
+        {
+            std::cout << "[SNAP] no differences\n";
+            restoreColor();
+            std::cout << std::flush;
+            return;
+        }
+
+        printBlockDiffOnly("[SNAP] A (diff only)", a, colorsA);
+        std::cout << '\n';
+        printBlockDiffOnly("[SNAP] B (diff only)", b, colorsB);
+    }
+    else
+    {
+        std::cout << "[SNAP] A\n";
+        DataToHexString(0, a.pStart, a.data.data(), cmpSize,
+            colorsA.empty() ? nullptr : colorsA.data(),
+            colorsA.empty() ? nullptr : colorsA.data());
+        std::cout << '\n';
+
+        std::cout << "\n[SNAP] B\n";
+        DataToHexString(0, b.pStart, b.data.data(), cmpSize,
+            colorsB.empty() ? nullptr : colorsB.data(),
+            colorsB.empty() ? nullptr : colorsB.data());
+        std::cout << '\n';
+
+        if (a.data.size() > cmpSize)
+        {
+            std::cout << "\n[SNAP] A tail (not compared)\n";
+            DataToHexString(0, a.pStart + cmpSize, a.data.data() + cmpSize, a.data.size() - cmpSize, nullptr, nullptr);
+            std::cout << '\n';
+        }
+
+        if (b.data.size() > cmpSize)
+        {
+            std::cout << "\n[SNAP] B tail (not compared)\n";
+            DataToHexString(0, b.pStart + cmpSize, b.data.data() + cmpSize, b.data.size() - cmpSize, nullptr, nullptr);
+            std::cout << '\n';
+        }
+    }
+
+    restoreColor();
+    std::cout << std::flush;
+}
+
 #if 0
 void TestUsage1()
 {
@@ -1684,6 +2241,18 @@ void TestUsage2()
 
     runner.SetEntryPointStackArg(0, reinterpret_cast<uintptr_t>(pEntryArg));
     runner.SetRegister(UC_X86_REG_ECX, reinterpret_cast<uintptr_t>(pEntryArg)); // if thiscall-style ctx is needed
+
+    //{ // diff test
+    //    auto s1 = runner.MakeSnapshotS((uintptr_t)pEntry, 0x1000);
+    //    char* buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntry, 0x1000);
+    //    buf[0] = 0xCC;
+    //    buf[100] = 0xCC;
+    //    runner._CopyMemory((uintptr_t)pEntry, (uintptr_t)buf, 0x1000);
+    //    free(buf);
+    //    auto s2 = runner.MakeSnapshotS((uintptr_t)pEntry, 0x1000);
+    //    runner.CompareSnapshots(s1, s2);
+    //    return;
+    //}
 
     // Пример брейка по адресу
     // runner.SetBreakpoint(reinterpret_cast<uintptr_t>(pEntry), [](AsmRunner*, uint64_t a){ printf("BP hit 0x%llx\n", (unsigned long long)a); }, true);
