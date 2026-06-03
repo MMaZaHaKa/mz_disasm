@@ -91,19 +91,39 @@ public:
 	uintptr_t GetInstructionCount() const { return m_instrCount; }
 
 	// tools
+	static inline uintptr_t AlignUp(uintptr_t x, uintptr_t a) { return (x + a - 1) & ~(a - 1); }
+	static inline uintptr_t AlignDown(uintptr_t v, uintptr_t a) { return v & ~(a - 1); }
+	static inline uintptr_t AlignDownPage(uintptr_t v) { return v & ~static_cast<uintptr_t>(0xFFF); }
+	static inline bool IsPrintableAscii(uint8_t c) { return c >= 0x20 && c <= 0x7e; }
+
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
 	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
-	void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output);
-	void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, const uint16_t* byteColors, const uint16_t* asciiColors);
-	void SetConsoleColor(int32_t mode);
+	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output);
+	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, const uint16_t* byteColors, const uint16_t* asciiColors);
+	static void SetConsoleColor(int32_t mode);
+	void MboxSTD(std::string msg, std::string title);
+	void EXIT_F();
+	void EXIT_S();
+	static uintptr_t RestorePointer(uintptr_t op_addr, uintptr_t offset);
+	static uintptr_t CalculateOffset(uintptr_t op_addr, uintptr_t dst);
+	static void* SearchPointerByPattern(void* ptrStart, int block_size, std::string pattern);
+	struct tMemoryRegion
+	{
+		void* baseAddress;
+		SIZE_T size;
+	};
+	// std::vector<AsmRunner::tMemoryRegion> regions = FindRegions(0x17000, MEM_PRIVATE, PAGE_READWRITE, MEM_COMMIT);
+	static std::vector<tMemoryRegion> FindRegions(SIZE_T targetSize = 0, DWORD targetType = 0, DWORD targetProtect = 0, DWORD targetState = MEM_COMMIT);
+	static void CompareRegionsSnapshots(const std::vector<tMemoryRegion>& oldRegions, const std::vector<tMemoryRegion>& newRegions, bool bExtra = true);
 
 	// Mem
 	uintptr_t AddMemory(uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/);
 	uintptr_t AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/);
-	void AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
+	bool AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
+	bool AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
 	void _CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
-	void FreeMemory(uintptr_t pVTo);
-	void ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
+	bool FreeMemory(uintptr_t pVTo);
+	bool ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
 	void DumpMemory(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
 	void DumpMemory(uintptr_t pNativeStart, uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
@@ -281,8 +301,6 @@ private:
 	uint32_t PcReg() const { return m_bX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP; }
 	uint32_t SpReg() const { return m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP; }
 	uint32_t FpReg() const { return m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP; }
-	static inline uintptr_t AlignUp(uintptr_t x, uintptr_t a) { return (x + a - 1) & ~(a - 1); }
-	static inline bool IsPrintableAscii(uint8_t c) { return c >= 0x20 && c <= 0x7e; }
 
 	void Log(const char* fmt, ...) const;
 
@@ -320,6 +338,60 @@ private:
 	bool LoadExportsFromBase(uintptr_t base, std::vector<tFuncNode>& out) const;
 };
 
+class MemoryPatcher
+{
+public:
+	uintptr_t address;
+	std::vector<uint8_t> originalBytes;
+	std::vector<uint8_t> patchBytes;
+	int size;
+	bool isPatched;
+	bool IsValidPointer(void* ptr)
+	{
+		if (!ptr) { return false; }
+		MEMORY_BASIC_INFORMATION mbi;
+		if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) { return false; }
+		return (mbi.State == MEM_COMMIT) && !(mbi.Protect & PAGE_NOACCESS);
+	}
+	void inline PerformWrite(uintptr_t pto, uintptr_t pfrom, uint32_t size)
+	{
+		DWORD vp[2];
+		if (!pto || !pfrom || !size) { printf("err patch\n"); return; }
+		VirtualProtect((void*)pto, size, PAGE_EXECUTE_READWRITE, &vp[0]);
+		memcpy((void*)pto, (void*)pfrom, size);
+		VirtualProtect((void*)pto, size, vp[0], &vp[1]);
+	}
+	MemoryPatcher() {}
+	MemoryPatcher(uintptr_t addr, uint8_t val, uint32_t cnt) : isPatched(false)//, address(addr), size(cnt)
+	{
+		if (!addr || !cnt || !IsValidPointer((void*)addr)) { return; }
+		address = addr; // 0 if !valid
+		size = cnt;
+		for (size_t i = 0; i < size; i++) { patchBytes.push_back(val); }
+	}
+	MemoryPatcher(uintptr_t addr, std::vector<uint8_t> patchData) : isPatched(false)//, address(addr)
+	{
+		if (!addr || !patchData.size() || !IsValidPointer((void*)addr)) { return; }
+		address = addr; // 0 if !valid
+		patchBytes = patchData;
+		size = patchBytes.size();
+	}
+	bool ReadBytes()
+	{
+		if (!address || !size || !IsValidPointer((void*)address)) { return false; }
+		originalBytes.clear();
+		originalBytes.reserve(size);
+		for (uint32_t i = 0; i < size; ++i)
+			originalBytes.push_back(((uint8_t*)address)[i]);
+		return true;
+	}
+	void inline ApplyPatch()
+	{
+		if (!originalBytes.size()) { for (int i = 0; i < size; i++) { originalBytes.push_back(((uint8_t*)address)[i]); } }
+		if (size && !isPatched) { PerformWrite(address, (uintptr_t)patchBytes.data(), patchBytes.size()); isPatched = true; printf("[0x%p/%d]: Ena\n", address, size); }
+	}
+	void inline RemovePatch() { if (size && isPatched) { PerformWrite(address, (uintptr_t)originalBytes.data(), originalBytes.size()); isPatched = false; printf("[0x%p/%d]: Disa\n", address, size); } }
+};
 
 
 // OLD

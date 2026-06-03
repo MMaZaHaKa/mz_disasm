@@ -583,7 +583,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     //    Log("%s", oss.str().c_str());
     //}
 
-    if (!m_bDisasmAfterCB && (m_bLogDisasm || m_bLogRunner)) {
+    if (!m_bDisasmAfterCB && (m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
         if(m_bDisasmRVA)
@@ -706,7 +706,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     }
 #endif
 
-    if (m_bDisasmAfterCB && (m_bLogDisasm || m_bLogRunner)) {
+    if (m_bDisasmAfterCB && (m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
         if (m_bDisasmRVA)
@@ -1118,6 +1118,298 @@ void AsmRunner::SetConsoleColor(int32_t mode)
         SetConsoleTextAttribute(hConsole, 0);
 }
 
+void AsmRunner::MboxSTD(std::string msg, std::string title)
+{
+    MessageBoxA(HWND_DESKTOP, msg.c_str(), title.c_str(), MB_SYSTEMMODAL | MB_ICONWARNING);
+}
+void AsmRunner::EXIT_F()
+{
+    ExitProcess(EXIT_FAILURE);
+}
+void AsmRunner::EXIT_S()
+{
+    ExitProcess(EXIT_SUCCESS);
+}
+
+uintptr_t AsmRunner::RestorePointer(uintptr_t op_addr, uintptr_t offset)
+{
+    return op_addr + 1 + sizeof(uintptr_t) + offset;
+}
+
+uintptr_t AsmRunner::CalculateOffset(uintptr_t op_addr, uintptr_t dst)
+{
+    return dst - (op_addr + 1 + sizeof(uintptr_t));
+}
+
+void* AsmRunner::SearchPointerByPattern(void* ptrStart, int block_size, std::string pattern)
+{
+#define INRANGE(x, a, b) (x >= a && x <= b)
+#define getBits(x) (INRANGE((x & (~0x20)), 'A', 'F') ? ((x & (~0x20)) - 'A' + 0xa) : (INRANGE(x, '0', '9') ? x - '0' : 0))
+#define getByte(x) (getBits(x[0]) << 4 | getBits(x[1]))
+    const char* buffptr_pattern = pattern.c_str();
+    uintptr_t pMatch = 0;
+    for (uintptr_t MemPtr = (uintptr_t)ptrStart; MemPtr < ((uintptr_t)ptrStart + block_size); MemPtr++)
+    {
+        if (!*buffptr_pattern) { break; }
+        if (*(PBYTE)buffptr_pattern == '\?' || *(BYTE*)MemPtr == getByte(buffptr_pattern))
+        {
+            if (!pMatch) { pMatch = MemPtr; }
+            if (!buffptr_pattern[2]) { break; }
+            if (*(PWORD)buffptr_pattern == '\?\?' || *(PBYTE)buffptr_pattern != '\?') { buffptr_pattern += 3; }
+            else { buffptr_pattern += 2; } //one ?
+        }
+        else
+        {
+            buffptr_pattern = pattern.c_str();
+            if (pMatch) { MemPtr = pMatch; }
+            pMatch = 0;
+        }
+    }
+    if (!pMatch) { return NULL; }
+    return (void*)pMatch;
+#undef getByte;
+#undef getBits;
+#undef INRANGE;
+}
+
+std::vector<AsmRunner::tMemoryRegion> AsmRunner::FindRegions(SIZE_T targetSize, DWORD targetType, DWORD targetProtect, DWORD targetState)
+{
+    std::vector<AsmRunner::tMemoryRegion> regions;
+    MEMORY_BASIC_INFORMATION mbi;
+    uintptr_t address = 0;
+    while (VirtualQuery((LPCVOID)address, &mbi, sizeof(mbi)) != 0) {
+        if (targetSize != 0 && mbi.RegionSize != targetSize) { address += mbi.RegionSize; continue; }
+        if (targetType != 0 && mbi.Type != targetType) { address += mbi.RegionSize; continue; }
+        if (targetProtect != 0 && mbi.Protect != targetProtect) { address += mbi.RegionSize; continue; }
+        if (targetState != 0 && mbi.State != targetState) { address += mbi.RegionSize; continue; }
+        regions.push_back({ mbi.BaseAddress, mbi.RegionSize });
+        address += mbi.RegionSize;
+    }
+    return regions;
+}
+
+void AsmRunner::CompareRegionsSnapshots(const std::vector<tMemoryRegion>& oldRegions, const std::vector<tMemoryRegion>& newRegions, bool bExtra)
+{
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    bool haveConsole = (hConsole != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hConsole, &csbi);
+    WORD oldAttr = haveConsole ? csbi.wAttributes : (WORD)(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+
+    const WORD kWhite = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+    const WORD kRed = FOREGROUND_RED | FOREGROUND_INTENSITY;
+    const WORD kGreen = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+
+    auto setColor = [&](WORD c)
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, c);
+    };
+
+    auto restoreColor = [&]()
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, oldAttr);
+    };
+
+    struct RegionKey
+    {
+        uintptr_t start;
+        uintptr_t size;
+
+        bool operator<(const RegionKey& other) const
+        {
+            if (start != other.start) return start < other.start;
+            return size < other.size;
+        }
+
+        bool operator==(const RegionKey& other) const
+        {
+            return start == other.start && size == other.size;
+        }
+    };
+
+    auto toKey = [](const tMemoryRegion& r) -> RegionKey
+    {
+        return {
+            reinterpret_cast<uintptr_t>(r.baseAddress),
+            static_cast<uintptr_t>(r.size)
+        };
+    };
+
+    std::vector<RegionKey> a;
+    std::vector<RegionKey> b;
+    a.reserve(oldRegions.size());
+    b.reserve(newRegions.size());
+
+    for (const auto& r : oldRegions) a.push_back(toKey(r));
+    for (const auto& r : newRegions) b.push_back(toKey(r));
+
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+
+    std::cout << "[REGIONS] old=" << std::dec << a.size()
+        << " new=" << b.size() << '\n';
+
+    size_t i = 0, j = 0;
+    size_t removed = 0, added = 0;
+
+    while (i < a.size() || j < b.size())
+    {
+        if (j >= b.size() || (i < a.size() && a[i] < b[j]))
+        {
+            setColor(kRed);
+            std::cout << "[-] region disappeared: "
+                << "0x" << std::hex << std::uppercase << a[i].start
+                << " size=0x" << a[i].size << '\n';
+            ++i;
+            ++removed;
+        }
+        else if (i >= a.size() || b[j] < a[i])
+        {
+            setColor(kGreen);
+            std::cout << "[+] region appeared:   "
+                << "0x" << std::hex << std::uppercase << b[j].start
+                << " size=0x" << b[j].size << '\n';
+            ++j;
+            ++added;
+        }
+        else
+        {
+            ++i;
+            ++j;
+        }
+    }
+
+    setColor(kWhite);
+    std::cout << "[REGIONS] removed=" << std::dec << removed
+        << " added=" << added << '\n';
+
+    restoreColor();
+    std::cout << std::flush;
+}
+
+#if 0
+void AsmRunner::CompareRegionsSnapshots(const std::vector<tMemoryRegion>& oldRegions, const std::vector<tMemoryRegion>& newRegions, bool bExtra)
+{
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    bool haveConsole = (hConsole != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hConsole, &csbi);
+    WORD oldAttr = haveConsole ? csbi.wAttributes : (WORD)(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+
+    const WORD kWhite = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+    const WORD kRed = FOREGROUND_RED | FOREGROUND_INTENSITY;
+    const WORD kGreen = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+
+    auto setColor = [&](WORD c)
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, c);
+    };
+
+    auto restoreColor = [&]()
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, oldAttr);
+    };
+
+    struct RegionKey
+    {
+        uintptr_t start{};
+        uintptr_t size{};
+        std::string extra;
+
+        bool operator<(const RegionKey& other) const
+        {
+            if (start != other.start) return start < other.start;
+            if (size != other.size)   return size < other.size;
+            return extra < other.extra;
+        }
+
+        bool sameBasic(const RegionKey& other) const
+        {
+            return start == other.start && size == other.size;
+        }
+    };
+
+    auto makeKey = [&](const tMemoryRegion& r) -> RegionKey
+    {
+        RegionKey k{};
+        k.start = reinterpret_cast<uintptr_t>(r.baseAddress);
+        k.size = static_cast<uintptr_t>(r.size);
+
+        if (bExtra)
+        {
+            // TODO WinApi request by baseAddress get \Device\HarddiskVolume5\ntdll.dll like cheatengine
+            //k.extra = r.extra;
+        }
+
+        return k;
+    };
+
+    auto formatRegion = [&](const RegionKey& r) -> std::string
+    {
+        std::ostringstream oss;
+        oss << "0x" << std::hex << std::uppercase << r.start
+            << " - 0x" << (r.start + r.size)
+            << " size=0x" << r.size;
+
+        if (bExtra && !r.extra.empty())
+            oss << " extra=\"" << r.extra << "\"";
+
+        return oss.str();
+    };
+
+    std::vector<RegionKey> a;
+    std::vector<RegionKey> b;
+    a.reserve(oldRegions.size());
+    b.reserve(newRegions.size());
+
+    for (const auto& r : oldRegions) a.push_back(makeKey(r));
+    for (const auto& r : newRegions) b.push_back(makeKey(r));
+
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+
+    std::cout << "[REGIONS] old=" << std::dec << a.size()
+        << " new=" << b.size()
+        << " extra=" << (bExtra ? "on" : "off") << '\n';
+
+    size_t i = 0, j = 0;
+    size_t removed = 0, added = 0, same = 0;
+
+    while (i < a.size() || j < b.size())
+    {
+        if (j >= b.size() || (i < a.size() && a[i] < b[j]))
+        {
+            setColor(kRed);
+            std::cout << "[-] disappeared: " << formatRegion(a[i]) << '\n';
+            ++removed;
+            ++i;
+        }
+        else if (i >= a.size() || b[j] < a[i])
+        {
+            setColor(kGreen);
+            std::cout << "[+] appeared:   " << formatRegion(b[j]) << '\n';
+            ++added;
+            ++j;
+        }
+        else
+        {
+            ++same;
+            ++i;
+            ++j;
+        }
+    }
+
+    setColor(kWhite);
+    std::cout << "[REGIONS] same=" << std::dec << same
+        << " removed=" << removed
+        << " added=" << added << '\n';
+
+    restoreColor();
+    std::cout << std::flush;
+}
+#endif
 
 uintptr_t AsmRunner::AddMemory(uintptr_t nSize, uint32_t nType)
 {
@@ -1138,12 +1430,39 @@ uintptr_t AsmRunner::AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType)
     return addr;
 }
 
-void AsmRunner::AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType)
+bool AsmRunner::AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType)
 {
-    if (!m_uc || !pVTo || !pFrom || !nSize) return;
+    if (!m_uc || !pVTo || !nSize) return false;
+#if 1
     uintptr_t mapSize = AlignUp(nSize, 0x1000);
     uc_mem_map(m_uc, pVTo, mapSize, nType);
-    uc_mem_write(m_uc, pVTo, reinterpret_cast<void*>(pFrom), nSize);
+#else
+    const uintptr_t pageSize = 0x1000;
+    const uintptr_t base = AlignDown(pVTo, pageSize);
+    const uintptr_t end = AlignUp(pVTo + nSize, pageSize);
+    const uintptr_t mapSize = end - base;
+
+    uc_err err = uc_mem_map(m_uc, base, mapSize, nType);
+    if (err != UC_ERR_OK)
+    {
+        if (m_bLogRunner)
+            Log("[!] uc_mem_map failed: %s (base=0x%p size=0x%zx)",
+                uc_strerror(err), (void*)base, (size_t)mapSize);
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool AsmRunner::AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType)
+{
+    if (!m_uc || !pVTo || !pFrom || !nSize) return false;
+    //uintptr_t mapSize = AlignUp(nSize, 0x1000);
+    //uc_mem_map(m_uc, pVTo, mapSize, nType);
+    bool bRes = AddMemoryTo(pVTo, nSize, nType);
+    if(bRes)
+        uc_mem_write(m_uc, pVTo, reinterpret_cast<void*>(pFrom), nSize);
+    return bRes;
 }
 
 void AsmRunner::_CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
@@ -1152,16 +1471,18 @@ void AsmRunner::_CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
     uc_mem_write(m_uc, pVTo, reinterpret_cast<void*>(pFrom), nSize);
 }
 
-void AsmRunner::FreeMemory(uintptr_t pVTo)
+bool AsmRunner::FreeMemory(uintptr_t pVTo)
 {
-    if (!m_uc || !pVTo) return;
+    if (!m_uc || !pVTo) return false;
     uc_mem_unmap(m_uc, pVTo, 0x1000);
+    return true;
 }
 
-void AsmRunner::ChangeMemoryType(uintptr_t pVTo, uint32_t nType)
+bool AsmRunner::ChangeMemoryType(uintptr_t pVTo, uint32_t nType)
 {
-    if (!m_uc || !pVTo) return;
+    if (!m_uc || !pVTo) return false;
     uc_mem_protect(m_uc, pVTo, 0x1000, nType);
+    return true;
 }
 
 void AsmRunner::DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize)
@@ -2210,23 +2531,112 @@ void TestUsage1()
 
     //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", "mdl.dll", (void*)pStart, (void*)pEnd, (size_t)nSize);
 
-    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto OpcodeCb = [&pThemidaStart, &pThemidaEnd](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
+        //printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
         self->DumpRegisters(true);
         return true;
 
-        //std::vector<uint8_t> bytes(size);
-        //if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) {
-        //    printf("[!] Failed to read bytes at 0x%p\n", (void*)address);
-        //    return true;
-        //}
+        if (self->IsInAddr(address, pThemidaStart, pThemidaEnd)) {
+            SetConsoleColor(0); // red
+        }
+        else {
+            SetConsoleColor(1);
+        }
+
+        if (self->GetInstructionCount() > /*5080*/110000) {
+            self->SetLogDisasm(true);
+        }
+        else {
+            self->SetLogDisasm(false);
+        }
+
+        if (self->IsSymMapInitialised()) {
+            static const tFuncNode* lastsym = nullptr;
+            const tFuncNode* sym = self->FindSymbolByRuntime(address);
+            if (sym && sym != lastsym) {
+                printf("%s\n", sym->name.c_str());
+                lastsym = sym;
+            }
+        }
 
         return true;
     };
 
     auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
-        //printf("MemCb 0x%p\n", (void*)address);
+        auto* self = static_cast<AsmRunner*>(user_data);
+        //printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
+
+        if (!self || !uc || size == 0)
+            return true;
+
+        //////std::vector<uint8_t> bytes(size);
+        //////if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) { // !! old and wrong
+        //////	SetConsoleColor(3);
+        //////	printf("[!] Failed to read bytes at 0x%p\n", (void*)address);
+        //////	self->AddMemoryTo(address, size, UC_PROT_READ | UC_PROT_WRITE);
+        //////	printf("[!] Created Region at 0x%p [%d]\n", (void*)address, size);
+        //////	SetConsoleColor(1);
+        //////	return true;
+        //////}
+
+        const bool isUnmapped =
+            type == UC_MEM_READ_UNMAPPED ||
+            type == UC_MEM_WRITE_UNMAPPED ||
+            type == UC_MEM_FETCH_UNMAPPED;
+
+        const bool isProt =
+            type == UC_MEM_READ_PROT ||
+            type == UC_MEM_WRITE_PROT ||
+            type == UC_MEM_FETCH_PROT;
+
+        const uintptr_t pageSize = 0x1000;
+        const uintptr_t base = self->AlignDown(address, pageSize);
+        const uintptr_t end = self->AlignUp(address + size, pageSize);
+        const uintptr_t mapSize = end - base;
+
+        if (isUnmapped)
+        {
+            SetConsoleColor(3);
+            printf("[!] Unmapped access at 0x%p, mapping 0x%zx bytes from 0x%p size 0x%zx bytes\n", (void*)address, (size_t)mapSize, (void*)base, size);
+            MboxSTD("Warn! isUnmapped", "MemCb");
+
+            if (!self->AddMemoryTo(base, mapSize, UC_PROT_READ | UC_PROT_WRITE))
+            {
+                printf("[!] Failed to map region at 0x%p\n", (void*)base);
+                SetConsoleColor(1);
+                return false;
+            }
+
+            printf("[+] Created Region at 0x%p [0x%zx]\n", (void*)base, (size_t)mapSize);
+            SetConsoleColor(1);
+
+            { // custom
+                self->CompareRegionsSnapshots(regionsBF, regionsAF);
+                self->_CopyMemory(address, address, size); // maping equal in native proc // докопирую данные в которые оно лезет, где то зашит регион в vmctx
+                self->DumpMemory(address, size); // uc copy result view
+                MboxSTD("custom wait", "MemCb");
+            }
+
+            return true;
+        }
+
+        if (isProt)
+        {
+            SetConsoleColor(3);
+            printf("[!] Protection fault at 0x%p, trying to relax protection\n", (void*)address);
+            MboxSTD("Warn! isProt", "MemCb");
+
+            if (!self->ChangeMemoryType(base, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC))
+            {
+                printf("[!] Failed to change protection at 0x%p\n", (void*)base);
+                SetConsoleColor(1);
+                return false;
+            }
+
+            SetConsoleColor(1);
+            return true;
+        }
 
         return true;
     };
@@ -2234,7 +2644,7 @@ void TestUsage1()
     auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
-        printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+        //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
             MboxSTD("module escape", "asm runner");
@@ -2345,22 +2755,118 @@ void TestStackArgs()
     }
 
     AsmRunner runner(false);
-    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto OpcodeCb = [&pThemidaStart, &pThemidaEnd](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
         //printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
-        self->DumpRegisters(true);
+        //self->DumpRegisters(true);
+        if (self->IsInAddr(address, pThemidaStart, pThemidaEnd)) {
+            SetConsoleColor(0); // red
+        }
+        else {
+            SetConsoleColor(1);
+        }
+
+        if (self->GetInstructionCount() > /*5080*/110000) {
+            self->SetLogDisasm(true);
+        }
+        else {
+            self->SetLogDisasm(false);
+        }
+
+        if (self->IsSymMapInitialised()) {
+            static const tFuncNode* lastsym = nullptr;
+            const tFuncNode* sym = self->FindSymbolByRuntime(address);
+            if (sym && sym != lastsym) {
+                printf("%s\n", sym->name.c_str());
+                lastsym = sym;
+            }
+        }
+
         return true;
     };
 
     auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
-        //printf("MemCb 0x%p\n", (void*)address);
+        auto* self = static_cast<AsmRunner*>(user_data);
+        //printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
+
+        if (!self || !uc || size == 0)
+            return true;
+
+        //////std::vector<uint8_t> bytes(size);
+        //////if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) { // !! old and wrong
+        //////	SetConsoleColor(3);
+        //////	printf("[!] Failed to read bytes at 0x%p\n", (void*)address);
+        //////	self->AddMemoryTo(address, size, UC_PROT_READ | UC_PROT_WRITE);
+        //////	printf("[!] Created Region at 0x%p [%d]\n", (void*)address, size);
+        //////	SetConsoleColor(1);
+        //////	return true;
+        //////}
+
+        const bool isUnmapped =
+            type == UC_MEM_READ_UNMAPPED ||
+            type == UC_MEM_WRITE_UNMAPPED ||
+            type == UC_MEM_FETCH_UNMAPPED;
+
+        const bool isProt =
+            type == UC_MEM_READ_PROT ||
+            type == UC_MEM_WRITE_PROT ||
+            type == UC_MEM_FETCH_PROT;
+
+        const uintptr_t pageSize = 0x1000;
+        const uintptr_t base = self->AlignDown(address, pageSize);
+        const uintptr_t end = self->AlignUp(address + size, pageSize);
+        const uintptr_t mapSize = end - base;
+
+        if (isUnmapped)
+        {
+            SetConsoleColor(3);
+            printf("[!] Unmapped access at 0x%p, mapping 0x%zx bytes from 0x%p size 0x%zx bytes\n", (void*)address, (size_t)mapSize, (void*)base, size);
+            MboxSTD("Warn! isUnmapped", "MemCb");
+
+            if (!self->AddMemoryTo(base, mapSize, UC_PROT_READ | UC_PROT_WRITE))
+            {
+                printf("[!] Failed to map region at 0x%p\n", (void*)base);
+                SetConsoleColor(1);
+                return false;
+            }
+
+            printf("[+] Created Region at 0x%p [0x%zx]\n", (void*)base, (size_t)mapSize);
+            SetConsoleColor(1);
+
+            { // custom
+                self->CompareRegionsSnapshots(regionsBF, regionsAF);
+                self->_CopyMemory(address, address, size); // maping equal in native proc // докопирую данные в которые оно лезет, где то зашит регион в vmctx
+                self->DumpMemory(address, size); // uc copy result view
+                MboxSTD("custom wait", "MemCb");
+            }
+
+            return true;
+        }
+
+        if (isProt)
+        {
+            SetConsoleColor(3);
+            printf("[!] Protection fault at 0x%p, trying to relax protection\n", (void*)address);
+            MboxSTD("Warn! isProt", "MemCb");
+
+            if (!self->ChangeMemoryType(base, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC))
+            {
+                printf("[!] Failed to change protection at 0x%p\n", (void*)base);
+                SetConsoleColor(1);
+                return false;
+            }
+
+            SetConsoleColor(1);
+            return true;
+        }
+
         return true;
     };
 
     auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
-        printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+        //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
             MboxSTD("module escape", "asm runner");
