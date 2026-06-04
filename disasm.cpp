@@ -150,7 +150,7 @@ bool AsmRunner::TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstructio
         case ZYDIS_MNEMONIC_LOOP:
         case ZYDIS_MNEMONIC_LOOPE:
         case ZYDIS_MNEMONIC_LOOPNE:
-            return ResolveDirectBranchTarget(instr, ops, curPc, outTarget);
+            return ResolveDirectBranchTarget(uc, instr, ops, curPc, outTarget);
 
         case ZYDIS_MNEMONIC_RET:
         case ZYDIS_MNEMONIC_IRET:
@@ -304,6 +304,15 @@ void AsmRunner::Shutdown()
     m_bDisasmAfterCB = false;
     m_bDisasmRVA = false;
     m_DisasmCustomASLR = 0;
+    m_anyJmpHooks.clear();
+    m_iat.clear();
+    m_bInitIAT = false;
+    m_bUpdatedPCInCB = false;
+    m_iatStart = 0;
+    m_iatEnd = 0;
+    m_cbIATCall = nullptr;
+    m_cbIATCallData = nullptr;
+    m_execRegions.clear();
 }
 
 uc_engine* AsmRunner::GetCTX()
@@ -436,14 +445,167 @@ std::string AsmRunner::FormatCurrentSymbolSuffix(uintptr_t rtAddr) const
     return oss.str();
 }
 
-bool AsmRunner::ResolveDirectBranchTarget(const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const
+bool AsmRunner::ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const
 {
-    for (uint32_t i = 0; i < instr.operand_count_visible; ++i) {
-        if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[i].imm.is_relative) {
-            outTarget = static_cast<uintptr_t>(insnAddr + instr.length + ops[i].imm.value.s);
+    if (!uc)
+        return false;
+
+    auto readU = [&](uint32_t ucReg, size_t truncBytes = sizeof(uintptr_t)) -> bool
+    {
+        uintptr_t v = 0;
+        if (uc_reg_read(uc, ucReg, &v) != UC_ERR_OK)
+            return false;
+
+        if (truncBytes == 4)
+            v = static_cast<uint32_t>(v);
+
+        out = v;
+        return true;
+    };
+
+    switch (reg)
+    {
+        case ZYDIS_REGISTER_RIP:
+        case ZYDIS_REGISTER_EIP:
+            out = CurrentPc(uc);
             return true;
+
+        case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX:
+            return readU(m_bX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX, (reg == ZYDIS_REGISTER_EAX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX:
+            return readU(m_bX64 ? UC_X86_REG_RBX : UC_X86_REG_EBX, (reg == ZYDIS_REGISTER_EBX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX:
+            return readU(m_bX64 ? UC_X86_REG_RCX : UC_X86_REG_ECX, (reg == ZYDIS_REGISTER_ECX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX:
+            return readU(m_bX64 ? UC_X86_REG_RDX : UC_X86_REG_EDX, (reg == ZYDIS_REGISTER_EDX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI:
+            return readU(m_bX64 ? UC_X86_REG_RSI : UC_X86_REG_ESI, (reg == ZYDIS_REGISTER_ESI) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI:
+            return readU(m_bX64 ? UC_X86_REG_RDI : UC_X86_REG_EDI, (reg == ZYDIS_REGISTER_EDI) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP:
+            return readU(m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP, (reg == ZYDIS_REGISTER_ESP) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP:
+            return readU(m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP, (reg == ZYDIS_REGISTER_EBP) ? 4 : sizeof(uintptr_t));
+
+        case ZYDIS_REGISTER_R8:  case ZYDIS_REGISTER_R8D:  return readU(UC_X86_REG_R8, (reg == ZYDIS_REGISTER_R8D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R9:  case ZYDIS_REGISTER_R9D:  return readU(UC_X86_REG_R9, (reg == ZYDIS_REGISTER_R9D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R10: case ZYDIS_REGISTER_R10D: return readU(UC_X86_REG_R10, (reg == ZYDIS_REGISTER_R10D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R11: case ZYDIS_REGISTER_R11D: return readU(UC_X86_REG_R11, (reg == ZYDIS_REGISTER_R11D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R12: case ZYDIS_REGISTER_R12D: return readU(UC_X86_REG_R12, (reg == ZYDIS_REGISTER_R12D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R13: case ZYDIS_REGISTER_R13D: return readU(UC_X86_REG_R13, (reg == ZYDIS_REGISTER_R13D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R14: case ZYDIS_REGISTER_R14D: return readU(UC_X86_REG_R14, (reg == ZYDIS_REGISTER_R14D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R15: case ZYDIS_REGISTER_R15D: return readU(UC_X86_REG_R15, (reg == ZYDIS_REGISTER_R15D) ? 4 : sizeof(uintptr_t));
+
+        default:
+            return false;
+    }
+}
+
+bool AsmRunner::ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const
+{
+    if (op.type != ZYDIS_OPERAND_TYPE_MEMORY)
+        return false;
+
+    uintptr_t ea = 0;
+    bool hasAny = false;
+
+    if (op.mem.base != ZYDIS_REGISTER_NONE)
+    {
+        if (op.mem.base == ZYDIS_REGISTER_RIP || op.mem.base == ZYDIS_REGISTER_EIP)
+        {
+            ea += insnAddr + instr.length;
+            hasAny = true;
+        }
+        else
+        {
+            uintptr_t base = 0;
+            if (!ReadZydisRegisterValue(uc, op.mem.base, base))
+                return false;
+            ea += base;
+            hasAny = true;
         }
     }
+
+    if (op.mem.index != ZYDIS_REGISTER_NONE)
+    {
+        uintptr_t idx = 0;
+        if (!ReadZydisRegisterValue(uc, op.mem.index, idx))
+            return false;
+
+        ea += idx * static_cast<uintptr_t>(op.mem.scale);
+        hasAny = true;
+    }
+
+    if (op.mem.disp.has_displacement)
+    {
+        ea += static_cast<int64_t>(op.mem.disp.value);
+        hasAny = true;
+    }
+
+    if (!hasAny)
+        return false;
+
+    outAddr = ea;
+    return true;
+}
+
+bool AsmRunner::ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const
+{
+    for (uint32_t i = 0; i < instr.operand_count_visible; ++i)
+    {
+        const auto& op = ops[i];
+
+        switch (op.type)
+        {
+        case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+            if (op.imm.is_relative)
+            {
+                outTarget = static_cast<uintptr_t>(insnAddr + instr.length + op.imm.value.s);
+                return true;
+            }
+            break;
+
+        case ZYDIS_OPERAND_TYPE_REGISTER:
+        {
+            uintptr_t v = 0;
+            if (ReadZydisRegisterValue(uc, op.reg.value, v))
+            {
+                outTarget = v;
+                return true;
+            }
+            break;
+        }
+
+        case ZYDIS_OPERAND_TYPE_MEMORY:
+        {
+            uintptr_t ea = 0;
+            if (!ResolveMemoryOperandAddress(uc, instr, op, insnAddr, ea))
+                break;
+
+            const size_t ptrSize = (op.size >= 8) ? static_cast<size_t>(op.size / 8) : (m_bX64 ? 8 : 4);
+            uintptr_t v = 0;
+            if (uc_mem_read(uc, ea, &v, ptrSize) == UC_ERR_OK)
+            {
+                if (!m_bX64)
+                    v = static_cast<uint32_t>(v);
+                else if (ptrSize == 4)
+                    v = static_cast<uint32_t>(v);
+
+                outTarget = v;
+                return true;
+            }
+            break;
+        }
+
+        case ZYDIS_OPERAND_TYPE_POINTER:
+            outTarget = static_cast<uintptr_t>(op.ptr.offset);
+            return true;
+
+        default:
+            break;
+        }
+    }
+
     return false;
 }
 
@@ -489,7 +651,7 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
 
     if (instr.mnemonic == ZYDIS_MNEMONIC_CALL || instr.mnemonic == ZYDIS_MNEMONIC_JMP) {
         uintptr_t target = 0;
-        if (ResolveDirectBranchTarget(instr, operands, runtimeAddress, target)) {
+        if (ResolveDirectBranchTarget(m_uc, instr, operands, runtimeAddress, target)) {
             oss << " ; -> " << FormatRuntimeAddressWithSymbol(target);
         }
     }
@@ -552,10 +714,15 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if (!m_bX64)
         curPc = static_cast<uint32_t>(curPc);
 
+    auto IsAllowedPc = [&](uintptr_t pc) -> bool
+    {
+        return IsModuleAddr(pc) || InExtraRegion(pc); // || IsRetHaltOrNull(pc); // if allow halt we exec 0x0
+    };
+
     if (m_modStart != 0 && m_modEnd != 0) {
         uintptr_t pc = CurrentPc(uc);
-        if (pc < m_modStart || pc >= m_modEnd) {
-            if(m_bLogRunner && !IsRetHaltOrNull(pc))
+        if (!IsAllowedPc(pc)) {
+            if(m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
                 Log("\n[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
             uc_emu_stop(uc);
             return;
@@ -646,6 +813,10 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             uc_emu_stop(uc);
             return;
         }
+        if (m_bUpdatedPCInCB) {
+            m_bUpdatedPCInCB = false;
+            return; // prevent notice in cb with old pc opcode
+        }
     }
 
 #ifdef ZYDIS
@@ -675,9 +846,9 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             }
 
             if (hasTarget) {
-                _OnAnyJmp(uc, curPc, target, instr.mnemonic);
+                _OnAnyJmp(uc, curPc, target, size, instr.mnemonic);
                 if (m_cbJmp) {
-                    if (!m_cbJmp(uc, curPc, target, instr.mnemonic, m_cbJmpData)) {
+                    if (!m_cbJmp(uc, curPc, target, size, instr.mnemonic, m_cbJmpData)) {
                         uc_emu_stop(uc);
                         return;
                     }
@@ -686,19 +857,32 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 #endif
 
             uintptr_t target = 0;
-
-            if (IsAnyIpTransfer(instr.mnemonic) &&
-                TryResolveIpTransfer(uc, instr, operands, curPc, target))
+            if (IsAnyIpTransfer(instr.mnemonic) && TryResolveIpTransfer(uc, instr, operands, curPc, target))
             {
-                _OnAnyJmp(uc, curPc, target, instr.mnemonic);
+                if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic))
+                    return;
 
-                if (m_cbJmp) {
-                    if (!m_cbJmp(uc, curPc, target, instr.mnemonic, m_cbJmpData)) {
-                        uc_emu_stop(uc);
-                        return;
-                    }
+                if (m_bUpdatedPCInCB) {
+                    m_bUpdatedPCInCB = false;
+                    return; // prevent notice in cb with old pc opcode
                 }
             }
+            else if (IsAnyIpTransfer(instr.mnemonic) && !TryResolveIpTransfer(uc, instr, operands, curPc, target))
+            {
+                MboxSTD("Warn! transfer op TryResolveIpTransfer not resolved", "AsmRunner");
+            }
+
+            //if (IsAnyIpTransfer(instr.mnemonic) && TryResolveIpTransfer(uc, instr, operands, curPc, target))
+            //{
+            //    _OnAnyJmp(uc, curPc, target, instr.mnemonic);
+
+            //    if (m_cbJmp) {
+            //        if (!m_cbJmp(uc, curPc, target, instr.mnemonic, m_cbJmpData)) {
+            //            uc_emu_stop(uc);
+            //            return;
+            //        }
+            //    }
+            //}
         }
         else {
             Log("[Zydis] mn=%u len=%u opcnt=%u", instr.mnemonic, instr.length, instr.operand_count_visible);
@@ -732,7 +916,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     }
 
     uintptr_t pcAfter = CurrentPc(uc);
-    if (m_modStart != 0 && m_modEnd != 0 && (pcAfter < m_modStart || pcAfter >= m_modEnd)) {
+    if (m_modStart != 0 && m_modEnd != 0 && !IsAllowedPc(pcAfter)) {
         if (m_bLogRunner && !IsRetHaltOrNull(pcAfter))
             Log("[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pcAfter, (void*)m_modStart, (void*)m_modEnd);
         uc_emu_stop(uc);
@@ -786,11 +970,19 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
                     uc_emu_stop(uc);
                     return false;
                 }
+                if (m_bUpdatedPCInCB) {
+                    m_bUpdatedPCInCB = false;
+                    return true;
+                }
             }
             else if (m_cbBreak) {
                 if (!m_cbBreak(uc, addr, m_cbBreakData)) {
                     uc_emu_stop(uc);
                     return false;
+                }
+                if (m_bUpdatedPCInCB) {
+                    m_bUpdatedPCInCB = false;
+                    return true;
                 }
             }
             break;
@@ -845,21 +1037,73 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
             uc_emu_stop(uc);
             return false;
         }
+
+        if (m_bUpdatedPCInCB) {
+            m_bUpdatedPCInCB = false;
+            return true;
+        }
     }
 
     return true;
 }
 
-void AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic)
+bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic)
 {
-    (void)uc;
-    if (m_bLogAnyJmp) {
+    if (m_bLogAnyJmp)
+    {
         Log("[JMP] 0x%p -> 0x%p (%s -> %s) (%d)",
             (void*)from, (void*)to,
             FormatRuntimeAddressWithSymbol(from).c_str(),
             FormatRuntimeAddressWithSymbol(to).c_str(),
             mnemonic);
     }
+
+    for (const auto& h : m_anyJmpHooks)
+    {
+        if (h.pAddr == to && h.cb)
+        {
+            if (!h.cb(uc, from, to, size, mnemonic, h.data))
+            {
+                uc_emu_stop(uc);
+                return false;
+            }
+
+            if (m_bUpdatedPCInCB) // clear in call side
+                return true; // prevent notice in cb with old pc opcode
+        }
+    }
+
+    if (m_bInitIAT && m_cbIATCall)
+    {
+        for (const auto& n : m_iat)
+        {
+            if (n.moduleBase && n.funcRva && (n.moduleBase + n.funcRva) == to)
+            {
+                if (!m_cbIATCall(uc, to, 0, mnemonic, m_cbIATCallData))
+                {
+                    uc_emu_stop(uc);
+                    return false;
+                }
+
+                if (m_bUpdatedPCInCB) // clear in call side
+                    return true; // prevent notice in cb with old pc opcode
+            }
+        }
+    }
+
+    if (m_cbJmp)
+    {
+        if (!m_cbJmp(uc, from, to, size, mnemonic, m_cbJmpData))
+        {
+            uc_emu_stop(uc);
+            return false;
+        }
+
+        if (m_bUpdatedPCInCB) // clear in call side
+            return true; // prevent notice in cb with old pc opcode
+    }
+
+    return true;
 }
 
 void AsmRunner::_OnBreakpoint(uc_engine* uc, uintptr_t address)
@@ -873,6 +1117,11 @@ void AsmRunner::_OnBreakpoint(uc_engine* uc, uintptr_t address)
 void AsmRunner::_OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz)
 {
     if (!m_trace.active || !m_trace.file.is_open()) return;
+
+    if (m_trace.PCArray) {
+        m_trace.file << "0x" << std::hex << std::uppercase << address << "\n";
+        return;
+    }
 
     std::ostringstream oss;
     oss << std::hex << std::uppercase;
@@ -964,6 +1213,105 @@ bool AsmRunner::GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, u
     nOutSize = static_cast<uintptr_t>(moduleInfo.SizeOfImage);
     pOutEnd = pOutStart + nOutSize;
     return true;
+}
+
+std::string AsmRunner::GetProcessName()
+{
+    char path[MAX_PATH] = { 0 };
+    GetModuleBaseNameA(GetCurrentProcess(), NULL, path, MAX_PATH);
+    return std::string(path);
+}
+
+std::string AsmRunner::GetModuleName(HMODULE hMod)
+{
+    char path[MAX_PATH] = { 0 };
+    GetModuleBaseNameA(GetCurrentProcess(), hMod, path, MAX_PATH);
+    return std::string(path);
+}
+
+void AsmRunner::AddExportsFromModule(HMODULE hMod, std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo)
+{
+    MODULEINFO mi = { 0 };
+    if (!GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi)))
+        return;
+
+    BYTE* base = reinterpret_cast<BYTE*>(mi.lpBaseOfDll);
+    std::string moduleName = GetModuleName(hMod);
+    uintptr_t moduleBase = reinterpret_cast<uintptr_t>(base);
+
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+
+    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size)
+        return;
+
+    IMAGE_EXPORT_DIRECTORY* exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+    if (!exp)
+        return;
+
+    DWORD* funcs = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
+    DWORD* names = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
+    WORD* ords = reinterpret_cast<WORD*>(base + exp->AddressOfNameOrdinals);
+
+    std::vector<std::string> perIndex(exp->NumberOfFunctions);
+
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i)
+    {
+        DWORD idx = ords[i];
+        if (idx < exp->NumberOfFunctions)
+        {
+            const char* nm = reinterpret_cast<const char*>(base + names[i]);
+            if (nm && *nm)
+                perIndex[idx] = nm;
+        }
+    }
+
+    DWORD expStart = dir.VirtualAddress;
+    DWORD expEnd = dir.VirtualAddress + dir.Size;
+
+    for (DWORD i = 0; i < exp->NumberOfFunctions; ++i)
+    {
+        DWORD rva = funcs[i];
+        if (!rva)
+            continue;
+
+        if (rva >= expStart && rva < expEnd)
+            continue;
+
+        uintptr_t addr = reinterpret_cast<uintptr_t>(base + rva);
+
+        std::string funcName = perIndex[i];
+        if (funcName.empty())
+        {
+            char tmp[64];
+            sprintf_s(tmp, "ord%u", exp->Base + i);
+            funcName = tmp;
+        }
+
+        if (addrToInfo.find(addr) == addrToInfo.end())
+        {
+            addrToInfo[addr] = { moduleName, funcName, moduleBase, rva };
+        }
+    }
+}
+
+void AsmRunner::CollectAllExports(std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo)
+{
+    HMODULE mods[1024] = { 0 };
+    DWORD needed = 0;
+
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return;
+
+    size_t count = needed / sizeof(HMODULE);
+    for (size_t i = 0; i < count; ++i)
+        AddExportsFromModule(mods[i], addrToInfo);
 }
 
 void AsmRunner::DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output)
@@ -1605,6 +1953,96 @@ uintptr_t AsmRunner::GetStack(uint32_t nIdx)
     return v;
 }
 
+bool AsmRunner::StackPush(uintptr_t v)
+{
+    if (!m_uc || !m_bInitedStack)
+        return false;
+
+    uintptr_t sp = CurrentSp(m_uc);
+    const uintptr_t ptrSize = PointerSize();
+    const uintptr_t stackLow = m_stackBase;
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    if (sp < stackLow + ptrSize)
+        return false;
+
+    sp -= ptrSize;
+    if (sp < stackLow || (sp + ptrSize) > stackHigh)
+        return false;
+
+    if (uc_mem_write(m_uc, sp, &v, ptrSize) != UC_ERR_OK)
+        return false;
+
+    if (!m_bX64)
+        v = static_cast<uint32_t>(v);
+
+    uc_reg_write(m_uc, SpReg(), &sp);
+    return true;
+}
+
+bool AsmRunner::StackPop(uintptr_t& v)
+{
+    if (!m_uc || !m_bInitedStack)
+        return false;
+
+    uintptr_t sp = CurrentSp(m_uc);
+    const uintptr_t ptrSize = PointerSize();
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    if ((sp + ptrSize) > stackHigh)
+        return false;
+
+    v = 0;
+    if (uc_mem_read(m_uc, sp, &v, ptrSize) != UC_ERR_OK)
+        return false;
+
+    if (!m_bX64)
+        v = static_cast<uint32_t>(v);
+
+    sp += ptrSize;
+    uc_reg_write(m_uc, SpReg(), &sp);
+    return true;
+}
+
+uintptr_t AsmRunner::StackPop()
+{
+    uintptr_t v = 0;
+    if (!StackPop(v))
+        return 0;
+    return v;
+}
+
+bool AsmRunner::StackPeek(uintptr_t& v, uint32_t nIdx)
+{
+    if (!m_uc || !m_bInitedStack)
+        return false;
+
+    uintptr_t sp = CurrentSp(m_uc);
+    const uintptr_t ptrSize = PointerSize();
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    uintptr_t addr = sp + static_cast<uintptr_t>(nIdx) * ptrSize;
+    if ((addr + ptrSize) > stackHigh)
+        return false;
+
+    v = 0;
+    if (uc_mem_read(m_uc, addr, &v, ptrSize) != UC_ERR_OK)
+        return false;
+
+    if (!m_bX64)
+        v = static_cast<uint32_t>(v);
+
+    return true;
+}
+
+uintptr_t AsmRunner::StackPeek(uint32_t nIdx)
+{
+    uintptr_t v = 0;
+    if (!StackPeek(v, nIdx))
+        return 0;
+    return v;
+}
+
 void AsmRunner::SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg)
 {
     if (!m_uc) return;
@@ -1654,6 +2092,240 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
     m_bInitedSehFS = true;
 }
 
+void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data)
+{
+    if (!pAddr)
+        return;
+
+    for (const auto& h : m_anyJmpHooks) {
+        if (h.pAddr == pAddr) {
+            if(m_bLogRunner)
+                Log("AnyJmpHook already exists for this address");
+            MboxSTD("AnyJmpHook already exists for this address", "AsmRunner");
+            return;
+        }
+    }
+
+    m_anyJmpHooks.push_back({ pAddr, std::move(cb), data });
+}
+
+void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bAllExpEnv, bool bTryResolveInModule, bool bRIMEscapeHook, bool bSaveRIM)
+{
+    m_iat.clear();
+    m_iatStart = pStart;
+    m_iatEnd = pEnd;
+    m_bInitIAT = false;
+
+    std::unordered_map<uintptr_t, tIEFuncNode> exports;
+    CollectAllExports(exports);
+
+    if (m_bLogRunner)
+        Log("[*] CollectAllExports: %zu exports", exports.size());
+
+    if (pStart == 0 || pEnd == 0 || pEnd <= pStart)
+    {
+        m_bInitIAT = true;
+        return;
+    }
+
+    const uintptr_t ptrSize = PointerSize();
+    const uint32_t nMaxJunkSteps = 3000;
+
+    FILE* rim = nullptr;
+    if (bSaveRIM)
+        rim = FileOpen("log_iat_resolve.log", "w");
+
+    auto readNativePtr = [&](uintptr_t addr, uintptr_t& out) -> bool
+    {
+        out = 0;
+        std::memcpy(&out, reinterpret_cast<void*>(addr), ptrSize);
+        if (!m_bX64)
+            out = static_cast<uint32_t>(out);
+        return true;
+    };
+
+    auto resolveWrapperEscape = [&](uintptr_t thunkEntry, uintptr_t& outResolved) -> bool
+    {
+        outResolved = 0;
+
+        if (!bTryResolveInModule)
+            return false;
+
+        if (m_modStart == 0 || m_modEnd <= m_modStart)
+            return false;
+
+        if (!IsModuleAddr(thunkEntry))
+            return false;
+
+        AsmRunner resolver(m_bX64);
+        resolver.Initialise(false, false, false, false);
+        resolver.CopyModule(m_modStart, m_modEnd - m_modStart);
+
+        uintptr_t captured = 0;
+
+        auto OpcodeCb = [](uc_engine*, uintptr_t, uint32_t, ZydisMnemonic, void*) -> bool
+        {
+            return true;
+        };
+
+        auto MemCb = [](uc_engine*, int32_t, uintptr_t, uintptr_t, uintptr_t, ZydisMnemonic, void*) -> bool
+        {
+            return true;
+        };
+
+        auto JmpCb = [&captured](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            (void)from;
+            (void)mnemonic;
+
+            if (!self->IsModuleAddr(to))
+            {
+                captured = to;
+                return false;
+            }
+
+            return true;
+        };
+
+        resolver.SetCallbacks(OpcodeCb, &resolver, MemCb, &resolver, JmpCb, &resolver);
+        resolver.Run(thunkEntry, nMaxJunkSteps);
+
+        if (captured != 0)
+        {
+            outResolved = captured;
+            return true;
+        }
+
+        return false;
+    };
+
+    const size_t iatSize = static_cast<size_t>(pEnd - pStart) / static_cast<size_t>(ptrSize);
+    m_iat.reserve(iatSize);
+
+    size_t iatIndex = 0;
+    for (uintptr_t addr = pStart; addr < pEnd; addr += ptrSize)
+    {
+        uintptr_t funcPtr = 0;
+        readNativePtr(addr, funcPtr);
+
+        if (funcPtr == 0)
+        {
+            if (m_bLogRunner)
+                Log("[IAT] skip null @0x%p", (void*)addr);
+
+            if (rim)
+                FileAdd(rim, "%zu", iatIndex);
+
+            iatIndex++;
+            continue;
+        }
+
+        auto itExp = exports.find(funcPtr);
+        if (itExp != exports.end())
+        {
+            m_iat.push_back(itExp->second);
+
+            if (m_bLogRunner)
+            {
+                const auto& n = itExp->second;
+                Log("[IAT] direct 0x%p -> %s!%s base=0x%p rva=0x%p",
+                    (void*)funcPtr,
+                    n.moduleName.c_str(),
+                    n.funcName.c_str(),
+                    (void*)n.moduleBase,
+                    (void*)n.funcRva);
+
+                if (rim)
+                    FileAdd(rim, "%zu %s %s", iatIndex, n.funcName.c_str(), n.moduleName.c_str());
+            }
+
+            iatIndex++;
+            continue;
+        }
+
+        if (IsModuleAddr(funcPtr))
+        {
+            uintptr_t escaped = 0;
+            if (resolveWrapperEscape(funcPtr, escaped))
+            {
+                auto itEsc = exports.find(escaped);
+                if (itEsc != exports.end())
+                {
+                    if (bRIMEscapeHook)
+                    {
+                        tIEFuncNode fakeWrapperNode;
+                        fakeWrapperNode.moduleName = GetModuleName((HMODULE)m_modStart);
+                        fakeWrapperNode.funcName = "fake_" + itEsc->second.funcName;
+                        fakeWrapperNode.moduleBase = m_modStart;
+                        fakeWrapperNode.funcRva = escaped - m_modStart;
+                        m_iat.push_back(fakeWrapperNode); // for hook cb when any call target is our iat wrapper
+                    }
+                    else
+                        m_iat.push_back(itEsc->second); // iat target
+
+                    if (m_bLogRunner)
+                    {
+                        const auto& n = itEsc->second;
+                        Log("[IAT] wrapper 0x%p -> escape 0x%p -> %s!%s base=0x%p rva=0x%p",
+                            (void*)funcPtr,
+                            (void*)escaped,
+                            n.moduleName.c_str(),
+                            n.funcName.c_str(),
+                            (void*)n.moduleBase,
+                            (void*)n.funcRva);
+
+                        if (rim)
+                            FileAdd(rim, "%zu %s %s", iatIndex, n.funcName.c_str(), n.moduleName.c_str());
+                    }
+                }
+                else
+                {
+                    if (m_bLogRunner)
+                        Log("[IAT] wrapper 0x%p escaped to 0x%p but export not found", (void*)funcPtr, (void*)escaped);
+
+                    if (rim)
+                        FileAdd(rim, "%zu", iatIndex);
+                }
+            }
+            else
+            {
+                if (m_bLogRunner)
+                    Log("[IAT] wrapper 0x%p unresolved", (void*)funcPtr);
+
+                if (rim)
+                    FileAdd(rim, "%zu", iatIndex);
+            }
+
+            iatIndex++;
+            continue;
+        }
+
+        if (m_bLogRunner)
+            Log("[IAT] skip non-export 0x%p", (void*)funcPtr);
+
+        if (rim)
+            FileAdd(rim, "%zu", iatIndex);
+    }
+
+    if (rim)
+        FileClose(rim);
+
+    m_bInitIAT = true;
+
+    if (m_bLogRunner)
+    {
+        Log("[*] SetIAT completed: %zu entries, IAT range [0x%p-0x%p]",
+            m_iat.size(), (void*)m_iatStart, (void*)m_iatEnd);
+    }
+}
+
+void AsmRunner::SetIATCallCB(OnOpcodeCb cb, void* data)
+{
+    m_cbIATCall = std::move(cb);
+    m_cbIATCallData = data;
+}
+
 void AsmRunner::SetCallbacks(OnOpcodeCb opcode_cb, void* opcode_data, OnMemCb mem_cb, void* mem_data, OnJmpCb jmp_cb, void* jmp_data)
 {
     m_cbOpcode = std::move(opcode_cb);
@@ -1664,35 +2336,37 @@ void AsmRunner::SetCallbacks(OnOpcodeCb opcode_cb, void* opcode_data, OnMemCb me
     m_cbJmpData = jmp_data;
 }
 
-void AsmRunner::CopyModule(const char* szModule, uintptr_t nSize)
+uintptr_t AsmRunner::CopyModule(const char* szModule, uintptr_t nSize)
 {
     assert(szModule != nullptr);
 
     uintptr_t pStart = 0, pEnd = 0, iSize = 0;
     if (!GetMappedModuleBounds(szModule, pStart, pEnd, iSize)) {
         Shutdown();
-        return;
+        return 0;
     }
 
     if (m_bLogRunner)
-        Log("[%s] base=0x%p end=0x%p size=0x%zx\n", szModule, (void*)pStart, (void*)pEnd, (size_t)iSize);
+        Log("[%s] base=0x%p end=0x%p size=0x%zx", szModule, (void*)pStart, (void*)pEnd, (size_t)iSize);
 
     uintptr_t copySize = (nSize == 0) ? iSize : nSize;
     if (!CopyModuleUC(pStart, pStart, copySize)) {
         Shutdown();
-        return;
+        return 0;
     }
 
     m_modStart = pStart;
     m_modEnd = pEnd;
 
-    //if (m_bLogRunner)
-    //{
-    //    Log("=== %s ===", szModule);
-    //    Log("pStart: 0x%p", (void*)pStart);
-    //    Log("pEnd:   0x%p", (void*)pEnd);
-    //    Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(iSize), static_cast<size_t>(iSize / (1024 * 1024)));
-    //}
+    if (m_bLogRunner)
+    {
+        Log("=== %s ===", szModule);
+        Log("pStart: 0x%p", (void*)pStart);
+        Log("pEnd:   0x%p", (void*)pEnd);
+        Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(iSize), static_cast<size_t>(iSize / (1024 * 1024)));
+    }
+
+    return pStart;
 }
 
 void AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize)
@@ -1703,6 +2377,8 @@ void AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize)
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pFrom);
         auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(pFrom + dos->e_lfanew);
         nSize = nt->OptionalHeader.SizeOfImage;
+        if (m_bLogRunner)
+            Log("IMAGE_NT_HEADERS: 0x%zx", nSize);
     }
 
     if (!CopyModuleUC(pFrom, pFrom, nSize)) {
@@ -1712,11 +2388,157 @@ void AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize)
 
     m_modStart = pFrom;
     m_modEnd = pFrom + nSize;
+
+    if (m_bLogRunner)
+    {
+        //Log("=== %s ===", szModule);
+        Log("pStart: 0x%p", (void*)m_modStart);
+        Log("pEnd:   0x%p", (void*)m_modEnd);
+        Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(nSize), static_cast<size_t>(nSize / (1024 * 1024)));
+    }
 }
 
 void AsmRunner::LoadModule(const char* szModule)
 {
     CopyModule(szModule, 0);
+}
+
+void AsmRunner::ResolveIATModule()
+{
+    if (!m_uc || !m_modStart || m_modEnd <= m_modStart)
+        return;
+
+    auto* base = reinterpret_cast<uint8_t*>(m_modStart);
+
+    __try
+    {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return;
+
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+            return;
+
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dir.VirtualAddress || !dir.Size)
+            return;
+
+        auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+        const uintptr_t ptrSize = PointerSize();
+
+        if (m_bLogRunner)
+            Log("[*] ResolveIATModule: importRVA=0x%p size=0x%zx", (void*)dir.VirtualAddress, static_cast<size_t>(dir.Size));
+
+        for (size_t dllIndex = 0; desc[dllIndex].Name != 0; ++dllIndex)
+        {
+            const char* dllName = reinterpret_cast<const char*>(base + desc[dllIndex].Name);
+            if (!dllName || !*dllName)
+                continue;
+
+            HMODULE hDll = GetModuleHandleA(dllName);
+            if (!hDll)
+                hDll = LoadLibraryA(dllName); // Load!!
+
+            uintptr_t* firstThunk = reinterpret_cast<uintptr_t*>(base + desc[dllIndex].FirstThunk);
+
+            // INT для имён/ординалов, если есть.
+            // Если OriginalFirstThunk == 0, используем FirstThunk как на диске.
+            uintptr_t* origThunk = desc[dllIndex].OriginalFirstThunk
+                ? reinterpret_cast<uintptr_t*>(base + desc[dllIndex].OriginalFirstThunk)
+                : firstThunk;
+
+            if (m_bLogRunner)
+            {
+                Log("[IAT] dll=%s hmod=0x%p OFT=0x%p FT=0x%p",
+                    dllName, (void*)hDll,
+                    (void*)desc[dllIndex].OriginalFirstThunk,
+                    (void*)desc[dllIndex].FirstThunk);
+            }
+
+            for (size_t i = 0; ; ++i)
+            {
+                uintptr_t thunk = origThunk[i];
+                if (thunk == 0)
+                    break;
+
+                void* resolved = nullptr;
+                const char* funcName = nullptr;
+                char ordBuf[32]{};
+
+                if (thunk & IMAGE_ORDINAL_FLAG32)
+                {
+                    WORD ordinal = static_cast<WORD>(thunk & 0xFFFF);
+                    resolved = reinterpret_cast<void*>(GetProcAddress(hDll, MAKEINTRESOURCEA(ordinal)));
+
+                    std::snprintf(ordBuf, sizeof(ordBuf), "#%u", ordinal);
+                    funcName = ordBuf;
+                }
+                else
+                {
+                    auto* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + thunk);
+                    funcName = reinterpret_cast<const char*>(ibn->Name);
+                    resolved = reinterpret_cast<void*>(GetProcAddress(hDll, funcName));
+                }
+
+                const uintptr_t thunkAddr = reinterpret_cast<uintptr_t>(&firstThunk[i]);
+
+                // Если адрес нашли — пишем его в IAT в Unicorn-памяти.
+                // Если нет — оставляем 0, чтобы это было видно в emu.
+                uintptr_t outValue = reinterpret_cast<uintptr_t>(resolved);
+
+                uc_err err = UC_ERR_OK;
+                if (ptrSize == 8)
+                {
+                    uint64_t v = static_cast<uint64_t>(outValue);
+                    err = uc_mem_write(m_uc, thunkAddr, &v, sizeof(v));
+                }
+                else
+                {
+                    uint32_t v = static_cast<uint32_t>(outValue);
+                    err = uc_mem_write(m_uc, thunkAddr, &v, sizeof(v));
+                }
+
+                if (m_bLogRunner)
+                {
+                    Log("[IAT] %s!%s -> %p  write@0x%p %s",
+                        dllName,
+                        funcName ? funcName : "?",
+                        resolved,
+                        (void*)thunkAddr,
+                        (err == UC_ERR_OK) ? "OK" : uc_strerror(err));
+                }
+            }
+        }
+
+        m_bInitIAT = true;
+
+        if (m_bLogRunner)
+            Log("[*] ResolveIATModule done");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (m_bLogRunner)
+            Log("[!] ResolveIATModule: exception while parsing PE image");
+    }
+}
+
+void AsmRunner::AddExecRegion(uintptr_t pStart, uintptr_t pEnd)
+{
+    if (pStart == 0 || pEnd == 0 || pEnd <= pStart)
+        return;
+
+    m_execRegions.push_back({ pStart, pEnd });
+}
+
+bool AsmRunner::InExtraRegion(uintptr_t pAddr) const
+{
+    for (const auto& r : m_execRegions)
+    {
+        if (pAddr >= r.pStart && pAddr < r.pEnd)
+            return true;
+    }
+    return false;
 }
 
 bool AsmRunner::LoadExportsFromBase(uintptr_t base, std::vector<tFuncNode>& out) const
@@ -1822,6 +2644,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 
     m_bPaused = false;
     m_bStopped = false;
+    m_bUpdatedPCInCB = false;
 
     if (m_bLogRunner) {
         Log("[*] Entry = 0x%p", (void*)pc);
@@ -2052,7 +2875,7 @@ void AsmRunner::TraceWriteLine(const std::string& s)
     m_trace.file << s << '\n';
 }
 
-void AsmRunner::TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount, TraceCb cb)
+void AsmRunner::TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount, TraceCb cb, bool bPCArray)
 {
     if (!m_uc) return;
     if (!szTraceFileOutPath || !*szTraceFileOutPath) return;
@@ -2066,6 +2889,7 @@ void AsmRunner::TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStar
 
     m_trace.count = 0;
     m_trace.maxCount = nMaxCount;
+    m_trace.PCArray = bPCArray;
     m_trace.cbStop = std::move(cb);
     m_trace.active = true;
     m_trace.prevRegs.clear();
@@ -2512,11 +3336,12 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
 }
 
 #if 0
-void TestUsage1()
+void IatTestUC()
 {
     AsmRunner runner(false);
-    void* pEntry = (void*)(0x62E4686F);
+    void* pEntry = addr(0x62E4686F);
 
+    MboxSTD("VMENTRY_UT_HK", "hold");
 
     //uintptr_t pStart = 0;
     //uintptr_t pEnd = 0;
@@ -2529,124 +3354,39 @@ void TestUsage1()
     //	return;
     //}
 
-    //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", "mdl.dll", (void*)pStart, (void*)pEnd, (size_t)nSize);
+    //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", STEAM_LIB, (void*)pStart, (void*)pEnd, (size_t)nSize);
 
-    auto OpcodeCb = [&pThemidaStart, &pThemidaEnd](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        //printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
-        self->DumpRegisters(true);
-        return true;
+        printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
 
-        if (self->IsInAddr(address, pThemidaStart, pThemidaEnd)) {
-            SetConsoleColor(0); // red
-        }
-        else {
-            SetConsoleColor(1);
-        }
+        //std::vector<uint8_t> bytes(size);
+        //if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) {
+        //	printf("[!] Failed to read bytes at 0x%p\n", (void*)address);
+        //	return true; // продолжаем, но логируем ошибку
+        //}
 
-        if (self->GetInstructionCount() > /*5080*/110000) {
-            self->SetLogDisasm(true);
-        }
-        else {
-            self->SetLogDisasm(false);
-        }
+        //if (bytes[0] == 0xC3) { // tmp
+        //	printf("[RET] at 0x%p\n", (void*)address);
+        //	return false; // если хочешь остановиться на RET
+        //}
 
-        if (self->IsSymMapInitialised()) {
-            static const tFuncNode* lastsym = nullptr;
-            const tFuncNode* sym = self->FindSymbolByRuntime(address);
-            if (sym && sym != lastsym) {
-                printf("%s\n", sym->name.c_str());
-                lastsym = sym;
-            }
-        }
-
+        // Ничего не делаем, просто возвращаем true (продолжаем выполнение)
         return true;
     };
 
     auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
-        auto* self = static_cast<AsmRunner*>(user_data);
-        //printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
-
-        if (!self || !uc || size == 0)
-            return true;
-
-        //////std::vector<uint8_t> bytes(size);
-        //////if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) { // !! old and wrong
-        //////	SetConsoleColor(3);
-        //////	printf("[!] Failed to read bytes at 0x%p\n", (void*)address);
-        //////	self->AddMemoryTo(address, size, UC_PROT_READ | UC_PROT_WRITE);
-        //////	printf("[!] Created Region at 0x%p [%d]\n", (void*)address, size);
-        //////	SetConsoleColor(1);
-        //////	return true;
-        //////}
-
-        const bool isUnmapped =
-            type == UC_MEM_READ_UNMAPPED ||
-            type == UC_MEM_WRITE_UNMAPPED ||
-            type == UC_MEM_FETCH_UNMAPPED;
-
-        const bool isProt =
-            type == UC_MEM_READ_PROT ||
-            type == UC_MEM_WRITE_PROT ||
-            type == UC_MEM_FETCH_PROT;
-
-        const uintptr_t pageSize = 0x1000;
-        const uintptr_t base = self->AlignDown(address, pageSize);
-        const uintptr_t end = self->AlignUp(address + size, pageSize);
-        const uintptr_t mapSize = end - base;
-
-        if (isUnmapped)
-        {
-            SetConsoleColor(3);
-            printf("[!] Unmapped access at 0x%p, mapping 0x%zx bytes from 0x%p size 0x%zx bytes\n", (void*)address, (size_t)mapSize, (void*)base, size);
-            MboxSTD("Warn! isUnmapped", "MemCb");
-
-            if (!self->AddMemoryTo(base, mapSize, UC_PROT_READ | UC_PROT_WRITE))
-            {
-                printf("[!] Failed to map region at 0x%p\n", (void*)base);
-                SetConsoleColor(1);
-                return false;
-            }
-
-            printf("[+] Created Region at 0x%p [0x%zx]\n", (void*)base, (size_t)mapSize);
-            SetConsoleColor(1);
-
-            { // custom
-                self->CompareRegionsSnapshots(regionsBF, regionsAF);
-                self->_CopyMemory(address, address, size); // maping equal in native proc // докопирую данные в которые оно лезет, где то зашит регион в vmctx
-                self->DumpMemory(address, size); // uc copy result view
-                MboxSTD("custom wait", "MemCb");
-            }
-
-            return true;
-        }
-
-        if (isProt)
-        {
-            SetConsoleColor(3);
-            printf("[!] Protection fault at 0x%p, trying to relax protection\n", (void*)address);
-            MboxSTD("Warn! isProt", "MemCb");
-
-            if (!self->ChangeMemoryType(base, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC))
-            {
-                printf("[!] Failed to change protection at 0x%p\n", (void*)base);
-                SetConsoleColor(1);
-                return false;
-            }
-
-            SetConsoleColor(1);
-            return true;
-        }
+        //printf("MemCb 0x%p\n", (void*)address);
 
         return true;
     };
 
-    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
-        //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+        printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
-        if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
+        if (!self->IsModuleAddr(to)) {
             MboxSTD("module escape", "asm runner");
             return false;
         }
@@ -2657,7 +3397,7 @@ void TestUsage1()
     runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
-    runner.CopyModule("mdl.dll");
+    runner.CopyModule(STEAM_LIB);
     runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
     //runner.TraceInstruction("C:\\trace.txt", reinterpret_cast<uintptr_t>(pEntry), 300); return; // автостарт
 
@@ -2667,68 +3407,6 @@ void TestUsage1()
     printf("[*] entry=0x%p\n", pEntry);
 
     runner.Run(reinterpret_cast<uintptr_t>(pEntry), 300); // 0 = без лимита по шагам
-    runner.Shutdown();
-}
-
-void TestUsage2()
-{
-    AsmRunner runner(false);
-    void* pEntry = (void*)(0x60F2F0C0);
-    void* pEntryArg = (void*)(0x615CDB58);
-
-    //uintptr_t pStart = 0;
-    //uintptr_t pEnd = 0;
-    //uintptr_t nSize = 0;
-    //runner.GetMappedModuleBounds("mdl.dll", pStart, pEnd, nSize);
-
-    //if (nSize == 0 || pStart == 0)
-    //{
-    //    //MboxSTD("VMENTRY_UT_HK", "module not found");
-    //    return;
-    //}
-
-    //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", "mdl.dll", (void*)pStart, (void*)pEnd, (size_t)nSize);
-
-    runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
-    runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
-    //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
-    runner.CopyModule("mdl.dll");
-    // if bInitUC false
-    ////runner.SetStack();                        // отдельный stack region    // !!!!!! already in Init
-    ////runner.SetFakeSehTid();                   // fs:0 / zero page заглушка // !!!!!! already in Init
-    // runner.SetCallbacks(...);              // при желании свои callback'и
-
-    // UC буфер 0x1000 под аргумент entrypoint
-    //uintptr_t pEntryArg = runner.AddMemory(0x1000, UC_PROT_READ | UC_PROT_WRITE);
-    //if (!pEntryArg)
-    //{
-    //	MboxSTD("VMENTRY_UT_HK", "alloc uc buffer failed");
-    //	runner.Shutdown();
-    //	return;
-    //}
-
-    runner.SetEntryPointStackArg(0, reinterpret_cast<uintptr_t>(pEntryArg));
-    runner.SetRegister(UC_X86_REG_ECX, reinterpret_cast<uintptr_t>(pEntryArg)); // if thiscall-style ctx is needed
-
-    //{ // diff test
-    //    auto s1 = runner.MakeSnapshotS((uintptr_t)pEntry, 0x1000);
-    //    char* buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntry, 0x1000);
-    //    buf[0] = 0xCC;
-    //    buf[100] = 0xCC;
-    //    runner._CopyMemory((uintptr_t)pEntry, (uintptr_t)buf, 0x1000);
-    //    free(buf);
-    //    auto s2 = runner.MakeSnapshotS((uintptr_t)pEntry, 0x1000);
-    //    runner.CompareSnapshots(s1, s2);
-    //    return;
-    //}
-
-    // Пример брейка по адресу
-    // runner.SetBreakpoint(reinterpret_cast<uintptr_t>(pEntry), [](AsmRunner*, uint64_t a){ printf("BP hit 0x%llx\n", (unsigned long long)a); }, true);
-
-    printf("[*] entry=0x%p\n", pEntry);
-    //runner.DisassembleWithZydis(); // покажет первые инструкции модуля с именами
-
-    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 100); // 0 = без лимита по шагам
     runner.Shutdown();
 }
 
@@ -2755,9 +3433,97 @@ void TestStackArgs()
     }
 
     AsmRunner runner(false);
-    auto OpcodeCb = [&pThemidaStart, &pThemidaEnd](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
         //printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
+        self->DumpRegisters(true);
+        return true;
+    };
+
+    auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        //printf("MemCb 0x%p\n", (void*)address);
+        return true;
+    };
+
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+
+        printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+
+        if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
+            MboxSTD("module escape", "asm runner");
+            return false;
+        }
+
+        return true;
+    };
+
+    runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
+    runner.CopyModule("c_export_test_dll.dll");
+    runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
+    const char* pArg = "AZAZIN";
+    uintptr_t pEntryArg = runner.AddMemory((uintptr_t)pArg, strlen(pArg) + 1, UC_PROT_READ | UC_PROT_WRITE);
+    uintptr_t pEntryArg2 = runner.AddMemory(strlen(pArg) + 1, UC_PROT_READ | UC_PROT_WRITE);
+    printf("pEntryArg (src) = 0x%p\n", (void*)pEntryArg);
+    printf("pEntryArg2 (dest) = 0x%p\n", (void*)pEntryArg2);
+    char* buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntryArg2, strlen(pArg) + 1);
+    printf("bf from uc %s\n", buf);
+    //MyMemcpy(void *dest, const void *src, unsigned int count)
+    runner.SetEntryPointStackArg(0, pEntryArg2); // dst
+    runner.SetEntryPointStackArg(1, pEntryArg); // src
+    runner.SetEntryPointStackArg(2, strlen(pArg) + 1); // sz
+    runner.Run(reinterpret_cast<uintptr_t>(f), 300); // 0 = без лимита по шагам
+    buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntryArg2, strlen(pArg) + 1);
+    printf("af from uc %s\n", buf);
+    runner.Shutdown();
+    MboxSTD("halt", "hold");
+}
+
+void VMENTRY_UT_HK(void* lpParameter)
+{
+    //IatTestUC();
+    //Test1();
+    //return;
+
+    ULONG_PTR lowLimit = 0;
+    ULONG_PTR highLimit = 0;
+
+    GetCurrentThreadStackLimits(&lowLimit, &highLimit);
+
+    printf("base (Stack Base): 0x%p\n", (void*)lowLimit);
+    printf("max (Stack Limit): 0x%p\n", (void*)highLimit);
+    printf("Size:   0x%zx (%zu MB)\n", static_cast<size_t>(highLimit - lowLimit), static_cast<size_t>(highLimit - lowLimit / (1024 * 1024)));
+
+    //auto regions = FindRegions(0x4D000, MEM_PRIVATE, PAGE_READWRITE, MEM_COMMIT);
+    //printf("[*] regions=%d\n", regions.size());
+    //void* pACPISSDT = regions.size() ? regions[0].baseAddress : null;
+    //printf("[*] pACPISSDT=0x%p\n", pACPISSDT);
+
+    AsmRunner runner(false);
+    void* pEntry = addr(0x60F2F0C0);
+    void* pEntryArg = addr(0x615CDB58);
+
+    uintptr_t pThemidaStart = (uintptr_t)addr(0x629D5000);
+    uintptr_t pThemidaEnd = (uintptr_t)addr(0x630DD000);
+
+    MboxSTD("VMENTRY_UT_HK", "hold");
+
+    //uintptr_t pStart = 0;
+    //uintptr_t pEnd = 0;
+    //uintptr_t nSize = 0;
+    //runner.GetMappedModuleBounds(STEAM_LIB, pStart, pEnd, nSize);
+
+    //if (nSize == 0 || pStart == 0)
+    //{
+    //	MboxSTD("VMENTRY_UT_HK", "module not found");
+    //	return;
+    //}
+
+    //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", STEAM_LIB, (void*)pStart, (void*)pEnd, (size_t)nSize);
+
+    auto OpcodeCb = [&pThemidaStart, &pThemidaEnd](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
         //self->DumpRegisters(true);
         if (self->IsInAddr(address, pThemidaStart, pThemidaEnd)) {
             SetConsoleColor(0); // red
@@ -2787,7 +3553,7 @@ void TestStackArgs()
 
     auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        //printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
+        printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
 
         if (!self || !uc || size == 0)
             return true;
@@ -2863,10 +3629,10 @@ void TestStackArgs()
         return true;
     };
 
-    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
-        //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+        printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
             MboxSTD("module escape", "asm runner");
@@ -2876,24 +3642,100 @@ void TestStackArgs()
         return true;
     };
 
+    runner.SetAnyJmpHook(0x12345678, [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            printf("[memcpy hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u", (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
+
+            const uintptr_t retaddr = from + size;
+            uintptr_t dst = 0;
+            uintptr_t src = 0;
+            uintptr_t n = 0;
+
+            if (self->IsX64())
+            {
+                dst = self->GetRegister(UC_X86_REG_RCX);
+                src = self->GetRegister(UC_X86_REG_RDX);
+                n = self->GetRegister(UC_X86_REG_R8);
+            }
+            else
+            {
+                if (!self->StackPop(dst)) return false;
+                if (!self->StackPop(src)) return false;
+                if (!self->StackPop(n))   return false;
+            }
+
+            printf("[memcpy] dst=0x%p src=0x%p n=0x%p ret=0x%p", (void*)dst, (void*)src, (void*)n, (void*)retaddr);
+
+            if (n != 0)
+                self->_CopyMemory(dst, src, n);
+
+            self->SetRegister(self->AxReg(), dst);
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        },
+        &runner);
+
     runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
-    runner.CopyModule("c_export_test_dll.dll");
+    runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
+    runner.SetDisasmAfterCB(true);
+    runner.SetDisasmRVA(true, 0x60F00000);
+    //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
+    uintptr_t mod = runner.CopyModule(STEAM_LIB);
+    runner.SetIAT((uintptr_t)addr(0x6137B000), (uintptr_t)addr(0x6137B508), false, true);
+    //uintptr_t mod = runner.CopyModule("_steamclient2.dll");
+    //runner.SetIAT((uintptr_t)addrCRC(0x6137B000), (uintptr_t)addrCRC(0x6137B508), false, true);
     runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
-    const char* pArg = "AZAZIN";
-    uintptr_t pEntryArg = runner.AddMemory((uintptr_t)pArg, strlen(pArg) + 1, UC_PROT_READ | UC_PROT_WRITE);
-    uintptr_t pEntryArg2 = runner.AddMemory(strlen(pArg) + 1, UC_PROT_READ | UC_PROT_WRITE);
-    printf("pEntryArg (src) = 0x%p\n", (void*)pEntryArg);
-    printf("pEntryArg2 (dest) = 0x%p\n", (void*)pEntryArg2);
-    char* buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntryArg2, strlen(pArg) + 1);
-    printf("bf from uc %s\n", buf);
-    //MyMemcpy(void *dest, const void *src, unsigned int count)
-    runner.SetEntryPointStackArg(0, pEntryArg2); // dst
-    runner.SetEntryPointStackArg(1, pEntryArg); // src
-    runner.SetEntryPointStackArg(2, strlen(pArg) + 1); // sz
-    runner.Run(reinterpret_cast<uintptr_t>(f), 300); // 0 = без лимита по шагам
-    buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntryArg2, strlen(pArg) + 1);
-    printf("af from uc %s\n", buf);
+    //runner.TraceInstruction("C:\\trace.txt", reinterpret_cast<uintptr_t>(pEntry), 300); return; // автостарт
+
+    // UC буфер 0x1000 под аргумент entrypoint
+    //uintptr_t pEntryArg = runner.AddMemory(0x1000, UC_PROT_READ | UC_PROT_WRITE);
+    //if (!pEntryArg)
+    //{
+    //	MboxSTD("VMENTRY_UT_HK", "alloc uc buffer failed");
+    //	runner.Shutdown();
+    //	return;
+    //}
+
+    runner.SetEntryPointStackArg(0, reinterpret_cast<uintptr_t>(pEntryArg));
+    //runner.SetRegister(UC_X86_REG_ECX, reinterpret_cast<uintptr_t>(pEntryArg)); // if thiscall-style ctx is needed
+
+    // Пример брейка по адресу
+    // runner.SetBreakpoint(reinterpret_cast<uintptr_t>(pEntry), [](AsmRunner*, uint64_t a){ printf("BP hit 0x%llx\n", (unsigned long long)a); }, true);
+
+    printf("[*] entry=0x%p\n", pEntry);
+    //runner.DisassembleWithZydis(); // покажет первые инструкции модуля с именами
+
+    //{ // diff test
+    //	auto s1 = runner.MakeSnapshotS((uintptr_t)pEntry, 0x1000);
+    //	char* buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntry, 0x1000);
+    //	buf[0] = 0xCC;
+    //	buf[100] = 0xCC;
+    //	runner._CopyMemory((uintptr_t)pEntry, (uintptr_t)buf, 0x1000);
+    //	free(buf);
+    //	auto s2 = runner.MakeSnapshotS((uintptr_t)pEntry, 0x1000);
+    //	runner.CompareSnapshots(s1, s2);
+    //	return;
+    //}
+
+    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 900000); // 0 = без лимита по шагам
     runner.Shutdown();
+
+
     MboxSTD("halt", "hold");
+    SetConsoleColor(1);
+    return;
+
+    MboxSTD("HkPostSendVM (post thread start)", "mzhk");
+    printf("lpParameter 0x%p  LPPARAM_CRITICAL_SECTION_POST_ANSW\n", lpParameter);
+    auto PostSendVM = (void(__cdecl*)(void*))addr(0x60F2F0C0);
+    PostSendVM(lpParameter); // memset -> vmentry -> vmexit -> vmreturn
+    printf("lpParameter 0x%p\n", lpParameter);
+    //MboxSTD("HkPostSendVM", "mzhk");
 }
 #endif

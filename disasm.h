@@ -24,15 +24,24 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <unordered_map>
 
 #define ARP(p) ((uintptr_t)p)
 #define ARV(p) ((void*)p)
 
-struct tFuncNode
+struct tFuncNode //tmp, use tIEFuncNode
 {
 	uintptr_t rva = 0;
 	size_t size = 0;
 	std::string name;
+};
+
+struct tIEFuncNode
+{
+	std::string moduleName;
+	std::string funcName;
+	uintptr_t moduleBase;
+	uintptr_t funcRva;
 };
 
 enum eBpType : uint32_t
@@ -54,8 +63,8 @@ public:
 	// type - UC_MEM_READ/UC_MEM_WRITE, address - адрес доступа, size - размер, value - значение (для записи)
 	using OnMemCb = std::function<bool(uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data)>;
 
-	// Тип колбэка для перехода: вызывается при jmp/call/ret
-	using OnJmpCb = std::function<bool(uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic, void* user_data)>;
+	// Тип колбэка для перехода: вызывается при jmp/call/ret // Pre - Jump transfer callback
+	using OnJmpCb = std::function<bool(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data)>;
 
 	// Тип колбэка для брейкпоинта
 	using OnBreakpointCb = std::function<bool(uc_engine* uc, uintptr_t address, void* user_data)>;
@@ -82,6 +91,8 @@ public:
 	bool IsLogRunner() const { return m_bLogRunner; }
 	void SetX64(bool isX64) { m_bX64 = isX64; }
 	bool IsX64() const { return m_bX64; }
+	void SetUpdatedPC(bool bUpdatedPCInCB) { m_bUpdatedPCInCB = bUpdatedPCInCB; }
+	bool IsUpdatedPC() const { return m_bUpdatedPCInCB; }
 	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
 
 	// core lifecycle
@@ -98,12 +109,16 @@ public:
 
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
 	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
+	std::string GetProcessName();
+	std::string GetModuleName(HMODULE hMod);
+	void AddExportsFromModule(HMODULE hMod, std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo);
+	void CollectAllExports(std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo);
 	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output);
 	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, const uint16_t* byteColors, const uint16_t* asciiColors);
 	static void SetConsoleColor(int32_t mode);
-	void MboxSTD(std::string msg, std::string title);
-	void EXIT_F();
-	void EXIT_S();
+	static void MboxSTD(std::string msg, std::string title);
+	static void EXIT_F();
+	static void EXIT_S();
 	static uintptr_t RestorePointer(uintptr_t op_addr, uintptr_t offset);
 	static uintptr_t CalculateOffset(uintptr_t op_addr, uintptr_t dst);
 	static void* SearchPointerByPattern(void* ptrStart, int block_size, std::string pattern);
@@ -134,6 +149,26 @@ public:
 	bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
 
 	// asm / registers / stack
+	uint32_t PcReg() const { return m_bX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP; }
+	uint32_t SpReg() const { return m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP; }
+	uint32_t FpReg() const { return m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP; }
+	uint32_t AxReg() const { return m_bX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX; }
+	uint32_t BxReg() const { return m_bX64 ? UC_X86_REG_RBX : UC_X86_REG_EBX; }
+	uint32_t CxReg() const { return m_bX64 ? UC_X86_REG_RCX : UC_X86_REG_ECX; }
+	uint32_t DxReg() const { return m_bX64 ? UC_X86_REG_RDX : UC_X86_REG_EDX; }
+	uint32_t SiReg() const { return m_bX64 ? UC_X86_REG_RSI : UC_X86_REG_ESI; }
+	uint32_t DiReg() const { return m_bX64 ? UC_X86_REG_RDI : UC_X86_REG_EDI; }
+	uint32_t FlagsReg() const { return UC_X86_REG_EFLAGS; }
+	uint32_t R8Reg() const { return m_bX64 ? UC_X86_REG_R8 : UC_X86_REG_R8D; }
+	uint32_t R9Reg() const { return m_bX64 ? UC_X86_REG_R9 : UC_X86_REG_R9D; }
+	uint32_t R10Reg() const { return m_bX64 ? UC_X86_REG_R10 : UC_X86_REG_R10D; }
+	uint32_t R11Reg() const { return m_bX64 ? UC_X86_REG_R11 : UC_X86_REG_R11D; }
+	uint32_t R12Reg() const { return m_bX64 ? UC_X86_REG_R12 : UC_X86_REG_R12D; }
+	uint32_t R13Reg() const { return m_bX64 ? UC_X86_REG_R13 : UC_X86_REG_R13D; }
+	uint32_t R14Reg() const { return m_bX64 ? UC_X86_REG_R14 : UC_X86_REG_R14D; }
+	uint32_t R15Reg() const { return m_bX64 ? UC_X86_REG_R15 : UC_X86_REG_R15D; }
+	uint32_t PointerSize() const { return m_bX64 ? 8 : 4; }
+
 	void SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg); // bLogRunner log st ptr // default // 0=ebp+4?
 	void SetStackArgEbpIndex(uint32_t nIdx, uintptr_t arg); // ebp+4 +8 +C ...  // bLogRunner log st ptr // custom stack arg // 4=ebpdefault 0arg?
 	void SetRegister(uint32_t nRegister, uintptr_t arg); // todo unicorn types?
@@ -141,15 +176,27 @@ public:
 	void SetStack(uintptr_t pStack, uintptr_t nSize); // if bLogRunner log stack
 	void SetStack(); // if bLogRunner log stack
 	uintptr_t GetStack(uint32_t nIdx);
+	bool StackPush(uintptr_t v);
+	bool StackPop(uintptr_t& v);
+	uintptr_t StackPop();
+	bool StackPeek(uintptr_t& v, uint32_t nIdx = 0);
+	uintptr_t StackPeek(uint32_t nIdx = 0);
 	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 
+
 	// callbacks / execution
+	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr);
+	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bAllExpEnv = true, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
+	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
 		OnMemCb mem_cb = nullptr, void* mem_data = nullptr,
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
-	void CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
+	uintptr_t CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
 	void CopyModule(uintptr_t pFrom, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
 	void LoadModule(const char* szModule); // mz pe? (exe+dll)
+	void ResolveIATModule();
+	void AddExecRegion(uintptr_t pStart, uintptr_t pEnd);
+	bool InExtraRegion(uintptr_t pAddr) const;
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep);
@@ -169,7 +216,8 @@ public:
 
 	void SetBreakpoint(uintptr_t pAddr, eBpType type = BP_CODE, uint32_t size = 1, OnBreakpointCb cb = nullptr, void* data = nullptr);
 	void RemoveBreakpoint(uintptr_t pAddr);
-	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr); // 0 until end, cb can null autofalse
+	// TODO: AddTraceInstructionPoint // точка с которой начинается логирование в обчном Run
+	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr, bool bPCArray = false); // 0 until end, cb can null autofalse
 
 	// IDA 7.6 IDC // https://docs.hex-rays.com/9.0/developer-guide/idc/idc-api-reference/alphabetical-list-of-idc-functions/686
 	std::string SanitizeIdaName(const std::string& in);
@@ -240,7 +288,21 @@ private:
 		uintptr_t lastMemAddr = 0;
 		uint32_t lastMemSize = 0;
 		bool lastMemWrite = false;
+		bool PCArray = false;
 		std::vector<uint8_t> lastMemData;
+	};
+
+	struct tAnyJmpHookNode
+	{
+		uintptr_t pAddr = 0;
+		OnJmpCb cb = nullptr;
+		void* data = nullptr;
+	};
+
+	struct tExecRegion
+	{
+		uintptr_t pStart = 0;
+		uintptr_t pEnd = 0;
 	};
 
 	uc_engine* m_uc = nullptr;
@@ -256,8 +318,18 @@ private:
 	bool m_bDisasmAfterCB = false;
 	bool m_bDisasmRVA = false;
 	uintptr_t m_DisasmCustomASLR = 0;
+	bool m_bInitIAT = false;
+	bool m_bUpdatedPCInCB = false;
 
 	std::vector<tFuncNode> m_sym;
+	std::vector<tAnyJmpHookNode> m_anyJmpHooks; // when any call smth from here
+	std::vector<tIEFuncNode> m_iat;
+	std::vector<tExecRegion> m_execRegions; // extra allowed no halt regions for execute
+
+	uintptr_t m_iatStart = 0;
+	uintptr_t m_iatEnd = 0;
+	OnOpcodeCb m_cbIATCall; // when any call smth from m_iat
+	void* m_cbIATCallData = nullptr;
 
 	uintptr_t m_modStart = 0;
 	uintptr_t m_modEnd = 0;
@@ -298,10 +370,6 @@ private:
 #endif
 
 private:
-	uint32_t PcReg() const { return m_bX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP; }
-	uint32_t SpReg() const { return m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP; }
-	uint32_t FpReg() const { return m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP; }
-
 	void Log(const char* fmt, ...) const;
 
 	static void HookCodeTrampoline(uc_engine* uc, uint64_t address, uint32_t size, void* user_data);
@@ -313,7 +381,7 @@ private:
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
 	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
-	void _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, ZydisMnemonic mnemonic);        // jmp/call/ret детектируется в _OnInstructionStep
+	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic);        // jmp/call/ret детектируется в _OnInstructionStep
 	void _OnBreakpoint(uc_engine* uc, uintptr_t address);             // срабатывание точки останова
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
 
@@ -321,7 +389,9 @@ private:
 	std::string FormatRuntimeAddress(uintptr_t rtAddr) const;
 	std::string FormatRuntimeAddressWithSymbol(uintptr_t rtAddr) const;
 	std::string FormatCurrentSymbolSuffix(uintptr_t rtAddr) const;
-	bool ResolveDirectBranchTarget(const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const;
+	bool ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const;
+	bool ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const;
+	bool ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const;
 
 	// more helpers
 	bool ReadBytes(uc_engine* uc, uint64_t address, uint32_t size, std::vector<uint8_t>& out) const;
@@ -657,6 +727,18 @@ public:
 //60F01040 VT_Adapters::CSteamAppTicket001_TICKET_sub_60F01040, 010d
 //60F01150 sub_60F01150, 001a
 
+
+// Stack hint
+// STACK: 0x00 (stack max)
+//	lvars int b;
+//	lvars int a;
+//	prev frame EBP (saved EBP); // pushed by prologue current function
+//  return addr; // pc after call, pushed by cpu call
+//  arg1 5; // pushed caller before call, 3d push
+//  arg2 6; // pushed caller before call, 2th push
+//  arg3 7; // pushed caller before call, 1st push
+//  0x0000 halt
+// STACK: 0xFF (stack base)
 
 // links
 //https://github.com/colby57/VMP-Imports-Deobfuscator/tree/3d9817024ea58d806a52a2bd85dde5b1c697dc75
