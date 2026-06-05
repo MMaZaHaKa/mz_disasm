@@ -42,6 +42,8 @@ struct tIEFuncNode
 	std::string funcName;
 	uintptr_t moduleBase;
 	uintptr_t funcRva;
+
+	inline uintptr_t GetAbsolute() { return moduleBase + funcRva; }
 };
 
 enum eBpType : uint32_t
@@ -186,8 +188,10 @@ public:
 
 	// callbacks / execution
 	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr);
-	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bAllExpEnv = true, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
+	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
+	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
+	tIEFuncNode* FindIATNode(std::string name, bool bLowerCmp = true, bool bContains = false);
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
 		OnMemCb mem_cb = nullptr, void* mem_data = nullptr,
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
@@ -325,6 +329,7 @@ private:
 	std::vector<tAnyJmpHookNode> m_anyJmpHooks; // when any call smth from here
 	std::vector<tIEFuncNode> m_iat;
 	std::vector<tExecRegion> m_execRegions; // extra allowed no halt regions for execute
+	std::unordered_map<uintptr_t, tIEFuncNode> exportsENV;
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
@@ -376,6 +381,9 @@ private:
 	static bool HookMemTrampoline(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
 	static bool IsAnyIpTransfer(ZydisMnemonic mn);
 	bool TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t curPc, uintptr_t& outTarget);
+	bool ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const;
+	bool ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const;
+	bool ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const;
 	bool CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size);
 
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
@@ -389,9 +397,6 @@ private:
 	std::string FormatRuntimeAddress(uintptr_t rtAddr) const;
 	std::string FormatRuntimeAddressWithSymbol(uintptr_t rtAddr) const;
 	std::string FormatCurrentSymbolSuffix(uintptr_t rtAddr) const;
-	bool ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const;
-	bool ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const;
-	bool ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const;
 
 	// more helpers
 	bool ReadBytes(uc_engine* uc, uint64_t address, uint32_t size, std::vector<uint8_t>& out) const;

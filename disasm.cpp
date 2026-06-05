@@ -120,6 +120,7 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
     }
 }
 
+#ifndef AR_DEBUG
 bool AsmRunner::TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t curPc, uintptr_t& outTarget)
 {
     switch (instr.mnemonic)
@@ -159,7 +160,7 @@ bool AsmRunner::TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstructio
         {
             uintptr_t sp = CurrentSp(uc);
             uintptr_t ret = 0;
-            const size_t ptrSize = m_bX64 ? 8 : 4;
+            const size_t ptrSize = PointerSize();
 
             if (uc_mem_read(uc, sp, &ret, ptrSize) == UC_ERR_OK)
             {
@@ -176,6 +177,522 @@ bool AsmRunner::TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstructio
             return false;
     }
 }
+
+bool AsmRunner::ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const
+{
+    if (!uc)
+        return false;
+
+    auto readU = [&](uint32_t ucReg, size_t truncBytes = sizeof(uintptr_t)) -> bool
+    {
+        uintptr_t v = 0;
+        if (uc_reg_read(uc, ucReg, &v) != UC_ERR_OK)
+            return false;
+
+        if (truncBytes == 4)
+            v = static_cast<uint32_t>(v);
+
+        out = v;
+        return true;
+    };
+
+    switch (reg)
+    {
+        case ZYDIS_REGISTER_RIP:
+        case ZYDIS_REGISTER_EIP:
+            out = CurrentPc(uc);
+            return true;
+
+        case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX:
+            return readU(m_bX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX, (reg == ZYDIS_REGISTER_EAX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX:
+            return readU(m_bX64 ? UC_X86_REG_RBX : UC_X86_REG_EBX, (reg == ZYDIS_REGISTER_EBX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX:
+            return readU(m_bX64 ? UC_X86_REG_RCX : UC_X86_REG_ECX, (reg == ZYDIS_REGISTER_ECX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX:
+            return readU(m_bX64 ? UC_X86_REG_RDX : UC_X86_REG_EDX, (reg == ZYDIS_REGISTER_EDX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI:
+            return readU(m_bX64 ? UC_X86_REG_RSI : UC_X86_REG_ESI, (reg == ZYDIS_REGISTER_ESI) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI:
+            return readU(m_bX64 ? UC_X86_REG_RDI : UC_X86_REG_EDI, (reg == ZYDIS_REGISTER_EDI) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP:
+            return readU(m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP, (reg == ZYDIS_REGISTER_ESP) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP:
+            return readU(m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP, (reg == ZYDIS_REGISTER_EBP) ? 4 : sizeof(uintptr_t));
+
+        case ZYDIS_REGISTER_R8:  case ZYDIS_REGISTER_R8D:  return readU(UC_X86_REG_R8, (reg == ZYDIS_REGISTER_R8D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R9:  case ZYDIS_REGISTER_R9D:  return readU(UC_X86_REG_R9, (reg == ZYDIS_REGISTER_R9D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R10: case ZYDIS_REGISTER_R10D: return readU(UC_X86_REG_R10, (reg == ZYDIS_REGISTER_R10D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R11: case ZYDIS_REGISTER_R11D: return readU(UC_X86_REG_R11, (reg == ZYDIS_REGISTER_R11D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R12: case ZYDIS_REGISTER_R12D: return readU(UC_X86_REG_R12, (reg == ZYDIS_REGISTER_R12D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R13: case ZYDIS_REGISTER_R13D: return readU(UC_X86_REG_R13, (reg == ZYDIS_REGISTER_R13D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R14: case ZYDIS_REGISTER_R14D: return readU(UC_X86_REG_R14, (reg == ZYDIS_REGISTER_R14D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R15: case ZYDIS_REGISTER_R15D: return readU(UC_X86_REG_R15, (reg == ZYDIS_REGISTER_R15D) ? 4 : sizeof(uintptr_t));
+
+        default:
+            return false;
+    }
+}
+
+bool AsmRunner::ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const
+{
+    if (op.type != ZYDIS_OPERAND_TYPE_MEMORY)
+        return false;
+
+    uintptr_t ea = 0;
+    bool hasAny = false;
+
+    if (op.mem.base != ZYDIS_REGISTER_NONE)
+    {
+        if (op.mem.base == ZYDIS_REGISTER_RIP || op.mem.base == ZYDIS_REGISTER_EIP)
+        {
+            ea += insnAddr + instr.length;
+            hasAny = true;
+        }
+        else
+        {
+            uintptr_t base = 0;
+            if (!ReadZydisRegisterValue(uc, op.mem.base, base))
+                return false;
+            ea += base;
+            hasAny = true;
+        }
+    }
+
+    if (op.mem.index != ZYDIS_REGISTER_NONE)
+    {
+        uintptr_t idx = 0;
+        if (!ReadZydisRegisterValue(uc, op.mem.index, idx))
+            return false;
+
+        ea += idx * static_cast<uintptr_t>(op.mem.scale);
+        hasAny = true;
+    }
+
+    if (op.mem.disp.has_displacement)
+    {
+        ea += static_cast<int64_t>(op.mem.disp.value);
+        hasAny = true;
+    }
+
+    if (!hasAny)
+        return false;
+
+    outAddr = ea;
+    return true;
+}
+
+bool AsmRunner::ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const
+{
+    for (uint32_t i = 0; i < instr.operand_count_visible; ++i)
+    {
+        const auto& op = ops[i];
+
+        switch (op.type)
+        {
+            case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+                if (op.imm.is_relative)
+                {
+                    outTarget = static_cast<uintptr_t>(insnAddr + instr.length + op.imm.value.s);
+                    return true;
+                }
+                break;
+
+            case ZYDIS_OPERAND_TYPE_REGISTER:
+            {
+                uintptr_t v = 0;
+                if (ReadZydisRegisterValue(uc, op.reg.value, v))
+                {
+                    outTarget = v;
+                    return true;
+                }
+                break;
+            }
+
+            case ZYDIS_OPERAND_TYPE_MEMORY:
+            {
+                uintptr_t ea = 0;
+                if (!ResolveMemoryOperandAddress(uc, instr, op, insnAddr, ea))
+                    break;
+
+                const size_t ptrSize = (op.size >= 8) ? static_cast<size_t>(op.size / 8) : (m_bX64 ? 8 : 4);
+                uintptr_t v = 0;
+                if (uc_mem_read(uc, ea, &v, ptrSize) == UC_ERR_OK)
+                {
+                    if (!m_bX64)
+                        v = static_cast<uint32_t>(v);
+                    else if (ptrSize == 4)
+                        v = static_cast<uint32_t>(v);
+
+                    outTarget = v;
+                    return true;
+                }
+                else {
+                    if (m_bLogRunner)
+                        Log("ResolveDirectBranchTarget: Failed to read %zu bytes from address 0x%p (ptrSize=%zu, op.size=%d)",
+                            ptrSize, (void*)ea, ptrSize, op.size);
+                    MboxSTD("ResolveDirectBranchTarget: Error Read", "AsmRunner");
+                }
+                break;
+            }
+
+            case ZYDIS_OPERAND_TYPE_POINTER:
+                outTarget = static_cast<uintptr_t>(op.ptr.offset);
+                return true;
+
+            default:
+                break;
+        }
+    }
+
+    return false;
+}
+#else
+bool AsmRunner::TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t curPc, uintptr_t& outTarget)
+{
+    Log("[TryResolveIpTransfer] ENTER: mnemonic=0x%x, curPc=0x%llx\n", instr.mnemonic, (unsigned long long)curPc);
+
+    switch (instr.mnemonic)
+    {
+        case ZYDIS_MNEMONIC_CALL:
+        case ZYDIS_MNEMONIC_JMP:
+        case ZYDIS_MNEMONIC_JB:
+        case ZYDIS_MNEMONIC_JBE:
+        case ZYDIS_MNEMONIC_JNB:
+        case ZYDIS_MNEMONIC_JNBE:
+        case ZYDIS_MNEMONIC_JL:
+        case ZYDIS_MNEMONIC_JLE:
+        case ZYDIS_MNEMONIC_JNL:
+        case ZYDIS_MNEMONIC_JNLE:
+        case ZYDIS_MNEMONIC_JNO:
+        case ZYDIS_MNEMONIC_JNP:
+        case ZYDIS_MNEMONIC_JNS:
+        case ZYDIS_MNEMONIC_JNZ:
+        case ZYDIS_MNEMONIC_JO:
+        case ZYDIS_MNEMONIC_JP:
+        case ZYDIS_MNEMONIC_JS:
+        case ZYDIS_MNEMONIC_JZ:
+        case ZYDIS_MNEMONIC_JCXZ:
+        case ZYDIS_MNEMONIC_JECXZ:
+        case ZYDIS_MNEMONIC_JRCXZ:
+        case ZYDIS_MNEMONIC_JKNZD:
+        case ZYDIS_MNEMONIC_JKZD:
+        case ZYDIS_MNEMONIC_LOOP:
+        case ZYDIS_MNEMONIC_LOOPE:
+        case ZYDIS_MNEMONIC_LOOPNE:
+            Log("[TryResolveIpTransfer] Branch/Call/Jump instruction -> calling ResolveDirectBranchTarget\n");
+            return ResolveDirectBranchTarget(uc, instr, ops, curPc, outTarget);
+
+        case ZYDIS_MNEMONIC_RET:
+        case ZYDIS_MNEMONIC_IRET:
+        case ZYDIS_MNEMONIC_IRETD:
+        case ZYDIS_MNEMONIC_IRETQ:
+        {
+            Log("[TryResolveIpTransfer] Return instruction detected\n");
+            uintptr_t sp = CurrentSp(uc);
+            uintptr_t ret = 0;
+            const size_t ptrSize = PointerSize();
+
+            Log("[TryResolveIpTransfer] SP=0x%llx, ptrSize=%zu, m_bX64=%d\n",
+                (unsigned long long)sp, ptrSize, m_bX64);
+
+            if (uc_mem_read(uc, sp, &ret, ptrSize) == UC_ERR_OK)
+            {
+                Log("[TryResolveIpTransfer] Read return address from stack: 0x%llx\n", (unsigned long long)ret);
+                if (!m_bX64)
+                {
+                    uint32_t oldRet = (uint32_t)ret;
+                    ret = static_cast<uint32_t>(ret);
+                    Log("[TryResolveIpTransfer] Truncated to 32-bit: 0x%x -> 0x%llx\n", oldRet, (unsigned long long)ret);
+                }
+
+                outTarget = ret;
+                Log("[TryResolveIpTransfer] Return target=0x%llx\n", (unsigned long long)outTarget);
+                return true;
+            }
+            Log("[TryResolveIpTransfer] FAILED to read return address from stack!\n");
+            return false;
+        }
+
+        default:
+            Log("[TryResolveIpTransfer] Unknown mnemonic, returning false\n");
+            return false;
+    }
+}
+
+bool AsmRunner::ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const
+{
+    Log("[ReadZydisRegisterValue] ENTER: reg=%d, m_bX64=%d\n", reg, m_bX64);
+
+    if (!uc)
+    {
+        Log("[ReadZydisRegisterValue] ERROR: uc is NULL\n");
+        return false;
+    }
+
+    auto readU = [&](uint32_t ucReg, size_t truncBytes = sizeof(uintptr_t)) -> bool
+    {
+        Log("[ReadZydisRegisterValue] readU: ucReg=0x%x, truncBytes=%zu\n", ucReg, truncBytes);
+        uintptr_t v = 0;
+        if (uc_reg_read(uc, ucReg, &v) != UC_ERR_OK)
+        {
+            Log("[ReadZydisRegisterValue] readU: uc_reg_read FAILED for ucReg=0x%x\n", ucReg);
+            return false;
+        }
+
+        Log("[ReadZydisRegisterValue] readU: raw value=0x%llx\n", (unsigned long long)v);
+
+        if (truncBytes == 4)
+        {
+            uint32_t oldV = (uint32_t)v;
+            v = static_cast<uint32_t>(v);
+            Log("[ReadZydisRegisterValue] readU: truncated to 32-bit: 0x%x -> 0x%llx\n", oldV, (unsigned long long)v);
+        }
+
+        out = v;
+        return true;
+    };
+
+    switch (reg)
+    {
+        case ZYDIS_REGISTER_RIP:
+        case ZYDIS_REGISTER_EIP:
+            out = CurrentPc(uc);
+            Log("[ReadZydisRegisterValue] RIP/EIP: CurrentPc=0x%llx\n", (unsigned long long)out);
+            return true;
+
+        case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX:
+            Log("[ReadZydisRegisterValue] Reading RAX/EAX\n");
+            return readU(m_bX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX, (reg == ZYDIS_REGISTER_EAX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX:
+            Log("[ReadZydisRegisterValue] Reading RBX/EBX\n");
+            return readU(m_bX64 ? UC_X86_REG_RBX : UC_X86_REG_EBX, (reg == ZYDIS_REGISTER_EBX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX:
+            Log("[ReadZydisRegisterValue] Reading RCX/ECX\n");
+            return readU(m_bX64 ? UC_X86_REG_RCX : UC_X86_REG_ECX, (reg == ZYDIS_REGISTER_ECX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX:
+            Log("[ReadZydisRegisterValue] Reading RDX/EDX\n");
+            return readU(m_bX64 ? UC_X86_REG_RDX : UC_X86_REG_EDX, (reg == ZYDIS_REGISTER_EDX) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI:
+            Log("[ReadZydisRegisterValue] Reading RSI/ESI\n");
+            return readU(m_bX64 ? UC_X86_REG_RSI : UC_X86_REG_ESI, (reg == ZYDIS_REGISTER_ESI) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI:
+            Log("[ReadZydisRegisterValue] Reading RDI/EDI\n");
+            return readU(m_bX64 ? UC_X86_REG_RDI : UC_X86_REG_EDI, (reg == ZYDIS_REGISTER_EDI) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP:
+            Log("[ReadZydisRegisterValue] Reading RSP/ESP\n");
+            return readU(m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP, (reg == ZYDIS_REGISTER_ESP) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP:
+            Log("[ReadZydisRegisterValue] Reading RBP/EBP\n");
+            return readU(m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP, (reg == ZYDIS_REGISTER_EBP) ? 4 : sizeof(uintptr_t));
+
+        case ZYDIS_REGISTER_R8:  case ZYDIS_REGISTER_R8D:
+            Log("[ReadZydisRegisterValue] Reading R8/R8D\n");
+            return readU(UC_X86_REG_R8, (reg == ZYDIS_REGISTER_R8D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R9:  case ZYDIS_REGISTER_R9D:
+            Log("[ReadZydisRegisterValue] Reading R9/R9D\n");
+            return readU(UC_X86_REG_R9, (reg == ZYDIS_REGISTER_R9D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R10: case ZYDIS_REGISTER_R10D:
+            Log("[ReadZydisRegisterValue] Reading R10/R10D\n");
+            return readU(UC_X86_REG_R10, (reg == ZYDIS_REGISTER_R10D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R11: case ZYDIS_REGISTER_R11D:
+            Log("[ReadZydisRegisterValue] Reading R11/R11D\n");
+            return readU(UC_X86_REG_R11, (reg == ZYDIS_REGISTER_R11D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R12: case ZYDIS_REGISTER_R12D:
+            Log("[ReadZydisRegisterValue] Reading R12/R12D\n");
+            return readU(UC_X86_REG_R12, (reg == ZYDIS_REGISTER_R12D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R13: case ZYDIS_REGISTER_R13D:
+            Log("[ReadZydisRegisterValue] Reading R13/R13D\n");
+            return readU(UC_X86_REG_R13, (reg == ZYDIS_REGISTER_R13D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R14: case ZYDIS_REGISTER_R14D:
+            Log("[ReadZydisRegisterValue] Reading R14/R14D\n");
+            return readU(UC_X86_REG_R14, (reg == ZYDIS_REGISTER_R14D) ? 4 : sizeof(uintptr_t));
+        case ZYDIS_REGISTER_R15: case ZYDIS_REGISTER_R15D:
+            Log("[ReadZydisRegisterValue] Reading R15/R15D\n");
+            return readU(UC_X86_REG_R15, (reg == ZYDIS_REGISTER_R15D) ? 4 : sizeof(uintptr_t));
+
+        default:
+            Log("[ReadZydisRegisterValue] UNKNOWN register: %d\n", reg);
+            return false;
+    }
+}
+
+bool AsmRunner::ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const
+{
+    Log("[ResolveMemoryOperandAddress] ENTER: insnAddr=0x%llx, op.type=%d\n", (unsigned long long)insnAddr, op.type);
+
+    if (op.type != ZYDIS_OPERAND_TYPE_MEMORY)
+    {
+        Log("[ResolveMemoryOperandAddress] Not a memory operand, returning false\n");
+        return false;
+    }
+
+    uintptr_t ea = 0;
+    bool hasAny = false;
+
+    Log("[ResolveMemoryOperandAddress] base=%d, index=%d, scale=%d, disp=%lld\n",
+        op.mem.base, op.mem.index, op.mem.scale, (long long)op.mem.disp.value);
+
+    if (op.mem.base != ZYDIS_REGISTER_NONE)
+    {
+        if (op.mem.base == ZYDIS_REGISTER_RIP || op.mem.base == ZYDIS_REGISTER_EIP)
+        {
+            ea += insnAddr + instr.length;
+            Log("[ResolveMemoryOperandAddress] RIP-relative: insnAddr=0x%llx, instr.length=%d, ea=0x%llx\n",
+                (unsigned long long)insnAddr, instr.length, (unsigned long long)ea);
+            hasAny = true;
+        }
+        else
+        {
+            uintptr_t base = 0;
+            Log("[ResolveMemoryOperandAddress] Reading base register\n");
+            if (!ReadZydisRegisterValue(uc, op.mem.base, base))
+            {
+                Log("[ResolveMemoryOperandAddress] FAILED to read base register\n");
+                return false;
+            }
+            ea += base;
+            Log("[ResolveMemoryOperandAddress] base=0x%llx, ea now=0x%llx\n", (unsigned long long)base, (unsigned long long)ea);
+            hasAny = true;
+        }
+    }
+
+    if (op.mem.index != ZYDIS_REGISTER_NONE)
+    {
+        uintptr_t idx = 0;
+        Log("[ResolveMemoryOperandAddress] Reading index register\n");
+        if (!ReadZydisRegisterValue(uc, op.mem.index, idx))
+        {
+            Log("[ResolveMemoryOperandAddress] FAILED to read index register\n");
+            return false;
+        }
+
+        uintptr_t scaledIdx = idx * static_cast<uintptr_t>(op.mem.scale);
+        ea += scaledIdx;
+        Log("[ResolveMemoryOperandAddress] idx=0x%llx, scale=%d, scaled=0x%llx, ea now=0x%llx\n",
+            (unsigned long long)idx, op.mem.scale, (unsigned long long)scaledIdx, (unsigned long long)ea);
+        hasAny = true;
+    }
+
+    if (op.mem.disp.has_displacement)
+    {
+        ea += static_cast<int64_t>(op.mem.disp.value);
+        Log("[ResolveMemoryOperandAddress] Added displacement %lld, ea=0x%llx\n",
+            (long long)op.mem.disp.value, (unsigned long long)ea);
+        hasAny = true;
+    }
+
+    if (!hasAny)
+    {
+        Log("[ResolveMemoryOperandAddress] No address components found!\n");
+        return false;
+    }
+
+    outAddr = ea;
+    Log("[ResolveMemoryOperandAddress] Final address=0x%llx\n", (unsigned long long)outAddr);
+    return true;
+}
+
+bool AsmRunner::ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const
+{
+    Log("[ResolveDirectBranchTarget] ENTER: insnAddr=0x%llx, operand_count=%d\n",
+        (unsigned long long)insnAddr, instr.operand_count_visible);
+
+    for (uint32_t i = 0; i < instr.operand_count_visible; ++i)
+    {
+        const auto& op = ops[i];
+        Log("[ResolveDirectBranchTarget] Processing operand %d: type=%d\n", i, op.type);
+
+        switch (op.type)
+        {
+            case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+                Log("[ResolveDirectBranchTarget] Immediate operand: is_relative=%d, value.s=%lld\n",
+                    op.imm.is_relative, (long long)op.imm.value.s);
+                if (op.imm.is_relative)
+                {
+                    outTarget = static_cast<uintptr_t>(insnAddr + instr.length + op.imm.value.s);
+                    Log("[ResolveDirectBranchTarget] Relative branch: 0x%llx + %d + %lld = 0x%llx\n",
+                        (unsigned long long)insnAddr, instr.length, (long long)op.imm.value.s, (unsigned long long)outTarget);
+                    return true;
+                }
+                break;
+
+            case ZYDIS_OPERAND_TYPE_REGISTER:
+                Log("[ResolveDirectBranchTarget] Register operand: reg=%d\n", op.reg.value);
+                {
+                    uintptr_t v = 0;
+                    if (ReadZydisRegisterValue(uc, op.reg.value, v))
+                    {
+                        outTarget = v;
+                        Log("[ResolveDirectBranchTarget] Register jump: target=0x%llx\n", (unsigned long long)outTarget);
+                        return true;
+                    }
+                    Log("[ResolveDirectBranchTarget] FAILED to read register value\n");
+                    break;
+                }
+
+            case ZYDIS_OPERAND_TYPE_MEMORY:
+                Log("[ResolveDirectBranchTarget] Memory operand: size=%d\n", op.size);
+                {
+                    uintptr_t ea = 0;
+                    if (!ResolveMemoryOperandAddress(uc, instr, op, insnAddr, ea))
+                    {
+                        Log("[ResolveDirectBranchTarget] FAILED to resolve memory address\n");
+                        break;
+                    }
+
+                    const size_t ptrSize = (op.size >= 8) ? static_cast<size_t>(op.size / 8) : (m_bX64 ? 8 : 4);
+                    Log("[ResolveDirectBranchTarget] Reading from address 0x%llx, ptrSize=%zu\n", (unsigned long long)ea, ptrSize);
+
+                    uintptr_t v = 0;
+                    if (uc_mem_read(uc, ea, &v, ptrSize) == UC_ERR_OK)
+                    {
+                        Log("[ResolveDirectBranchTarget] Raw read value=0x%llx\n", (unsigned long long)v);
+
+                        if (!m_bX64)
+                        {
+                            uint32_t oldV = (uint32_t)v;
+                            v = static_cast<uint32_t>(v);
+                            Log("[ResolveDirectBranchTarget] 32-bit mode, truncated: 0x%x -> 0x%llx\n", oldV, (unsigned long long)v);
+                        }
+                        else if (ptrSize == 4)
+                        {
+                            uint32_t oldV = (uint32_t)v;
+                            v = static_cast<uint32_t>(v);
+                            Log("[ResolveDirectBranchTarget] 64-bit mode but reading 32-bit ptr, truncated: 0x%x -> 0x%llx\n", oldV, (unsigned long long)v);
+                        }
+
+                        outTarget = v;
+                        Log("[ResolveDirectBranchTarget] Memory jump: target=0x%llx\n", (unsigned long long)outTarget);
+                        return true;
+                    }
+                    else {
+                        if (m_bLogRunner)
+                            Log("ResolveDirectBranchTarget: Failed to read %zu bytes from address 0x%p (ptrSize=%zu, op.size=%d)",
+                                ptrSize, (void*)ea, ptrSize, op.size);
+                        MboxSTD("ResolveDirectBranchTarget: Error Read", "AsmRunner");
+                    }
+
+                    Log("[ResolveDirectBranchTarget] FAILED to read from memory at 0x%llx\n", (unsigned long long)ea);
+                    break;
+                }
+
+            case ZYDIS_OPERAND_TYPE_POINTER:
+                Log("[ResolveDirectBranchTarget] Pointer operand: offset=0x%llx, segment=0x%x\n",
+                    (unsigned long long)op.ptr.offset, op.ptr.segment);
+                outTarget = static_cast<uintptr_t>(op.ptr.offset);
+                return true;
+
+            default:
+                Log("[ResolveDirectBranchTarget] Unhandled operand type: %d\n", op.type);
+                break;
+        }
+    }
+
+    Log("[ResolveDirectBranchTarget] FAILED to resolve target\n");
+    return false;
+}
+#endif
 
 bool AsmRunner::CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size)
 {
@@ -306,6 +823,7 @@ void AsmRunner::Shutdown()
     m_DisasmCustomASLR = 0;
     m_anyJmpHooks.clear();
     m_iat.clear();
+    exportsENV.clear();
     m_bInitIAT = false;
     m_bUpdatedPCInCB = false;
     m_iatStart = 0;
@@ -443,170 +961,6 @@ std::string AsmRunner::FormatCurrentSymbolSuffix(uintptr_t rtAddr) const
         oss << "+0x" << std::hex << std::uppercase << (rel - sym->rva);
 
     return oss.str();
-}
-
-bool AsmRunner::ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const
-{
-    if (!uc)
-        return false;
-
-    auto readU = [&](uint32_t ucReg, size_t truncBytes = sizeof(uintptr_t)) -> bool
-    {
-        uintptr_t v = 0;
-        if (uc_reg_read(uc, ucReg, &v) != UC_ERR_OK)
-            return false;
-
-        if (truncBytes == 4)
-            v = static_cast<uint32_t>(v);
-
-        out = v;
-        return true;
-    };
-
-    switch (reg)
-    {
-        case ZYDIS_REGISTER_RIP:
-        case ZYDIS_REGISTER_EIP:
-            out = CurrentPc(uc);
-            return true;
-
-        case ZYDIS_REGISTER_RAX: case ZYDIS_REGISTER_EAX:
-            return readU(m_bX64 ? UC_X86_REG_RAX : UC_X86_REG_EAX, (reg == ZYDIS_REGISTER_EAX) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_RBX: case ZYDIS_REGISTER_EBX:
-            return readU(m_bX64 ? UC_X86_REG_RBX : UC_X86_REG_EBX, (reg == ZYDIS_REGISTER_EBX) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_RCX: case ZYDIS_REGISTER_ECX:
-            return readU(m_bX64 ? UC_X86_REG_RCX : UC_X86_REG_ECX, (reg == ZYDIS_REGISTER_ECX) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_RDX: case ZYDIS_REGISTER_EDX:
-            return readU(m_bX64 ? UC_X86_REG_RDX : UC_X86_REG_EDX, (reg == ZYDIS_REGISTER_EDX) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_RSI: case ZYDIS_REGISTER_ESI:
-            return readU(m_bX64 ? UC_X86_REG_RSI : UC_X86_REG_ESI, (reg == ZYDIS_REGISTER_ESI) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_RDI: case ZYDIS_REGISTER_EDI:
-            return readU(m_bX64 ? UC_X86_REG_RDI : UC_X86_REG_EDI, (reg == ZYDIS_REGISTER_EDI) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_RSP: case ZYDIS_REGISTER_ESP:
-            return readU(m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP, (reg == ZYDIS_REGISTER_ESP) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_RBP: case ZYDIS_REGISTER_EBP:
-            return readU(m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP, (reg == ZYDIS_REGISTER_EBP) ? 4 : sizeof(uintptr_t));
-
-        case ZYDIS_REGISTER_R8:  case ZYDIS_REGISTER_R8D:  return readU(UC_X86_REG_R8, (reg == ZYDIS_REGISTER_R8D) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_R9:  case ZYDIS_REGISTER_R9D:  return readU(UC_X86_REG_R9, (reg == ZYDIS_REGISTER_R9D) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_R10: case ZYDIS_REGISTER_R10D: return readU(UC_X86_REG_R10, (reg == ZYDIS_REGISTER_R10D) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_R11: case ZYDIS_REGISTER_R11D: return readU(UC_X86_REG_R11, (reg == ZYDIS_REGISTER_R11D) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_R12: case ZYDIS_REGISTER_R12D: return readU(UC_X86_REG_R12, (reg == ZYDIS_REGISTER_R12D) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_R13: case ZYDIS_REGISTER_R13D: return readU(UC_X86_REG_R13, (reg == ZYDIS_REGISTER_R13D) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_R14: case ZYDIS_REGISTER_R14D: return readU(UC_X86_REG_R14, (reg == ZYDIS_REGISTER_R14D) ? 4 : sizeof(uintptr_t));
-        case ZYDIS_REGISTER_R15: case ZYDIS_REGISTER_R15D: return readU(UC_X86_REG_R15, (reg == ZYDIS_REGISTER_R15D) ? 4 : sizeof(uintptr_t));
-
-        default:
-            return false;
-    }
-}
-
-bool AsmRunner::ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const
-{
-    if (op.type != ZYDIS_OPERAND_TYPE_MEMORY)
-        return false;
-
-    uintptr_t ea = 0;
-    bool hasAny = false;
-
-    if (op.mem.base != ZYDIS_REGISTER_NONE)
-    {
-        if (op.mem.base == ZYDIS_REGISTER_RIP || op.mem.base == ZYDIS_REGISTER_EIP)
-        {
-            ea += insnAddr + instr.length;
-            hasAny = true;
-        }
-        else
-        {
-            uintptr_t base = 0;
-            if (!ReadZydisRegisterValue(uc, op.mem.base, base))
-                return false;
-            ea += base;
-            hasAny = true;
-        }
-    }
-
-    if (op.mem.index != ZYDIS_REGISTER_NONE)
-    {
-        uintptr_t idx = 0;
-        if (!ReadZydisRegisterValue(uc, op.mem.index, idx))
-            return false;
-
-        ea += idx * static_cast<uintptr_t>(op.mem.scale);
-        hasAny = true;
-    }
-
-    if (op.mem.disp.has_displacement)
-    {
-        ea += static_cast<int64_t>(op.mem.disp.value);
-        hasAny = true;
-    }
-
-    if (!hasAny)
-        return false;
-
-    outAddr = ea;
-    return true;
-}
-
-bool AsmRunner::ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const
-{
-    for (uint32_t i = 0; i < instr.operand_count_visible; ++i)
-    {
-        const auto& op = ops[i];
-
-        switch (op.type)
-        {
-        case ZYDIS_OPERAND_TYPE_IMMEDIATE:
-            if (op.imm.is_relative)
-            {
-                outTarget = static_cast<uintptr_t>(insnAddr + instr.length + op.imm.value.s);
-                return true;
-            }
-            break;
-
-        case ZYDIS_OPERAND_TYPE_REGISTER:
-        {
-            uintptr_t v = 0;
-            if (ReadZydisRegisterValue(uc, op.reg.value, v))
-            {
-                outTarget = v;
-                return true;
-            }
-            break;
-        }
-
-        case ZYDIS_OPERAND_TYPE_MEMORY:
-        {
-            uintptr_t ea = 0;
-            if (!ResolveMemoryOperandAddress(uc, instr, op, insnAddr, ea))
-                break;
-
-            const size_t ptrSize = (op.size >= 8) ? static_cast<size_t>(op.size / 8) : (m_bX64 ? 8 : 4);
-            uintptr_t v = 0;
-            if (uc_mem_read(uc, ea, &v, ptrSize) == UC_ERR_OK)
-            {
-                if (!m_bX64)
-                    v = static_cast<uint32_t>(v);
-                else if (ptrSize == 4)
-                    v = static_cast<uint32_t>(v);
-
-                outTarget = v;
-                return true;
-            }
-            break;
-        }
-
-        case ZYDIS_OPERAND_TYPE_POINTER:
-            outTarget = static_cast<uintptr_t>(op.ptr.offset);
-            return true;
-
-        default:
-            break;
-        }
-    }
-
-    return false;
 }
 
 bool AsmRunner::ReadBytes(uc_engine* uc, uint64_t address, uint32_t size, std::vector<uint8_t>& out) const
@@ -856,21 +1210,26 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             }
 #endif
 
-            uintptr_t target = 0;
-            if (IsAnyIpTransfer(instr.mnemonic) && TryResolveIpTransfer(uc, instr, operands, curPc, target))
-            {
-                if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic))
-                    return;
+            if (IsAnyIpTransfer(instr.mnemonic)) {
+                uintptr_t target = 0;
+                if (TryResolveIpTransfer(uc, instr, operands, curPc, target)) {
+                    if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic))
+                        return;
 
-                if (m_bUpdatedPCInCB) {
-                    m_bUpdatedPCInCB = false;
-                    return; // prevent notice in cb with old pc opcode
+                    if (m_bUpdatedPCInCB) {
+                        m_bUpdatedPCInCB = false;
+                        return; // prevent notice in cb with old pc opcode
+                    }
                 }
-            }
-            else if (IsAnyIpTransfer(instr.mnemonic) && !TryResolveIpTransfer(uc, instr, operands, curPc, target))
-            {
-                MboxSTD("Warn! transfer op TryResolveIpTransfer not resolved", "AsmRunner");
-            }
+                else {
+                    if (m_bLogRunner) {
+                        Log("[!] TryResolveIpTransfer failed: pc=0x%p mn=%u len=%u opcnt=%u",
+                            (void*)curPc, (unsigned)instr.mnemonic, (unsigned)instr.length,
+                            (unsigned)instr.operand_count_visible);
+                    }
+                    MboxSTD("Warn! transfer op TryResolveIpTransfer not resolved", "AsmRunner");
+                }
+            }         
 
             //if (IsAnyIpTransfer(instr.mnemonic) && TryResolveIpTransfer(uc, instr, operands, curPc, target))
             //{
@@ -2109,18 +2468,18 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data)
     m_anyJmpHooks.push_back({ pAddr, std::move(cb), data });
 }
 
-void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bAllExpEnv, bool bTryResolveInModule, bool bRIMEscapeHook, bool bSaveRIM)
+void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule, bool bRIMEscapeHook, bool bSaveRIM)
 {
+    exportsENV.clear();
     m_iat.clear();
     m_iatStart = pStart;
     m_iatEnd = pEnd;
     m_bInitIAT = false;
 
-    std::unordered_map<uintptr_t, tIEFuncNode> exports;
-    CollectAllExports(exports);
+    CollectAllExports(exportsENV);
 
     if (m_bLogRunner)
-        Log("[*] CollectAllExports: %zu exports", exports.size());
+        Log("[*] CollectAllExports: %zu exports", exportsENV.size());
 
     if (pStart == 0 || pEnd == 0 || pEnd <= pStart)
     {
@@ -2221,8 +2580,8 @@ void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bAllExpEnv, bool b
             continue;
         }
 
-        auto itExp = exports.find(funcPtr);
-        if (itExp != exports.end())
+        auto itExp = exportsENV.find(funcPtr);
+        if (itExp != exportsENV.end())
         {
             m_iat.push_back(itExp->second);
 
@@ -2249,8 +2608,8 @@ void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bAllExpEnv, bool b
             uintptr_t escaped = 0;
             if (resolveWrapperEscape(funcPtr, escaped))
             {
-                auto itEsc = exports.find(escaped);
-                if (itEsc != exports.end())
+                auto itEsc = exportsENV.find(escaped);
+                if (itEsc != exportsENV.end())
                 {
                     if (bRIMEscapeHook)
                     {
@@ -2324,6 +2683,53 @@ void AsmRunner::SetIATCallCB(OnOpcodeCb cb, void* data)
 {
     m_cbIATCall = std::move(cb);
     m_cbIATCallData = data;
+}
+
+tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
+{
+    if (bRVA) {
+        for (auto& e : exportsENV) {
+            if (e.second.funcRva == pAddr)
+                return &e.second;
+        }
+    }
+    else {
+        auto itExp = exportsENV.find(pAddr);
+        if (itExp != exportsENV.end())
+            return &itExp->second;
+    }
+    return nullptr;
+}
+
+tIEFuncNode* AsmRunner::FindIATNode(std::string name, bool bLowerCmp, bool bContains)
+{
+    std::string searchName = name;
+    if (bLowerCmp)
+        std::transform(searchName.begin(), searchName.end(), searchName.begin(), ::tolower);
+
+    for (auto& e : exportsENV) {
+        std::string funcName = e.second.funcName;
+        std::string moduleName = e.second.moduleName;
+
+        if (bLowerCmp) {
+            std::transform(funcName.begin(), funcName.end(), funcName.begin(), ::tolower);
+            std::transform(moduleName.begin(), moduleName.end(), moduleName.begin(), ::tolower);
+        }
+
+        if (bContains) {
+            if (funcName.find(searchName) != std::string::npos ||
+                moduleName.find(searchName) != std::string::npos) {
+                return &e.second;
+            }
+        }
+        else {
+            if (funcName == searchName || moduleName == searchName) {
+                return &e.second;
+            }
+        }
+    }
+
+    return nullptr;
 }
 
 void AsmRunner::SetCallbacks(OnOpcodeCb opcode_cb, void* opcode_data, OnMemCb mem_cb, void* mem_data, OnJmpCb jmp_cb, void* jmp_data)
@@ -3479,7 +3885,7 @@ void TestStackArgs()
     MboxSTD("halt", "hold");
 }
 
-void VMENTRY_UT_HK(void* lpParameter)
+void __cdecl VMENTRY_UT_HK(void* lpParameter)
 {
     //IatTestUC();
     //Test1();
@@ -3500,11 +3906,12 @@ void VMENTRY_UT_HK(void* lpParameter)
     //printf("[*] pACPISSDT=0x%p\n", pACPISSDT);
 
     AsmRunner runner(false);
-    void* pEntry = addr(0x60F2F0C0);
-    void* pEntryArg = addr(0x615CDB58);
+    bool bCRC = true;
+    void* pEntry = bCRC ? addrCRC(0x60F2F0C0) : addr(0x60F2F0C0);
+    void* pEntryArg = bCRC ? addrCRC(0x615CDB58) : addr(0x615CDB58);
 
-    uintptr_t pThemidaStart = (uintptr_t)addr(0x629D5000);
-    uintptr_t pThemidaEnd = (uintptr_t)addr(0x630DD000);
+    uintptr_t pThemidaStart = (uintptr_t)(bCRC ? addrCRC(0x629D5000) : addr(0x629D5000));
+    uintptr_t pThemidaEnd = (uintptr_t)(bCRC ? addrCRC(0x630DD000) : addr(0x630DD000));
 
     MboxSTD("VMENTRY_UT_HK", "hold");
 
@@ -3521,7 +3928,7 @@ void VMENTRY_UT_HK(void* lpParameter)
 
     //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", STEAM_LIB, (void*)pStart, (void*)pEnd, (size_t)nSize);
 
-    auto OpcodeCb = [&pThemidaStart, &pThemidaEnd](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto OpcodeCb = [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
         printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
         //self->DumpRegisters(true);
@@ -3538,6 +3945,14 @@ void VMENTRY_UT_HK(void* lpParameter)
         else {
             self->SetLogDisasm(false);
         }
+
+        // VA 153415
+        // C 153476  (153477)
+        //if (self->GetInstructionCount() == 153000)
+        //	MboxSTD("custom wait before virual alloc", "MemCb");
+
+        if (self->GetInstructionCount() == 200000)
+            MboxSTD("crc section copy", "MemCb");
 
         if (self->IsSymMapInitialised()) {
             static const tFuncNode* lastsym = nullptr;
@@ -3642,38 +4057,118 @@ void VMENTRY_UT_HK(void* lpParameter)
         return true;
     };
 
-    runner.SetAnyJmpHook(0x12345678, [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
-        {
+    //runner.SetAnyJmpHook(0x12345678, [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+    //	{
+    //		auto* self = static_cast<AsmRunner*>(user_data);
+    //		if (!self)
+    //			return true;
+
+    //		printf("[memcpy hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u", (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
+
+    //		const uintptr_t retaddr = from + size;
+    //		uintptr_t dst = 0;
+    //		uintptr_t src = 0;
+    //		uintptr_t n = 0;
+
+    //		if (self->IsX64())
+    //		{
+    //			dst = self->GetRegister(UC_X86_REG_RCX);
+    //			src = self->GetRegister(UC_X86_REG_RDX);
+    //			n = self->GetRegister(UC_X86_REG_R8);
+    //		}
+    //		else
+    //		{
+    //			if (!self->StackPop(dst)) return false;
+    //			if (!self->StackPop(src)) return false;
+    //			if (!self->StackPop(n))   return false;
+    //		}
+
+    //		printf("[memcpy] dst=0x%p src=0x%p n=0x%p ret=0x%p", (void*)dst, (void*)src, (void*)n, (void*)retaddr);
+
+    //		if (n != 0)
+    //			self->_CopyMemory(dst, src, n);
+
+    //		self->SetRegister(self->AxReg(), dst);
+    //		self->SetRegister(self->PcReg(), retaddr);
+    //		self->SetUpdatedPC(true);
+
+    //		return true;
+    //	},
+    //	&runner);
+
+    runner.SetIAT(0, 0, false); // collect temp ENV
+    runner.SetAnyJmpHook(runner.FindIATNode("VirtualAlloc")->GetAbsolute(), [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
                 return true;
 
-            printf("[memcpy hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u", (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
+            printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u\n", (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
+            tIEFuncNode* pNode = self->FindIATNode(to);
+            if (pNode)
+                printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
 
-            const uintptr_t retaddr = from + size;
-            uintptr_t dst = 0;
-            uintptr_t src = 0;
-            uintptr_t n = 0;
+            MboxSTD("custom wait", "MemCb");
+
+            // LPVOID VirtualAlloc(
+            //   LPVOID lpAddress,         // x86: [ESP+4], x64: RCX
+            //   SIZE_T dwSize,            // x86: [ESP+8], x64: RDX
+            //   DWORD flAllocationType,   // x86: [ESP+12], x64: R8
+            //   DWORD flProtect           // x86: [ESP+16], x64: R9
+            // );
+
+            uintptr_t lpAddress = 0;
+            uintptr_t dwSize = 0;
+            uintptr_t flAllocationType = 0;
+            uintptr_t flProtect = 0;
+            uintptr_t retaddr = from + size;
 
             if (self->IsX64())
             {
-                dst = self->GetRegister(UC_X86_REG_RCX);
-                src = self->GetRegister(UC_X86_REG_RDX);
-                n = self->GetRegister(UC_X86_REG_R8);
+                // x64 calling convention (fastcall)
+                lpAddress = self->GetRegister(UC_X86_REG_RCX);
+                dwSize = self->GetRegister(UC_X86_REG_RDX);
+                flAllocationType = self->GetRegister(UC_X86_REG_R8);
+                flProtect = self->GetRegister(UC_X86_REG_R9);
             }
             else
             {
-                if (!self->StackPop(dst)) return false;
-                if (!self->StackPop(src)) return false;
-                if (!self->StackPop(n))   return false;
+                // x86 stdcall (args on stack) // LIFO
+                if (!self->StackPop(lpAddress))			return false;
+                if (!self->StackPop(dwSize))			return false;
+                if (!self->StackPop(flAllocationType))  return false;
+                if (!self->StackPop(flProtect))			return false;
             }
 
-            printf("[memcpy] dst=0x%p src=0x%p n=0x%p ret=0x%p", (void*)dst, (void*)src, (void*)n, (void*)retaddr);
+            printf("[VirtualAlloc] lpAddress=0x%p dwSize=0x%p flAllocationType=0x%p flProtect=0x%p ret=0x%p\n",
+                (void*)lpAddress, (void*)dwSize, (void*)flAllocationType, (void*)flProtect, (void*)retaddr);
 
-            if (n != 0)
-                self->_CopyMemory(dst, src, n);
+            uintptr_t allocated = 0;
 
-            self->SetRegister(self->AxReg(), dst);
+            if (dwSize == 0) {
+                allocated = 0;
+            }
+            else {
+                allocated = self->AddMemory(dwSize, UC_PROT_ALL);
+                if (!allocated)
+                {
+                    printf("[VirtualAlloc] AddMemory failed for size 0x%p\n", (void*)dwSize);
+                    self->SetRegister(self->AxReg(), 0);
+                    self->SetRegister(self->PcReg(), retaddr);
+                    self->SetUpdatedPC(true);
+                    return true;
+                }
+
+                printf("[VirtualAlloc] allocated 0x%p bytes at 0x%p\n", (void*)dwSize, (void*)allocated);
+
+                if (lpAddress != 0 && lpAddress != allocated)
+                {
+                    printf("[VirtualAlloc] WARNING: requested specific address 0x%p but allocated at 0x%p\n",
+                        (void*)lpAddress, (void*)allocated);
+                }
+            }
+
+            self->SetRegister(self->AxReg(), allocated);
             self->SetRegister(self->PcReg(), retaddr);
             self->SetUpdatedPC(true);
 
@@ -3686,10 +4181,14 @@ void VMENTRY_UT_HK(void* lpParameter)
     runner.SetDisasmAfterCB(true);
     runner.SetDisasmRVA(true, 0x60F00000);
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
-    uintptr_t mod = runner.CopyModule(STEAM_LIB);
-    runner.SetIAT((uintptr_t)addr(0x6137B000), (uintptr_t)addr(0x6137B508), false, true);
-    //uintptr_t mod = runner.CopyModule("_steamclient2.dll");
-    //runner.SetIAT((uintptr_t)addrCRC(0x6137B000), (uintptr_t)addrCRC(0x6137B508), false, true);
+    if (!bCRC) {
+        uintptr_t mod = runner.CopyModule(STEAM_LIB);
+        runner.SetIAT((uintptr_t)addr(0x6137B000), (uintptr_t)addr(0x6137B508), false);
+    }
+    else {
+        uintptr_t mod = runner.CopyModule(CRC_STEAM_LIB);
+        runner.SetIAT((uintptr_t)addrCRC(0x6137B000), (uintptr_t)addrCRC(0x6137B508), false);
+    }
     runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
     //runner.TraceInstruction("C:\\trace.txt", reinterpret_cast<uintptr_t>(pEntry), 300); return; // автостарт
 
@@ -3737,5 +4236,6 @@ void VMENTRY_UT_HK(void* lpParameter)
     PostSendVM(lpParameter); // memset -> vmentry -> vmexit -> vmreturn
     printf("lpParameter 0x%p\n", lpParameter);
     //MboxSTD("HkPostSendVM", "mzhk");
+
 }
 #endif
