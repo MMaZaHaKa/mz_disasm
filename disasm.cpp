@@ -105,6 +105,7 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
         case ZYDIS_MNEMONIC_IRETQ:
 
         // Прерывания / системные переходы
+#ifdef AR_SYSCALL_JUMP_CB
         case ZYDIS_MNEMONIC_INT:
         case ZYDIS_MNEMONIC_INT1:
         case ZYDIS_MNEMONIC_INT3:
@@ -113,7 +114,13 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
         case ZYDIS_MNEMONIC_SYSENTER:
         case ZYDIS_MNEMONIC_SYSEXIT:
         case ZYDIS_MNEMONIC_SYSRET:
+
+        case ZYDIS_MNEMONIC_UD2:
+        case ZYDIS_MNEMONIC_UD1:
+        case ZYDIS_MNEMONIC_UD0:
+        case ZYDIS_MNEMONIC_HLT:
             return true;
+#endif
 
         default:
             return false;
@@ -821,6 +828,7 @@ void AsmRunner::Shutdown()
     m_bDisasmAfterCB = false;
     m_bDisasmRVA = false;
     m_DisasmCustomASLR = 0;
+    m_DisasmICNotice = 0;
     m_anyJmpHooks.clear();
     m_iat.clear();
     exportsENV.clear();
@@ -830,7 +838,16 @@ void AsmRunner::Shutdown()
     m_iatEnd = 0;
     m_cbIATCall = nullptr;
     m_cbIATCallData = nullptr;
+    m_cbSysCall = nullptr;
+    m_cbSysCallData = nullptr;
     m_execRegions.clear();
+    if (m_rttrace.file.is_open()) {
+        m_rttrace.file.close();
+    }
+    m_rttrace.inited = false;
+    m_rttrace.aslr = 0;
+    m_rttrace.rva = false;
+    m_icHooks.clear();
 }
 
 uc_engine* AsmRunner::GetCTX()
@@ -1089,6 +1106,15 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc) : "[READ ERROR]";
     std::string curSym = FormatCurrentSymbolSuffix(curPc);
 
+    if (m_rttrace.inited && m_rttrace.file.is_open()) {
+        uintptr_t outPc = curPc;
+        if (m_rttrace.rva)
+            outPc = curPc - m_modStart;
+        if (m_rttrace.aslr != 0)
+            outPc = curPc - m_modStart + m_rttrace.aslr;
+        m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+    }
+
     //if (m_bLogDisasm /*|| m_bLogRunner*/) {
     //    std::ostringstream oss;
     //    oss << "[" << m_instrCount << "] ";
@@ -1104,7 +1130,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     //    Log("%s", oss.str().c_str());
     //}
 
-    if (!m_bDisasmAfterCB && (m_bLogDisasm /*|| m_bLogRunner*/)) {
+    if (!m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
         if(m_bDisasmRVA)
@@ -1161,6 +1187,53 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 #endif
+
+    auto IsSysCallLike = [](ZydisMnemonic mn) -> bool
+    {
+        switch (mn)
+        {
+            case ZYDIS_MNEMONIC_INT:
+            case ZYDIS_MNEMONIC_INT1:
+            case ZYDIS_MNEMONIC_INT3:
+            case ZYDIS_MNEMONIC_INTO:
+            case ZYDIS_MNEMONIC_SYSCALL:
+            case ZYDIS_MNEMONIC_SYSENTER:
+            case ZYDIS_MNEMONIC_SYSEXIT:
+            case ZYDIS_MNEMONIC_SYSRET:
+            case ZYDIS_MNEMONIC_UD2:
+            case ZYDIS_MNEMONIC_UD1:
+            case ZYDIS_MNEMONIC_UD0:
+            case ZYDIS_MNEMONIC_HLT:
+                return true;
+            default:
+                return false;
+        }
+    };
+
+    if (m_cbSysCall && IsSysCallLike(mnemonic)) {
+        if (!m_cbSysCall(uc, curPc, size, mnemonic, m_cbSysCallData)) {
+            uc_emu_stop(uc);
+            return;
+        }
+        if (m_bUpdatedPCInCB) {
+            m_bUpdatedPCInCB = false;
+            return; // prevent notice in cb with old pc opcode
+        }
+    }
+
+    for (const auto& n : m_icHooks) {
+        if (n.nIC != m_instrCount || !n.cb)
+            continue;
+
+        if (!n.cb(uc, curPc, size, mnemonic, n.data)) {
+            uc_emu_stop(uc);
+            return;
+        }
+        if (m_bUpdatedPCInCB) {
+            m_bUpdatedPCInCB = false;
+            return; // prevent notice in cb with old pc opcode
+        }
+    }
 
     if (m_cbOpcode) {
         if (!m_cbOpcode(uc, curPc, size, mnemonic, m_cbOpcodeData)) {
@@ -1249,7 +1322,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     }
 #endif
 
-    if (m_bDisasmAfterCB && (m_bLogDisasm /*|| m_bLogRunner*/)) {
+    if (m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
         if (m_bDisasmRVA)
@@ -1823,6 +1896,40 @@ void AsmRunner::SetConsoleColor(int32_t mode)
         SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
     else if (mode == 7)
         SetConsoleTextAttribute(hConsole, 0);
+}
+
+HANDLE AsmRunner::InitConsole()
+{
+    AllocConsole();
+
+    //SetConsoleOutputCP(866);
+    setlocale(LC_ALL, "Russian");
+    SetConsoleOutputCP(1251);
+    SetConsoleCP(1251);
+
+    freopen("CONIN$", "r", stdin);
+    freopen("CONOUT$", "w", stdout);
+
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN);
+
+    return hConsole;
+}
+
+void AsmRunner::CopyToClipboard(const char* text)
+{
+    if (!OpenClipboard(NULL))
+        return;
+
+    EmptyClipboard();
+    size_t len = strlen(text) + 1;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (hMem) {
+        memcpy(GlobalLock(hMem), text, len);
+        GlobalUnlock(hMem);
+        SetClipboardData(CF_TEXT, hMem);
+    }
+    CloseClipboard();
 }
 
 void AsmRunner::MboxSTD(std::string msg, std::string title)
@@ -2421,6 +2528,7 @@ void AsmRunner::SetStackArgEbpIndex(uint32_t nIdx, uintptr_t arg)
     uc_mem_write(m_uc, slot, &arg, ptrSize);
 }
 
+#if 1 // temp hack avoid fakin skip write UC_X86_REG_FS_BASE in SetTebBase
 void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
 {
     assert(m_bInitedSehFS == false);
@@ -2449,6 +2557,150 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
             Log("[!] write zero page failed: %s", uc_strerror(err));
     }
     m_bInitedSehFS = true;
+}
+#else
+void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
+{
+    assert(m_bInitedSehFS == false);
+    if (!m_uc) return;
+
+    // Windows TEB/SEH scratch area.
+    // x86 uses FS, x64 uses GS.
+    if (pAddr == 0)
+        pAddr = m_bX64 ? static_cast<uintptr_t>(0x000000007FFDF000ull) : static_cast<uintptr_t>(0x7FFDF000u);
+
+    if (nSize == 0)
+        nSize = 0x1000; // 0x2000?
+
+    const uintptr_t mapSize = AlignUp(nSize, 0x1000);
+    uc_err err = uc_mem_map(m_uc, pAddr, mapSize, UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK)
+    {
+        if (m_bLogRunner)
+            Log("[!] TEB/SEH map failed at 0x%p: %s", (void*)pAddr, uc_strerror(err));
+        return;
+    }
+
+    std::vector<uint8_t> zero(mapSize, 0);
+    err = uc_mem_write(m_uc, pAddr, zero.data(), zero.size());
+    if (err != UC_ERR_OK)
+    {
+        if (m_bLogRunner)
+            Log("[!] TEB/SEH zero init failed at 0x%p: %s", (void*)pAddr, uc_strerror(err));
+        return;
+    }
+
+    auto writePtrRaw = [&](uintptr_t offset, uintptr_t value) -> bool
+    {
+        return uc_mem_write(m_uc, pAddr + offset, &value, PointerSize()) == UC_ERR_OK;
+    };
+
+    const uintptr_t selfOffset = m_bX64 ? 0x30 : 0x18;
+    const uintptr_t pebOffset = m_bX64 ? 0x60 : 0x30;
+    const uintptr_t lastErrorOffset = m_bX64 ? 0x68 : 0x34;
+    const uintptr_t stackBaseOffset = m_bX64 ? 0x08 : 0x04;
+    const uintptr_t stackLimitOffset = m_bX64 ? 0x10 : 0x08;
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    uintptr_t nullPtr = 0;
+    writePtrRaw(0x00, nullPtr);          // ExceptionList
+    writePtrRaw(stackBaseOffset, m_stackBase); // StackBase
+    writePtrRaw(stackLimitOffset, stackHigh); // StackLimit
+    writePtrRaw(selfOffset, pAddr);      // Self
+    writePtrRaw(pebOffset, nullPtr);     // PEB placeholder
+    writePtrRaw(lastErrorOffset, 0);     // LastErrorValue
+
+    if (!SetTebBase(pAddr))
+    {
+        if (m_bLogRunner)
+            Log("[!] Failed to set TEB base for %s", m_bX64 ? "GS" : "FS");
+        return;
+    }
+
+    m_bInitedSehFS = true;
+    if (m_bLogRunner)
+        Log("[*] TEB/SEH initialized at 0x%p (%s, base=%s)", (void*)pAddr, m_bX64 ? "x64" : "x86", m_bX64 ? "GS" : "FS");
+}
+#endif
+
+bool AsmRunner::SetTebBase(uintptr_t base)
+{
+    if (!m_uc)
+        return false;
+
+    uc_err err = UC_ERR_OK;
+    uint64_t v = static_cast<uint64_t>(base);
+    if (m_bX64)
+        err = uc_reg_write(m_uc, UC_X86_REG_GS_BASE, &v);
+    else
+        err = uc_reg_write(m_uc, UC_X86_REG_FS_BASE, &v);
+
+    return err == UC_ERR_OK;
+}
+
+uintptr_t AsmRunner::GetTebBase() const
+{
+    if (!m_uc)
+        return 0;
+
+    uint64_t v = 0;
+    if (m_bX64)
+    {
+        if (uc_reg_read(m_uc, UC_X86_REG_GS_BASE, &v) != UC_ERR_OK)
+            return 0;
+    }
+    else
+    {
+        if (uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &v) != UC_ERR_OK)
+            return 0;
+    }
+
+    return static_cast<uintptr_t>(v);
+}
+
+bool AsmRunner::WriteTebValue(uint32_t offset, uintptr_t value)
+{
+    if (!m_uc || !m_bInitedSehFS)
+        return false;
+
+    const uintptr_t tebBase = GetTebBase();
+    if (!tebBase)
+        return false;
+
+    const size_t sz = PointerSize();
+    return uc_mem_write(m_uc, tebBase + offset, &value, sz) == UC_ERR_OK;
+}
+
+uintptr_t AsmRunner::ReadTebValue(uint32_t offset) const
+{
+    if (!m_uc || !m_bInitedSehFS)
+        return 0;
+
+    const uintptr_t tebBase = GetTebBase();
+    if (!tebBase)
+        return 0;
+
+    uintptr_t value = 0;
+    const size_t sz = m_bX64 ? 8 : 4;
+    if (uc_mem_read(m_uc, tebBase + offset, &value, sz) != UC_ERR_OK)
+        return 0;
+
+    if (!m_bX64)
+        value = static_cast<uint32_t>(value);
+
+    return value;
+}
+
+void AsmRunner::SetTebLastError(uint32_t error)
+{
+    const uint32_t offset = m_bX64 ? 0x68 : 0x34;
+    (void)WriteTebValue(offset, static_cast<uintptr_t>(error));
+}
+
+uint32_t AsmRunner::GetTebLastError() const
+{
+    const uint32_t offset = m_bX64 ? 0x68 : 0x34;
+    return static_cast<uint32_t>(ReadTebValue(offset));
 }
 
 void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data)
@@ -2685,6 +2937,12 @@ void AsmRunner::SetIATCallCB(OnOpcodeCb cb, void* data)
     m_cbIATCallData = data;
 }
 
+void AsmRunner::SetSysCallCB(OnOpcodeCb cb, void* data)
+{
+    m_cbSysCall = std::move(cb);
+    m_cbSysCallData = data;
+}
+
 tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
 {
     if (bRVA) {
@@ -2740,6 +2998,25 @@ void AsmRunner::SetCallbacks(OnOpcodeCb opcode_cb, void* opcode_data, OnMemCb me
     m_cbMemData = mem_data;
     m_cbJmp = std::move(jmp_cb);
     m_cbJmpData = jmp_data;
+}
+
+void AsmRunner::SetICCallback(uintptr_t nIC, OnOpcodeCb opcode_cb, void* opcode_data)
+{
+    if (!nIC)
+        return;
+
+    for (const auto& h : m_icHooks)
+    {
+        if (h.nIC == nIC)
+        {
+            if (m_bLogRunner)
+                Log("ICCallback already exists for this nIC");
+            MboxSTD("ICCallback already exists for this nIC", "AsmRunner");
+            return;
+        }
+    }
+
+    m_icHooks.push_back({ nIC, std::move(opcode_cb), opcode_data });
 }
 
 uintptr_t AsmRunner::CopyModule(const char* szModule, uintptr_t nSize)
@@ -3019,6 +3296,224 @@ tFuncNode AsmRunner::GetModuleExport(const char* szModule, const char* szExportN
     return empty;
 }
 
+void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA, uintptr_t pASLR)
+{
+    if (!szPCTraceFileOutPath || !*szPCTraceFileOutPath) return;
+
+    if (m_rttrace.file.is_open())
+        m_rttrace.file.close();
+
+    m_rttrace.file.open(szPCTraceFileOutPath, std::ios::out | std::ios::trunc);
+    if (!m_rttrace.file.is_open() && m_bLogRunner)
+    {
+        Log("[!] cannot open PC trace file: %s", szPCTraceFileOutPath);
+        m_rttrace.inited = false;
+        return;
+    }
+
+    m_rttrace.aslr = pASLR;
+    m_rttrace.rva = bRVA;
+
+    if (m_bLogRunner) {
+        Log("[*] PC trace opened: %s", szPCTraceFileOutPath);
+        Log("[*] PC trace mode: %s%s", bRVA ? "RVA" : "PC", (bRVA && pASLR) ? " + custom ASLR" : "");
+    }
+
+    m_rttrace.inited = true;
+}
+
+void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
+{
+    if (!szPCTraceA || !*szPCTraceA || !szPCTraceB || !*szPCTraceB)
+    {
+        Log("[!] ComparePCTrace: empty path");
+        return;
+    }
+
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    bool haveConsole = (hConsole != INVALID_HANDLE_VALUE) && GetConsoleScreenBufferInfo(hConsole, &csbi);
+    WORD oldAttr = haveConsole ? csbi.wAttributes : (WORD)(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+
+    const WORD kWhite = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+    const WORD kRed = FOREGROUND_RED;
+    const WORD kGreen = FOREGROUND_GREEN;
+    const WORD kYellow = FOREGROUND_RED | FOREGROUND_GREEN;
+
+    auto setColor = [&](WORD c)
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, c);
+    };
+
+    auto restoreColor = [&]()
+    {
+        if (haveConsole)
+            SetConsoleTextAttribute(hConsole, oldAttr);
+    };
+
+    std::ifstream fa(szPCTraceA);
+    std::ifstream fb(szPCTraceB);
+
+    if (!fa.is_open())
+    {
+        Log("[!] ComparePCTrace: cannot open A: %s", szPCTraceA);
+        restoreColor();
+        return;
+    }
+    if (!fb.is_open())
+    {
+        Log("[!] ComparePCTrace: cannot open B: %s", szPCTraceB);
+        restoreColor();
+        return;
+    }
+
+    auto trim = [](std::string& s)
+    {
+        auto issp = [](unsigned char c) { return std::isspace(c) != 0; };
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(),
+            [&](char c) { return !issp(static_cast<unsigned char>(c)); }));
+        s.erase(std::find_if(s.rbegin(), s.rend(),
+            [&](char c) { return !issp(static_cast<unsigned char>(c)); }).base(), s.end());
+    };
+
+    auto parseLine = [&](const std::string& line, uintptr_t& out) -> bool
+    {
+        std::string s = line;
+        trim(s);
+        if (s.empty())
+            return false;
+        if (s[0] == ';' || s[0] == '#')
+            return false;
+
+        size_t p = s.find("0x");
+        const char* str = (p != std::string::npos) ? (s.c_str() + p + 2) : s.c_str();
+
+        char* end = nullptr;
+        unsigned long long v = std::strtoull(str, &end, 16);
+        if (end == str)
+            return false;
+
+        out = static_cast<uintptr_t>(v);
+        return true;
+    };
+
+    auto loadTrace = [&](std::ifstream& f, std::vector<uintptr_t>& out)
+    {
+        out.clear();
+        std::string line;
+        while (std::getline(f, line))
+        {
+            uintptr_t pc = 0;
+            if (parseLine(line, pc))
+                out.push_back(pc);
+        }
+    };
+
+    std::vector<uintptr_t> a, b;
+    loadTrace(fa, a);
+    loadTrace(fb, b);
+
+    if (m_bLogRunner)
+    {
+        Log("[*] ComparePCTrace");
+        Log("[*] A: %s (len=%zu)", szPCTraceA, static_cast<size_t>(a.size()));
+        Log("[*] B: %s (len=%zu)", szPCTraceB, static_cast<size_t>(b.size()));
+    }
+
+    if (a.empty() && b.empty())
+    {
+        setColor(kGreen);
+        Log("[=] both traces are empty");
+        restoreColor();
+        return;
+    }
+
+    const size_t minSz = min(a.size(), b.size());
+    size_t firstDiff = minSz;
+
+    for (size_t i = 0; i < minSz; ++i)
+    {
+        if (a[i] != b[i])
+        {
+            firstDiff = i;
+            break;
+        }
+    }
+
+    if (firstDiff == minSz)
+    {
+        setColor(kGreen);
+        Log("[=] traces match for first %zu instruction(s)", static_cast<size_t>(minSz));
+
+        if (a.size() == b.size())
+            Log("[=] eq, same length: %zu", static_cast<size_t>(a.size()));
+        else if (a.size() < b.size())
+            Log("[=] eq by shorter file: A ended first, B is longer by %zu instruction(s)", static_cast<size_t>(b.size() - a.size()));
+        else
+            Log("[=] eq by shorter file: B ended first, A is longer by %zu instruction(s)", static_cast<size_t>(a.size() - b.size()));
+
+        restoreColor();
+        return;
+    }
+
+    const size_t begin = (firstDiff > 10) ? (firstDiff - 10) : 0;
+    const size_t end = min(max(a.size(), b.size()), firstDiff + 11);
+
+    setColor(kYellow);
+    Log("[!] first diff at instruction #%zu", static_cast<size_t>(firstDiff));
+    setColor(kWhite);
+
+    for (size_t i = begin; i < end; ++i)
+    {
+        const bool hasA = i < a.size();
+        const bool hasB = i < b.size();
+        const bool eq = hasA && hasB && (a[i] == b[i]);
+
+        if (i == firstDiff)
+            setColor(kYellow);
+        else if (eq)
+            setColor(kGreen);
+        else
+            setColor(kRed);
+
+        if (hasA && hasB)
+        {
+            Log("[%zu] A 0x%p / B 0x%p%s",
+                static_cast<size_t>(i),
+                (void*)a[i],
+                (void*)b[i],
+                (i == firstDiff) ? "  <== 1st diff" : "");
+        }
+        else if (hasA)
+        {
+            Log("[%zu] A 0x%p / B <EOF>%s",
+                static_cast<size_t>(i),
+                (void*)a[i],
+                (i == firstDiff) ? "  <== 1st diff" : "");
+        }
+        else
+        {
+            Log("[%zu] A <EOF> / B 0x%p%s",
+                static_cast<size_t>(i),
+                (void*)b[i],
+                (i == firstDiff) ? "  <== 1st diff" : "");
+        }
+    }
+
+    setColor(kWhite);
+
+    if (a.size() != b.size())
+    {
+        if (a.size() < b.size())
+            Log("[!] A shorter by %zu instruction(s)", static_cast<size_t>(b.size() - a.size()));
+        else
+            Log("[!] B shorter by %zu instruction(s)", static_cast<size_t>(a.size() - b.size()));
+    }
+
+    restoreColor();
+}
+
 void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 {
     if (!m_uc) return;
@@ -3062,6 +3557,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
     uc_err err = uc_emu_start(m_uc, pc, m_modEnd ? m_modEnd : 0, 0, count);
 
     if (m_bLogRunner) {
+        SetConsoleColor(1);
         Log("[*] emu end, err=%s, instr=%zu", uc_strerror(err), static_cast<size_t>(m_instrCount));
 
         if (err != UC_ERR_OK) {
@@ -3176,6 +3672,25 @@ void AsmRunner::DumpRegisters(bool bCol)
         Log("EAX/RAX=%s EBX/RBX=%s ECX/RCX=%s EDX/RDX=%s", fmt(eax).c_str(), fmt(ebx).c_str(), fmt(ecx).c_str(), fmt(edx).c_str());
         Log("ESI/RSI=%s EDI/RDI=%s ESP/RSP=%s EBP/RBP=%s", fmt(esi).c_str(), fmt(edi).c_str(), fmt(esp).c_str(), fmt(ebp).c_str());
         Log("%s=%s", m_bX64 ? "RIP" : "EIP", fmt(eip).c_str());
+    }
+}
+
+void AsmRunner::DumpSegmentRegisters()
+{
+    if (!m_uc) return;
+
+    uint64_t fs_base = 0;
+    uint64_t gs_base = 0;
+
+    if (m_bX64) {
+        uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
+        uc_reg_read(m_uc, UC_X86_REG_GS_BASE, &gs_base);
+        Log("FS_BASE = 0x%016llX", fs_base);
+        Log("GS_BASE = 0x%016llX", gs_base);
+    }
+    else {
+        uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
+        Log("FS_BASE = 0x%08X", (uint32_t)fs_base);
     }
 }
 
@@ -3807,7 +4322,7 @@ void IatTestUC()
     runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
     //runner.TraceInstruction("C:\\trace.txt", reinterpret_cast<uintptr_t>(pEntry), 300); return; // автостарт
 
-    // Пример брейка по адресу
+    // Пример бряка по адресу
     // runner.SetBreakpoint(reinterpret_cast<uintptr_t>(pEntry), [](AsmRunner*, uint64_t a){ printf("BP hit 0x%llx\n", (unsigned long long)a); }, true);
 
     printf("[*] entry=0x%p\n", pEntry);
@@ -3928,10 +4443,18 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
     //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", STEAM_LIB, (void*)pStart, (void*)pEnd, (size_t)nSize);
 
+    runner.SetICCallback(2'500'000, [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        MboxSTD("crc section copy", "MemCb");
+        return true;
+        },
+        &runner);
+
     auto OpcodeCb = [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
+        //printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
         //self->DumpRegisters(true);
+        //self->DumpSegmentRegisters();
         if (self->IsInAddr(address, pThemidaStart, pThemidaEnd)) {
             SetConsoleColor(0); // red
         }
@@ -3939,7 +4462,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             SetConsoleColor(1);
         }
 
-        if (self->GetInstructionCount() > /*5080*/110000) {
+        if (self->GetInstructionCount() > /*5080*/2'500'000) {
             self->SetLogDisasm(true);
         }
         else {
@@ -3951,9 +4474,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
         //if (self->GetInstructionCount() == 153000)
         //	MboxSTD("custom wait before virual alloc", "MemCb");
 
-        if (self->GetInstructionCount() == 200000)
-            MboxSTD("crc section copy", "MemCb");
-
+        // log change funcs
         if (self->IsSymMapInitialised()) {
             static const tFuncNode* lastsym = nullptr;
             const tFuncNode* sym = self->FindSymbolByRuntime(address);
@@ -3968,7 +4489,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
     auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
+        //printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
 
         if (!self || !uc || size == 0)
             return true;
@@ -4015,7 +4536,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             SetConsoleColor(1);
 
             { // custom
-                self->CompareRegionsSnapshots(regionsBF, regionsAF);
+                //self->CompareRegionsSnapshots(regionsBF, regionsAF);
                 self->_CopyMemory(address, address, size); // maping equal in native proc // докопирую данные в которые оно лезет, где то зашит регион в vmctx
                 self->DumpMemory(address, size); // uc copy result view
                 MboxSTD("custom wait", "MemCb");
@@ -4047,7 +4568,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
-        printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+        //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
             MboxSTD("module escape", "asm runner");
@@ -4108,7 +4629,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             if (pNode)
                 printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
 
-            MboxSTD("custom wait", "MemCb");
+            //MboxSTD("custom wait", "MemCb");
 
             // LPVOID VirtualAlloc(
             //   LPVOID lpAddress,         // x86: [ESP+4], x64: RCX
@@ -4180,6 +4701,9 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
     runner.SetDisasmAfterCB(true);
     runner.SetDisasmRVA(true, 0x60F00000);
+    //runner.SetPCTrace("trace_crc.txt");
+    runner.SetLogDisasmICNotice(500'000);
+    runner.ComparePCTrace("trace_crc3.txt", "trace_crc2.txt");
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
     if (!bCRC) {
         uintptr_t mod = runner.CopyModule(STEAM_LIB);
@@ -4204,7 +4728,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     runner.SetEntryPointStackArg(0, reinterpret_cast<uintptr_t>(pEntryArg));
     //runner.SetRegister(UC_X86_REG_ECX, reinterpret_cast<uintptr_t>(pEntryArg)); // if thiscall-style ctx is needed
 
-    // Пример брейка по адресу
+    // Пример бряка по адресу
     // runner.SetBreakpoint(reinterpret_cast<uintptr_t>(pEntry), [](AsmRunner*, uint64_t a){ printf("BP hit 0x%llx\n", (unsigned long long)a); }, true);
 
     printf("[*] entry=0x%p\n", pEntry);
@@ -4222,7 +4746,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     //	return;
     //}
 
-    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 900000); // 0 = без лимита по шагам
+    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 3'500'000); // 0 = без лимита по шагам // 800 000 crc copy
     runner.Shutdown();
 
 

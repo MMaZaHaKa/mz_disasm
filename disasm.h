@@ -15,6 +15,11 @@
 #include <Zydis/Zydis.h>
 #endif
 
+//#define AR_SYSCALL_JUMP_CB
+//#define AR_DEBUG
+
+// TODO: normal seh, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb
+
 #include "stdint.h"
 #include <vector>
 #include <map>
@@ -85,6 +90,7 @@ public:
 	bool IsDisasmRVA() const { return m_bDisasmRVA; }
 	void SetLogDisasm(bool enabled) { m_bLogDisasm = enabled; }
 	bool IsLogDisasm() const { return m_bLogDisasm; }
+	void SetLogDisasmICNotice(uintptr_t disasmICNotice) { m_DisasmICNotice = disasmICNotice; }
 	void SetLogMemRW(bool enabled) { m_bLogMemRW = enabled; }
 	bool IsLogMemRW() const { return m_bLogMemRW; }
 	void SetLogAnyJmp(bool enabled) { m_bLogAnyJmp = enabled; }
@@ -118,6 +124,8 @@ public:
 	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output);
 	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, const uint16_t* byteColors, const uint16_t* asciiColors);
 	static void SetConsoleColor(int32_t mode);
+	static HANDLE InitConsole();
+	static void CopyToClipboard(const char* text);
 	static void MboxSTD(std::string msg, std::string title);
 	static void EXIT_F();
 	static void EXIT_S();
@@ -148,7 +156,7 @@ public:
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
 	bool IsModuleAddr(uintptr_t pAddr);
 	bool IsRetHaltOrNull(uintptr_t pAddr);
-	bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
+	static bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
 
 	// asm / registers / stack
 	uint32_t PcReg() const { return m_bX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP; }
@@ -184,18 +192,25 @@ public:
 	bool StackPeek(uintptr_t& v, uint32_t nIdx = 0);
 	uintptr_t StackPeek(uint32_t nIdx = 0);
 	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
-
+	bool SetTebBase(uintptr_t base);
+	uintptr_t GetTebBase() const;
+	bool WriteTebValue(uint32_t offset, uintptr_t value);
+	uintptr_t ReadTebValue(uint32_t offset) const;
+	void SetTebLastError(uint32_t error);
+	uint32_t GetTebLastError() const;
 
 	// callbacks / execution
 	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr);
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
+	void SetSysCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
 	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
 	tIEFuncNode* FindIATNode(std::string name, bool bLowerCmp = true, bool bContains = false);
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
 		OnMemCb mem_cb = nullptr, void* mem_data = nullptr,
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
-	uintptr_t CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
+	void SetICCallback(uintptr_t nIC, OnOpcodeCb opcode_cb, void* opcode_data);
+	uintptr_t CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename)
 	void CopyModule(uintptr_t pFrom, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
 	void LoadModule(const char* szModule); // mz pe? (exe+dll)
 	void ResolveIATModule();
@@ -203,12 +218,15 @@ public:
 	bool InExtraRegion(uintptr_t pAddr) const;
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
+	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0);
+	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB);
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep);
 	void Pause();
 	void Resume();
 	void Stop();
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
 	void DumpRegisters(bool bCol = true); // and flags
+	void DumpSegmentRegisters();
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
@@ -309,6 +327,21 @@ private:
 		uintptr_t pEnd = 0;
 	};
 
+	struct tRTTrace
+	{
+		std::ofstream file;
+		uintptr_t aslr;
+		bool rva;
+		bool inited;
+	};
+
+	struct tICNode
+	{
+		uintptr_t nIC;
+		OnOpcodeCb cb;
+		void* data = nullptr;
+	};
+
 	uc_engine* m_uc = nullptr;
 	bool m_bInitialised = false;
 	bool m_bLogEnabled = true;
@@ -317,11 +350,12 @@ private:
 	bool m_bLogAnyJmp = false;
 	bool m_bLogRunner = false;
 	bool m_bInitedStack = false;
-	bool m_bInitedSehFS = false;
+	bool m_bInitedSehFS = false; // 0x0 0x7FFDF000 fs TEB Thread Environment Block FS:[0]
 	bool m_bX64 = false;
 	bool m_bDisasmAfterCB = false;
 	bool m_bDisasmRVA = false;
 	uintptr_t m_DisasmCustomASLR = 0;
+	uintptr_t m_DisasmICNotice = 0;
 	bool m_bInitIAT = false;
 	bool m_bUpdatedPCInCB = false;
 
@@ -330,11 +364,14 @@ private:
 	std::vector<tIEFuncNode> m_iat;
 	std::vector<tExecRegion> m_execRegions; // extra allowed no halt regions for execute
 	std::unordered_map<uintptr_t, tIEFuncNode> exportsENV;
+	std::vector<tICNode> m_icHooks;
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
 	OnOpcodeCb m_cbIATCall; // when any call smth from m_iat
 	void* m_cbIATCallData = nullptr;
+	OnOpcodeCb m_cbSysCall; // syscall, int, ud2, etc
+	void* m_cbSysCallData = nullptr;
 
 	uintptr_t m_modStart = 0;
 	uintptr_t m_modEnd = 0;
@@ -364,7 +401,8 @@ private:
 	bool m_bStopped = false;
 
 	std::map<uintptr_t, tBpInfo> m_breakpoints;
-	tTraceState m_trace;
+	tTraceState m_trace; // separate run
+	tRTTrace m_rttrace; // default
 
 #ifdef ZYDIS
 	ZydisDecoder m_decoder{};
@@ -744,6 +782,8 @@ public:
 //  arg3 7; // pushed caller before call, 1st push
 //  0x0000 halt
 // STACK: 0xFF (stack base)
+
+//0x7FFDF000 fs TEB Thread Environment Block FS:[0]
 
 // links
 //https://github.com/colby57/VMP-Imports-Deobfuscator/tree/3d9817024ea58d806a52a2bd85dde5b1c697dc75
