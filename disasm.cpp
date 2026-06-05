@@ -2623,6 +2623,7 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
 }
 #endif
 
+// TODO: Not work x86 uc_reg_write UC_X86_REG_FS_BASE!!
 bool AsmRunner::SetTebBase(uintptr_t base)
 {
     if (!m_uc)
@@ -2637,6 +2638,45 @@ bool AsmRunner::SetTebBase(uintptr_t base)
 
     return err == UC_ERR_OK;
 }
+
+//bool AsmRunner::SetTebBase(uintptr_t base)
+//{
+//    if (!m_uc)
+//        return false;
+//
+//    // Маска MSR для FS_BASE (0xC0000100) [citation:1]
+//    const uint32_t MSR_FS_BASE = 0xC0000100;
+//    // Маска MSR для GS_BASE (0xC0000101), если нужна
+//    // const uint32_t MSR_GS_BASE = 0xC0000101;
+//
+//    uc_x86_msr msr;
+//    msr.rid = MSR_FS_BASE;
+//    msr.value = static_cast<uint64_t>(base);
+//
+//    uc_err err = uc_reg_write(m_uc, UC_X86_REG_MSR, &msr);
+//
+//    if (err != UC_ERR_OK) {
+//        if (m_bLogRunner) {
+//            Log("[!] Failed to write FS_BASE via MSR. Error: %s", uc_strerror(err));
+//        }
+//        return false;
+//    }
+//
+//    // Если вы эмулируете 64-битный код, вам также нужно будет обновить сегментный селектор.
+//    // Для 32-битного кода записи в MSR достаточно для установки базового адреса.
+//    if (m_bX64) {
+//        // Для x64: также запишите 0 в селектор GS, чтобы указать, что используется база из MSR.
+//        uint16_t gs_selector = 0;
+//        uc_reg_write(m_uc, UC_X86_REG_GS, &gs_selector);
+//    }
+//    else {
+//        // Для x86: обнулите селектор FS, чтобы система использовала базовый адрес из MSR.
+//        uint16_t fs_selector = 0;
+//        uc_reg_write(m_uc, UC_X86_REG_FS, &fs_selector);
+//    }
+//
+//    return true;
+//}
 
 uintptr_t AsmRunner::GetTebBase() const
 {
