@@ -799,8 +799,13 @@ void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, boo
 
     if (bInitUC)
     {
-        SetStack();
+#if 0
+        CopyNTSeh();
+        CopyNTStack();
+#else
         SetFakeSehTid();
+        SetStack();
+#endif
     }
 
     m_bInitialised = true;
@@ -2346,6 +2351,35 @@ void AsmRunner::CompareRegionsSnapshots(const std::vector<tMemoryRegion>& oldReg
 }
 #endif
 
+bool AsmRunner::IsNTMemoryReadable(uintptr_t address, uintptr_t size)
+{
+    if (address == 0 || size == 0)
+        return false;
+
+    MEMORY_BASIC_INFORMATION mbi = { 0 };
+
+    if (VirtualQuery((LPCVOID)address, &mbi, sizeof(mbi)) == 0)
+        return false;
+
+    if (mbi.State != MEM_COMMIT)
+        return false;
+
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+        return false;
+
+    if (mbi.Protect == PAGE_READWRITE ||
+        mbi.Protect == PAGE_READONLY ||
+        mbi.Protect == PAGE_EXECUTE_READ ||
+        mbi.Protect == PAGE_EXECUTE_READWRITE)
+    {
+        uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (address + size <= regionEnd)
+            return true;
+    }
+
+    return false;
+}
+
 uintptr_t AsmRunner::AddMemory(uintptr_t nSize, uint32_t nType)
 {
     if (!m_uc || nSize == 0) return 0;
@@ -2522,6 +2556,78 @@ void AsmRunner::SetStack(uintptr_t pStack, uintptr_t nSize)
     //uc_mem_write(m_uc, GetRegister(SpReg()), &m_halt, sizeof(m_halt)); // same
     uc_mem_write(m_uc, sp, &m_halt, sizeof(m_halt));
     m_bInitedStack = true;
+}
+
+// TODO
+void AsmRunner::CopyNTStack(uintptr_t pStack, uintptr_t nSize)
+{
+    assert(m_bInitedStack == false);
+    if (!m_uc)
+        return;
+
+    ULONG_PTR lowLimit = 0, highLimit = 0;
+    GetCurrentThreadStackLimits(&lowLimit, &highLimit);
+
+    CONTEXT ctx{};
+    RtlCaptureContext(&ctx);
+
+#ifdef _AMD64_
+    //uintptr_t nativeSp = m_bX64 ? static_cast<uintptr_t>(ctx.Rsp) : static_cast<uintptr_t>(ctx.Esp);
+    //uintptr_t nativeBp = m_bX64 ? static_cast<uintptr_t>(ctx.Rbp) : static_cast<uintptr_t>(ctx.Ebp);
+#else
+    uintptr_t nativeSp = m_bX64 ? 0 : static_cast<uintptr_t>(ctx.Esp);
+    uintptr_t nativeBp = m_bX64 ? 0 : static_cast<uintptr_t>(ctx.Ebp);
+#endif
+
+    if (pStack == 0)
+        pStack = m_stackBase;
+
+    if (nSize == 0)
+        nSize = static_cast<uintptr_t>(highLimit - lowLimit);
+
+    const uintptr_t mapSize = AlignUp(nSize, 0x1000);
+    if (uc_mem_map(m_uc, pStack, mapSize, UC_PROT_READ | UC_PROT_WRITE) != UC_ERR_OK)
+        return;
+
+    // Копируем безопасное окно вокруг текущих SP/BP.
+    // Не лезем в guard page, не пытаемся тащить весь reserved stack.
+    const uintptr_t pad = 0x4000;
+    uintptr_t copyLow = (nativeSp < nativeBp) ? nativeSp : nativeBp;
+    uintptr_t copyHigh = (nativeSp > nativeBp) ? nativeSp : nativeBp;
+
+    copyLow = (copyLow > pad) ? (copyLow - pad) : static_cast<uintptr_t>(lowLimit);
+    copyHigh += pad;
+
+    if (copyLow < static_cast<uintptr_t>(lowLimit))
+        copyLow = static_cast<uintptr_t>(lowLimit);
+    if (copyHigh > static_cast<uintptr_t>(highLimit))
+        copyHigh = static_cast<uintptr_t>(highLimit);
+
+    copyLow = AlignDown(copyLow, PointerSize());
+    copyHigh = AlignUp(copyHigh, PointerSize());
+
+    if (copyHigh > copyLow)
+    {
+        const size_t sz = static_cast<size_t>(copyHigh - copyLow);
+        std::vector<uint8_t> buf(sz);
+        std::memcpy(buf.data(), reinterpret_cast<void*>(copyLow), sz);
+        uc_mem_write(m_uc, pStack + (copyLow - static_cast<uintptr_t>(lowLimit)), buf.data(), buf.size());
+    }
+
+    uintptr_t emuSp = pStack + (nativeSp - static_cast<uintptr_t>(lowLimit));
+    uintptr_t emuBp = pStack + (nativeBp - static_cast<uintptr_t>(lowLimit));
+
+    uc_reg_write(m_uc, SpReg(), &emuSp);
+    uc_reg_write(m_uc, FpReg(), &emuBp);
+
+    // halt sentinel как и раньше
+    uc_mem_write(m_uc, pStack + mapSize - m_stackEPSize, &m_halt, sizeof(m_halt));
+
+    m_bInitedStack = true;
+
+    if (m_bLogRunner)
+        Log("[*] CopyNTStack done: base=0x%p size=0x%zx SP=0x%p BP=0x%p",
+            (void*)pStack, (size_t)mapSize, (void*)emuSp, (void*)emuBp);
 }
 
 void AsmRunner::SetStack()
@@ -2743,6 +2849,83 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
         Log("[*] TEB/SEH initialized at 0x%p (%s, base=%s)", (void*)pAddr, m_bX64 ? "x64" : "x86", m_bX64 ? "GS" : "FS");
 }
 #endif
+
+void AsmRunner::CopyNTSeh(uintptr_t pAddr, uintptr_t nSize)
+{
+    assert(m_bInitedSehFS == false);
+    if (!m_uc)
+        return;
+
+    const size_t ps = PointerSize();
+
+    if (pAddr == 0)
+        pAddr = m_bX64 ? static_cast<uintptr_t>(0x000000007FFDF000ull) : 0x0; // x86: zero page mirror
+
+    if (nSize == 0)
+        nSize = 0x1000;
+
+    const uintptr_t mapSize = AlignUp(nSize, 0x1000);
+
+    uc_err err = uc_mem_map(m_uc, pAddr, mapSize, UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK)
+    {
+        if (m_bLogRunner)
+            Log("[!] CopyNTSeh map failed at 0x%p: %s", (void*)pAddr, uc_strerror(err));
+        return;
+    }
+
+    std::vector<uint8_t> zero(mapSize, 0);
+    uc_mem_write(m_uc, pAddr, zero.data(), zero.size());
+
+    auto writePtr = [&](uintptr_t off, uintptr_t v) -> bool
+    {
+        return uc_mem_write(m_uc, pAddr + off, &v, ps) == UC_ERR_OK;
+    };
+
+    auto writeDword = [&](uintptr_t off, uint32_t v) -> bool
+    {
+        return uc_mem_write(m_uc, pAddr + off, &v, sizeof(v)) == UC_ERR_OK;
+    };
+
+    // Минимальный TEB/NT_TIB набор, который реально нужен эмулятору.
+    // x64 — зеркалим по текущему native TEB.
+    // x86 — оставляем zero-page mirror и только ставим stack bounds.
+    ULONG_PTR lowLimit = 0, highLimit = 0;
+    GetCurrentThreadStackLimits(&lowLimit, &highLimit);
+
+    if (m_bX64)
+    {
+        auto* teb = reinterpret_cast<uint8_t*>(NtCurrentTeb());
+        if (teb)
+        {
+            writePtr(0x00, 0); // ExceptionList (x64 не используется как на x86)
+            writePtr(0x08, *reinterpret_cast<uintptr_t*>(teb + 0x08)); // StackBase
+            writePtr(0x10, *reinterpret_cast<uintptr_t*>(teb + 0x10)); // StackLimit
+            writePtr(0x30, reinterpret_cast<uintptr_t>(teb));          // Self
+            writePtr(0x60, *reinterpret_cast<uintptr_t*>(teb + 0x60)); // PEB
+            writeDword(0x68, *reinterpret_cast<uint32_t*>(teb + 0x68)); // LastErrorValue
+        }
+
+        (void)SetTebBase(pAddr);
+    }
+    else
+    {
+        writePtr(0x00, 0); // ExceptionList
+        writePtr(0x04, static_cast<uintptr_t>(highLimit)); // StackBase
+        writePtr(0x08, static_cast<uintptr_t>(lowLimit));   // StackLimit
+        writePtr(0x18, 0); // Self / Teb pointer not used via FS_BASE here
+        writePtr(0x30, 0); // PEB placeholder
+        writeDword(0x34, 0); // LastErrorValue
+
+        // если FS_BASE не выставляется в твоей сборке Unicorn, zero-page mirror всё равно работает
+        (void)SetTebBase(0);
+    }
+
+    m_bInitedSehFS = true;
+
+    if (m_bLogRunner)
+        Log("[*] CopyNTSeh done: base=0x%p (%s)", (void*)pAddr, m_bX64 ? "x64" : "x86");
+}
 
 // TODO: Not work x86 uc_reg_write UC_X86_REG_FS_BASE!!
 bool AsmRunner::SetTebBase(uintptr_t base)
@@ -3756,6 +3939,8 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             }
 
             DumpRegisters();
+            DumpSegmentRegisters();
+            DumpStack(50);
             SetConsoleColor(6);
         }
     }
@@ -3853,6 +4038,54 @@ void AsmRunner::DumpSegmentRegisters()
     else {
         uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
         Log("FS_BASE = 0x%08X", (uint32_t)fs_base);
+    }
+}
+
+void AsmRunner::DumpStack(intptr_t nCount)
+{
+    if (!m_uc || !m_bInitedStack)
+        return;
+
+    const uintptr_t ptrSize = PointerSize();
+    const uintptr_t sp = CurrentSp(m_uc);
+    const uintptr_t fp = GetRegister(FpReg());
+
+    const uintptr_t stackLow = m_stackBase;
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    const char* regNameSp = m_bX64 ? "rsp" : "esp";
+    const char* regNameFp = m_bX64 ? "rbp" : "ebp";
+
+    intptr_t idx = 0;
+    uintptr_t addr = sp;
+
+    while (true)
+    {
+        if (nCount >= 0 && idx >= nCount)
+            break;
+
+        if (addr + ptrSize > stackHigh)
+            break;
+
+        uintptr_t val = 0;
+        if (uc_mem_read(m_uc, addr, &val, ptrSize) != UC_ERR_OK)
+            break;
+
+        if (!m_bX64)
+            val = static_cast<uint32_t>(val);
+
+        printf("[%lld] 0x%p: 0x%p", static_cast<long long>(idx), (void*)addr, (void*)val);
+
+        if (addr == sp)
+            printf(" <- %s", regNameSp);
+
+        if (nCount == -1 && fp != 0 && addr == fp)
+            printf(" <- %s", regNameFp);
+
+        printf("\n");
+
+        ++idx;
+        addr += ptrSize;
     }
 }
 
@@ -4612,6 +4845,51 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
     std::cout << std::flush;
 }
 
+template <typename T>
+bool AsmRunner::WriteMemory(uintptr_t pAddr, const T& val, bool bCreateRegion)
+{
+    static_assert(std::is_trivially_copyable_v<T>,
+        "WriteMemory<T> requires trivially copyable T");
+
+    if (!m_uc || !pAddr)
+        return false;
+
+    const auto tryWrite = [&]() -> bool
+    {
+        return uc_mem_write(m_uc, pAddr, &val, sizeof(T)) == UC_ERR_OK;
+    };
+
+    if (tryWrite())
+        return true;
+
+    if (!bCreateRegion)
+    {
+        if (m_bLogRunner)
+            Log("WriteMemory: write failed at 0x%p, size=%zu", (void*)pAddr, sizeof(T));
+        return false;
+    }
+
+    const uintptr_t pageSize = 0x1000;
+    const uintptr_t base = AlignDownPage(pAddr);
+    const uintptr_t end = AlignUp(pAddr + sizeof(T), pageSize);
+    const uintptr_t mapSize = end - base;
+
+    if (!AddMemoryTo(base, mapSize, UC_PROT_READ | UC_PROT_WRITE))
+    {
+        if (m_bLogRunner)
+            Log("WriteMemory: failed to map region at 0x%p, size=0x%zx", (void*)base, (size_t)mapSize);
+        return false;
+    }
+
+    if (tryWrite())
+        return true;
+
+    if (m_bLogRunner)
+        Log("WriteMemory: write still failed after mapping at 0x%p, size=%zu", (void*)pAddr, sizeof(T));
+
+    return false;
+}
+
 #if 0
 void IatTestUC()
 {
@@ -4786,6 +5064,13 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
     MboxSTD("VMENTRY_UT_HK", "hold");
 
+    //crc start 0x60F01000,  size 0x47A000
+    uintptr_t nSize = 0x47A000; // 4'694'016
+    uintptr_t nCpyStart = 153495 + 1; // 1st rep movsb
+    uintptr_t nCpyEnd = 4'847'512; // last rep movsb
+    uintptr_t nCrcSumEnd = 93'017'845; // 83 instr / per 4 byte  // (0x47A000 / 4) * 83  ~97'400'832
+    // 93017871 VirtualFree
+
     //uintptr_t pStart = 0;
     //uintptr_t pEnd = 0;
     //uintptr_t nSize = 0;
@@ -4799,9 +5084,16 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
     //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", STEAM_LIB, (void*)pStart, (void*)pEnd, (size_t)nSize);
 
-    runner.SetICCallback(4'800'000, [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    runner.SetICCallback(nCpyEnd, [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        MboxSTD("crc section copy", "Cb");
+        MboxSTD("crc cpy end", "Cb");
+        return true;
+        },
+        &runner);
+
+    runner.SetICCallback(nCrcSumEnd, [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        MboxSTD("crc sum end", "Cb");
         return true;
         },
         &runner);
@@ -4818,7 +5110,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             SetConsoleColor(1);
         }
 
-        if (self->GetInstructionCount() > /*5080*/4'800'000) {
+        if (self->GetInstructionCount() > /*5080*/(/*nCrcSumEnd*/ nCpyEnd)) {
             self->SetLogDisasm(true);
         }
         else {
@@ -4891,12 +5183,15 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             printf("[+] Created Region at 0x%p [0x%zx]\n", (void*)base, (size_t)mapSize);
             SetConsoleColor(1);
 
-            { // custom
+            if (self->IsNTMemoryReadable(address, size))
+            { // custom // themida read correct crc // 0x4F238ED8
                 //self->CompareRegionsSnapshots(regionsBF, regionsAF);
                 self->_CopyMemory(address, address, size); // maping equal in native proc // докопирую данные в которые оно лезет, где то зашит регион в vmctx
                 self->DumpMemory(address, size); // uc copy result view
                 MboxSTD("custom wait", "MemCb");
             }
+            else
+                MboxSTD("cant read nt", "MemCb");
 
             return true;
         }
@@ -4927,6 +5222,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
         //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
+            printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
             MboxSTD("module escape", "asm runner");
             return false;
         }
@@ -5053,13 +5349,134 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             return true;
         },
         &runner);
+    runner.SetAnyJmpHook(runner.FindIATNode("VirtualFree")->GetAbsolute(), [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            //MboxSTD("custom wait", "VirtualFree");
+
+            printf("[hook] VirtualFree hit: from=0x%p to=0x%p size=%u mnemonic=%u\n",
+                (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
+
+            tIEFuncNode* pNode = self->FindIATNode(to);
+            if (pNode)
+                printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
+
+            // BOOL VirtualFree(
+            //   LPVOID lpAddress,   // x86: [ESP+4], x64: RCX
+            //   SIZE_T dwSize,      // x86: [ESP+8], x64: RDX  
+            //   DWORD dwFreeType    // x86: [ESP+12], x64: R8
+            // );
+
+            uintptr_t lpAddress = 0;
+            uintptr_t dwSize = 0;
+            uintptr_t dwFreeType = 0;
+            uintptr_t retaddr = from + size;
+
+            if (self->IsX64())
+            {
+                lpAddress = self->GetRegister(UC_X86_REG_RCX);
+                dwSize = self->GetRegister(UC_X86_REG_RDX);
+                dwFreeType = self->GetRegister(UC_X86_REG_R8);
+            }
+            else
+            {
+                if (!self->StackPop(lpAddress)) return false;
+                if (!self->StackPop(dwSize)) return false;
+                if (!self->StackPop(dwFreeType)) return false;
+            }
+
+            printf("[VirtualFree] lpAddress=0x%p dwSize=0x%p dwFreeType=0x%p ret=0x%p\n",
+                (void*)lpAddress, (void*)dwSize, (void*)dwFreeType, (void*)retaddr);
+
+            BOOL result = TRUE; // или VirtualFreeStub((LPVOID)lpAddress, dwSize, dwFreeType);
+
+            // Если нужно освободить память в эмуляторе:
+            if (dwFreeType == MEM_RELEASE || dwFreeType == MEM_DECOMMIT)
+            {
+                if (lpAddress != 0)
+                {
+                    self->FreeMemory(lpAddress);
+                    printf("[VirtualFree] Freeing memory at 0x%p\n", (void*)lpAddress);
+                }
+            }
+
+            self->SetRegister(self->AxReg(), result);
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        },
+        &runner);
+
+    runner.SetAnyJmpHook(runner.FindIATNode("GetSystemTimeAsFileTime")->GetAbsolute(),
+        [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self) return true;
+
+            MboxSTD("custom wait", "GetSystemTimeAsFileTime");
+
+            printf("[hook] GetSystemTimeAsFileTime hit: from=0x%p to=0x%p\n", (void*)from, (void*)to);
+
+            // Получаем аргументы
+            uintptr_t lpSystemTimeAsFileTime = 0;
+            uintptr_t retaddr = from + size;
+
+            if (self->IsX64())
+            {
+                lpSystemTimeAsFileTime = self->GetRegister(UC_X86_REG_RCX);
+            }
+            else
+            {
+                if (!self->StackPop(lpSystemTimeAsFileTime)) return false;
+            }
+
+            printf("[GetSystemTimeAsFileTime] lpSystemTimeAsFileTime=0x%p\n", (void*)lpSystemTimeAsFileTime);
+
+            FILETIME ft = { 0 };
+
+#if 0
+            GetSystemTimeAsFileTime(&ft);
+#else
+            static FILETIME s_ft = { 0 };
+            static BOOL bInitialized = FALSE;
+
+            if (!bInitialized)
+            {
+                GetSystemTimeAsFileTime(&s_ft);
+                bInitialized = TRUE;
+                printf("[GetSystemTimeAsFileTime] Static time initialized: 0x%08X%08X\n",
+                    s_ft.dwHighDateTime, s_ft.dwLowDateTime);
+            }
+
+            ft = s_ft;
+#endif
+
+            printf("[GetSystemTimeAsFileTime] result: 0x%08X%08X\n", ft.dwHighDateTime, ft.dwLowDateTime);
+
+            // Записываем результат обратно в память эмулятора
+            if (lpSystemTimeAsFileTime)
+                self->_CopyMemory(lpSystemTimeAsFileTime, (uintptr_t)&ft, sizeof(FILETIME));
+
+            // Устанавливаем возврат (функция void, ничего не возвращает)
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        }, &runner);
 
     runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
     runner.SetDisasmAfterCB(true);
     runner.SetDisasmRVA(true, 0x60F00000);
-    runner.SetPCTrace("trace_crc.txt", true, 0, 4'800'000);
-    runner.SetLogDisasmICNotice(500'000);
+    //runner.SetPCTrace("trace_crc.txt", true, 0, 9'500'000);
+    runner.SetLogDisasmICNotice(500'000 * 2);
+    //runner.AddDeadzoneIC(nCpyStart, nCpyEnd); // skip rep movsd
+    //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd); // skip crc eax sum
+    runner.AddDeadzoneIC(nCpyStart, nCrcSumEnd);
     runner.ComparePCTrace("trace_crc3.txt", "trace_crc2.txt");
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
     if (!bCRC) {
@@ -5103,7 +5520,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     //	return;
     //}
 
-    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 5'500'000); // 0 = без лимита по шагам // 800 000 crc copy
+    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 0); // 0 = без лимита по шагам // 800 000 crc copy
     runner.Shutdown();
 
 

@@ -146,6 +146,7 @@ public:
 	// std::vector<AsmRunner::tMemoryRegion> regions = FindRegions(0x17000, MEM_PRIVATE, PAGE_READWRITE, MEM_COMMIT);
 	static std::vector<tMemoryRegion> FindRegions(SIZE_T targetSize = 0, DWORD targetType = 0, DWORD targetProtect = 0, DWORD targetState = MEM_COMMIT);
 	static void CompareRegionsSnapshots(const std::vector<tMemoryRegion>& oldRegions, const std::vector<tMemoryRegion>& newRegions, bool bExtra = true);
+	static bool IsNTMemoryReadable(uintptr_t address, uintptr_t size = 1);
 
 	// Mem
 	uintptr_t AddMemory(uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/);
@@ -190,6 +191,7 @@ public:
 	void SetRegister(uint32_t nRegister, uintptr_t arg); // todo unicorn types?
 	uintptr_t GetRegister(uint32_t nRegister);
 	void SetStack(uintptr_t pStack, uintptr_t nSize); // if bLogRunner log stack
+	void CopyNTStack(uintptr_t pStack = 0, uintptr_t nSize = 0);
 	void SetStack(); // if bLogRunner log stack
 	uintptr_t GetStack(uint32_t nIdx);
 	bool StackPush(uintptr_t v);
@@ -198,6 +200,7 @@ public:
 	bool StackPeek(uintptr_t& v, uint32_t nIdx = 0);
 	uintptr_t StackPeek(uint32_t nIdx = 0);
 	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
+	void CopyNTSeh(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	bool SetTebBase(uintptr_t base);
 	uintptr_t GetTebBase() const;
 	bool WriteTebValue(uint32_t offset, uintptr_t value);
@@ -233,6 +236,7 @@ public:
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
 	void DumpRegisters(bool bCol = true); // and flags
 	void DumpSegmentRegisters();
+	void DumpStack(intptr_t nCount = -1);
 	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
 	void InstallDefaultHooks();
 
@@ -294,6 +298,9 @@ public:
 	tMemSnapshot MakeSnapshot(uintptr_t pStart, uintptr_t pEnd);
 	tMemSnapshot MakeSnapshotS(uintptr_t pStart, uintptr_t nSize);
 	void CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly = true);
+
+	template <typename T>
+	bool WriteMemory(uintptr_t pAddr, const T& val, bool bCreateRegion = false);
 
 private:
 	// точки останова: addr info
