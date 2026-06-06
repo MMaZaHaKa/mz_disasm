@@ -29,6 +29,7 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 
 #define ARP(p) ((uintptr_t)p)
@@ -102,6 +103,8 @@ public:
 	void SetUpdatedPC(bool bUpdatedPCInCB) { m_bUpdatedPCInCB = bUpdatedPCInCB; }
 	bool IsUpdatedPC() const { return m_bUpdatedPCInCB; }
 	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
+	uintptr_t GetModStart() const { return m_modStart; }
+	uintptr_t GetModEnd() const { return m_modEnd; }
 
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
@@ -114,6 +117,9 @@ public:
 	static inline uintptr_t AlignDown(uintptr_t v, uintptr_t a) { return v & ~(a - 1); }
 	static inline uintptr_t AlignDownPage(uintptr_t v) { return v & ~static_cast<uintptr_t>(0xFFF); }
 	static inline bool IsPrintableAscii(uint8_t c) { return c >= 0x20 && c <= 0x7e; }
+	static std::chrono::steady_clock::time_point CaptureTime();
+	static void DumpTime(std::chrono::steady_clock::time_point start, const char* label = nullptr);
+	static void DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label = nullptr);
 
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
 	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
@@ -227,6 +233,8 @@ public:
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
 	void DumpRegisters(bool bCol = true); // and flags
 	void DumpSegmentRegisters();
+	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
+	void InstallDefaultHooks();
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
@@ -343,6 +351,16 @@ private:
 		void* data = nullptr;
 	};
 
+	struct tDeadzoneIC {
+		uintptr_t startIC;     // Начальный счётчик инструкций
+		uintptr_t endIC;       // Конечный счётчик инструкций
+		bool skipJmps;         // Пропускать JMP колбэки
+		bool skipMem;          // Пропускать MEM колбэки
+		bool skipOpcode;       // Пропускать Opcode колбэки
+		bool skipAll;          // Пропустить всё
+		bool active;           // Активен ли сейчас
+	};
+
 	uc_engine* m_uc = nullptr;
 	bool m_bInitialised = false;
 	bool m_bLogEnabled = true;
@@ -366,6 +384,9 @@ private:
 	std::vector<tExecRegion> m_execRegions; // extra allowed no halt regions for execute
 	std::unordered_map<uintptr_t, tIEFuncNode> exportsENV;
 	std::vector<tICNode> m_icHooks;
+	std::vector<tDeadzoneIC> m_deadzonesIC;
+	bool m_bInDeadzoneIC = false;
+	int32_t m_currentDeadzoneICIndex = -1;
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
@@ -424,6 +445,8 @@ private:
 	bool ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const;
 	bool ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const;
 	bool CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size);
+	void UpdateDeadzoneIC(uintptr_t currentIC);
+	tDeadzoneIC* GetCurrentDeadzoneIC();
 
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка

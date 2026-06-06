@@ -733,6 +733,37 @@ bool AsmRunner::CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t 
     return true;
 }
 
+void AsmRunner::UpdateDeadzoneIC(uintptr_t currentIC)
+{
+    m_bInDeadzoneIC = false;
+    m_currentDeadzoneICIndex = -1;
+
+    for (size_t i = 0; i < m_deadzonesIC.size(); ++i) {
+        const auto& dz = m_deadzonesIC[i];
+        if (currentIC >= dz.startIC && currentIC <= dz.endIC)
+        {
+            m_bInDeadzoneIC = true;
+            m_currentDeadzoneICIndex = static_cast<int32_t>(i);
+            return;
+        }
+    }
+}
+
+AsmRunner::tDeadzoneIC* AsmRunner::GetCurrentDeadzoneIC()
+{
+    if (!m_bInDeadzoneIC)
+        return nullptr;
+
+    if (m_currentDeadzoneICIndex < 0)
+        return nullptr;
+
+    const size_t idx = static_cast<size_t>(m_currentDeadzoneICIndex);
+    if (idx >= m_deadzonesIC.size())
+        return nullptr;
+
+    return &m_deadzonesIC[idx];
+}
+
 void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC)
 {
     m_bLogDisasm = bLogDisasm;
@@ -849,6 +880,9 @@ void AsmRunner::Shutdown()
     m_rttrace.icoffset = 0;
     m_rttrace.rva = false;
     m_icHooks.clear();
+    m_deadzonesIC.clear();
+    m_bInDeadzoneIC = false;
+    m_currentDeadzoneICIndex = -1;
 }
 
 uc_engine* AsmRunner::GetCTX()
@@ -1081,6 +1115,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 {
     (void)user_data;
     ++m_instrCount;
+    UpdateDeadzoneIC(m_instrCount);
 
     uintptr_t curPc = static_cast<uintptr_t>(address);
     if (!m_bX64)
@@ -1090,6 +1125,63 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     {
         return IsModuleAddr(pc) || InExtraRegion(pc); // || IsRetHaltOrNull(pc); // if allow halt we exec 0x0
     };
+
+    tDeadzoneIC* dz = GetCurrentDeadzoneIC();
+    if (dz && (dz->skipAll || dz->skipOpcode))
+    {
+        // notice
+        if (m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0))
+        {
+            if (m_modStart != 0 && m_modEnd != 0) {
+                uintptr_t pc = CurrentPc(uc);
+                if (!IsAllowedPc(pc)) {
+                    if (m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
+                        Log("\n[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
+                    uc_emu_stop(uc);
+                    return;
+                }
+            }
+
+            std::vector<uint8_t> bytes;
+            bool readOk = ReadBytes(uc, address, size, bytes);
+            std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc) : "[READ ERROR]";
+            std::string curSym = FormatCurrentSymbolSuffix(curPc);
+
+            std::ostringstream oss;
+            oss << "[" << m_instrCount << "] [IN DEAD ZONE " << m_currentDeadzoneICIndex << "] ";
+            if (m_bDisasmRVA)
+                oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR);
+            else
+                oss << "0x" << std::hex << std::uppercase << curPc;
+            oss << ": " << disasm;
+
+            std::string line = oss.str();
+            constexpr size_t kSymbolColumn = 70;
+            if (line.size() < kSymbolColumn)
+                line += std::string(kSymbolColumn - line.size(), ' ');
+            else
+                line += "  ";
+
+            if (!curSym.empty())
+                line += "; " + curSym;
+
+            Log("%s", line.c_str());
+        }
+
+        // trace
+        if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
+        {
+            uintptr_t outPc = curPc;
+            if (m_rttrace.rva)
+                outPc = curPc - m_modStart;
+            if (m_rttrace.aslr != 0)
+                outPc = curPc - m_modStart + m_rttrace.aslr;
+
+            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+        }
+
+        return;
+    }
 
     if (m_modStart != 0 && m_modEnd != 0) {
         uintptr_t pc = CurrentPc(uc);
@@ -1359,6 +1451,11 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data)
 {
     (void)user_data;
+
+    const tDeadzoneIC* dz = GetCurrentDeadzoneIC();
+    if (dz && (dz->skipAll || dz->skipMem))
+        return true;
+
     uintptr_t addr = static_cast<uintptr_t>(address);
     uintptr_t sz = static_cast<uintptr_t>(size);
 
@@ -1482,6 +1579,10 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
 
 bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic)
 {
+    tDeadzoneIC* dz = GetCurrentDeadzoneIC();
+    if (dz && (dz->skipAll || dz->skipJmps))
+        return true;
+
     if (m_bLogAnyJmp)
     {
         Log("[JMP] 0x%p -> 0x%p (%s -> %s) (%d)",
@@ -1606,6 +1707,25 @@ void AsmRunner::_OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz)
             m_trace.prevRegs[key] = cur;
         }
     }
+}
+
+std::chrono::steady_clock::time_point AsmRunner::CaptureTime()
+{
+    return std::chrono::steady_clock::now();
+}
+
+void AsmRunner::DumpTime(std::chrono::steady_clock::time_point start, const char* label)
+{
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(CaptureTime() - start).count();
+    if (label) printf("[%s] %.3fms (%lldus)\n", label, us / 1000.0, us);
+    else printf("[%.3fms (%lldus)]\n", us / 1000.0, us);
+}
+
+void AsmRunner::DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label)
+{
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    if (label) printf("[Delta %s] %.3fms (%lldus)\n", label, us / 1000.0, us);
+    else printf("[Delta] %.3fms (%lldus)\n", us / 1000.0, us);
 }
 
 uintptr_t AsmRunner::GetMappedModuleSizeByName(LPCSTR moduleName)
@@ -3734,6 +3854,200 @@ void AsmRunner::DumpSegmentRegisters()
         uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
         Log("FS_BASE = 0x%08X", (uint32_t)fs_base);
     }
+}
+
+void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode)
+{
+    m_deadzonesIC.push_back({ startIC, endIC, skipJmps, skipMem, skipOpcode, skipAll, false });
+
+    std::sort(m_deadzonesIC.begin(), m_deadzonesIC.end(),
+        [](const tDeadzoneIC& a, const tDeadzoneIC& b) { return a.startIC < b.startIC; });
+
+    if (m_bLogRunner)
+        Log("[*] DeadzoneIC added: %llu - %llu (skipAll=%d)", startIC, endIC, skipAll);
+}
+
+// TODO: others + log hook call
+void AsmRunner::InstallDefaultHooks()
+{
+    // kernel32.dll
+    LoadLibraryA("kernel32.dll");
+
+    SetIAT(0, 0, false); // collect temp ENV
+    SetAnyJmpHook(FindIATNode("VirtualAlloc")->GetAbsolute(),
+        [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            //printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u\n", (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
+
+            // LPVOID VirtualAlloc(
+            //   LPVOID lpAddress,         // x86: [ESP+4], x64: RCX
+            //   SIZE_T dwSize,            // x86: [ESP+8], x64: RDX
+            //   DWORD flAllocationType,   // x86: [ESP+12], x64: R8
+            //   DWORD flProtect           // x86: [ESP+16], x64: R9
+            // );
+
+            uintptr_t lpAddress = 0;
+            uintptr_t dwSize = 0;
+            uintptr_t flAllocationType = 0;
+            uintptr_t flProtect = 0;
+            uintptr_t retaddr = from + size;
+
+            if (self->IsX64())
+            {
+                // x64 calling convention (fastcall)
+                lpAddress = self->GetRegister(UC_X86_REG_RCX);
+                dwSize = self->GetRegister(UC_X86_REG_RDX);
+                flAllocationType = self->GetRegister(UC_X86_REG_R8);
+                flProtect = self->GetRegister(UC_X86_REG_R9);
+            }
+            else
+            {
+                // x86 stdcall (args on stack) // LIFO
+                if (!self->StackPop(lpAddress))			return false;
+                if (!self->StackPop(dwSize))			return false;
+                if (!self->StackPop(flAllocationType))  return false;
+                if (!self->StackPop(flProtect))			return false;
+            }
+
+            printf("[VirtualAlloc] lpAddress=0x%p dwSize=0x%p flAllocationType=0x%p flProtect=0x%p ret=0x%p\n",
+                (void*)lpAddress, (void*)dwSize, (void*)flAllocationType, (void*)flProtect, (void*)retaddr);
+
+            uintptr_t allocated = 0;
+
+            if (dwSize == 0) {
+                allocated = 0;
+            }
+            else {
+                allocated = self->AddMemory(dwSize, UC_PROT_ALL);
+                if (!allocated)
+                {
+                    printf("[VirtualAlloc] AddMemory failed for size 0x%p\n", (void*)dwSize);
+                    self->SetRegister(self->AxReg(), 0);
+                    self->SetRegister(self->PcReg(), retaddr);
+                    self->SetUpdatedPC(true);
+                    return true;
+                }
+
+                printf("[VirtualAlloc] allocated 0x%p bytes at 0x%p\n", (void*)dwSize, (void*)allocated);
+
+                if (lpAddress != 0 && lpAddress != allocated)
+                {
+                    printf("[VirtualAlloc] WARNING: requested specific address 0x%p but allocated at 0x%p\n",
+                        (void*)lpAddress, (void*)allocated);
+                }
+            }
+
+            self->SetRegister(self->AxReg(), allocated);
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        }, this);
+
+    SetAnyJmpHook(FindIATNode("VirtualFree")->GetAbsolute(),
+        [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            //printf("[hook] VirtualFree hit: from=0x%p to=0x%p size=%u mnemonic=%u\n", (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
+
+            // BOOL VirtualFree(
+            //   LPVOID lpAddress,   // x86: [ESP+4], x64: RCX
+            //   SIZE_T dwSize,      // x86: [ESP+8], x64: RDX  
+            //   DWORD dwFreeType    // x86: [ESP+12], x64: R8
+            // );
+
+            uintptr_t lpAddress = 0;
+            uintptr_t dwSize = 0;
+            uintptr_t dwFreeType = 0;
+            uintptr_t retaddr = from + size;
+
+            if (self->IsX64())
+            {
+                lpAddress = self->GetRegister(UC_X86_REG_RCX);
+                dwSize = self->GetRegister(UC_X86_REG_RDX);
+                dwFreeType = self->GetRegister(UC_X86_REG_R8);
+            }
+            else
+            {
+                if (!self->StackPop(lpAddress)) return false;
+                if (!self->StackPop(dwSize)) return false;
+                if (!self->StackPop(dwFreeType)) return false;
+            }
+
+            printf("[VirtualFree] lpAddress=0x%p dwSize=0x%p dwFreeType=0x%p ret=0x%p\n", (void*)lpAddress, (void*)dwSize, (void*)dwFreeType, (void*)retaddr);
+
+            BOOL result = TRUE; // или VirtualFreeStub((LPVOID)lpAddress, dwSize, dwFreeType);
+
+            if (dwFreeType == MEM_RELEASE || dwFreeType == MEM_DECOMMIT)
+            {
+                if (lpAddress != 0)
+                {
+                    self->FreeMemory(lpAddress);
+                    printf("[VirtualFree] Freeing memory at 0x%p\n", (void*)lpAddress);
+                }
+            }
+
+            self->SetRegister(self->AxReg(), result);
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        }, this);
+
+    SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime")->GetAbsolute(),
+        [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self) return true;
+
+            //printf("[hook] GetSystemTimeAsFileTime hit: from=0x%p to=0x%p\n", (void*)from, (void*)to);
+
+            uintptr_t lpSystemTimeAsFileTime = 0;
+            uintptr_t retaddr = from + size;
+
+            if (self->IsX64())
+                lpSystemTimeAsFileTime = self->GetRegister(UC_X86_REG_RCX);
+            else
+                if (!self->StackPop(lpSystemTimeAsFileTime)) return false;
+
+            printf("[GetSystemTimeAsFileTime] lpSystemTimeAsFileTime=0x%p\n", (void*)lpSystemTimeAsFileTime);
+
+            FILETIME ft = { 0 };
+
+#if 0
+            GetSystemTimeAsFileTime(&ft);
+#else
+            static FILETIME s_ft = { 0 };
+            static BOOL bInitialized = FALSE;
+
+            if (!bInitialized)
+            {
+                GetSystemTimeAsFileTime(&s_ft);
+                bInitialized = TRUE;
+                printf("[GetSystemTimeAsFileTime] Static time initialized: 0x%08X%08X\n",
+                    s_ft.dwHighDateTime, s_ft.dwLowDateTime);
+            }
+
+            ft = s_ft;
+#endif
+
+            printf("[GetSystemTimeAsFileTime] result: 0x%08X%08X\n", ft.dwHighDateTime, ft.dwLowDateTime);
+
+            if (lpSystemTimeAsFileTime)
+                self->_CopyMemory(lpSystemTimeAsFileTime, (uintptr_t)&ft, sizeof(FILETIME));
+
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        }, this);
 }
 
 void AsmRunner::TrimInPlace(std::string& s)
