@@ -218,7 +218,7 @@ public:
 	bool InExtraRegion(uintptr_t pAddr) const;
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
-	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0);
+	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0);
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB);
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep);
 	void Pause();
@@ -331,6 +331,7 @@ private:
 	{
 		std::ofstream file;
 		uintptr_t aslr;
+		uintptr_t icoffset;
 		bool rva;
 		bool inited;
 	};

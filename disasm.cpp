@@ -846,6 +846,7 @@ void AsmRunner::Shutdown()
     }
     m_rttrace.inited = false;
     m_rttrace.aslr = 0;
+    m_rttrace.icoffset = 0;
     m_rttrace.rva = false;
     m_icHooks.clear();
 }
@@ -1106,7 +1107,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc) : "[READ ERROR]";
     std::string curSym = FormatCurrentSymbolSuffix(curPc);
 
-    if (m_rttrace.inited && m_rttrace.file.is_open()) {
+    if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
         uintptr_t outPc = curPc;
         if (m_rttrace.rva)
             outPc = curPc - m_modStart;
@@ -3336,7 +3337,7 @@ tFuncNode AsmRunner::GetModuleExport(const char* szModule, const char* szExportN
     return empty;
 }
 
-void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA, uintptr_t pASLR)
+void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset)
 {
     if (!szPCTraceFileOutPath || !*szPCTraceFileOutPath) return;
 
@@ -3352,6 +3353,7 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA, uintptr_
     }
 
     m_rttrace.aslr = pASLR;
+    m_rttrace.icoffset = nICOffset;
     m_rttrace.rva = bRVA;
 
     if (m_bLogRunner) {
@@ -4483,9 +4485,9 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
     //printf("[%s] base=0x%p end=0x%p size=0x%zx\n", STEAM_LIB, (void*)pStart, (void*)pEnd, (size_t)nSize);
 
-    runner.SetICCallback(2'500'000, [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    runner.SetICCallback(4'800'000, [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        MboxSTD("crc section copy", "MemCb");
+        MboxSTD("crc section copy", "Cb");
         return true;
         },
         &runner);
@@ -4502,7 +4504,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             SetConsoleColor(1);
         }
 
-        if (self->GetInstructionCount() > /*5080*/2'500'000) {
+        if (self->GetInstructionCount() > /*5080*/4'800'000) {
             self->SetLogDisasm(true);
         }
         else {
@@ -4658,6 +4660,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     //	&runner);
 
     runner.SetIAT(0, 0, false); // collect temp ENV
+    //printf("0x%p\n", runner.FindIATNode("VirtualAlloc")->GetAbsolute());
     runner.SetAnyJmpHook(runner.FindIATNode("VirtualAlloc")->GetAbsolute(), [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
             auto* self = static_cast<AsmRunner*>(user_data);
@@ -4741,7 +4744,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
     runner.SetDisasmAfterCB(true);
     runner.SetDisasmRVA(true, 0x60F00000);
-    //runner.SetPCTrace("trace_crc.txt");
+    runner.SetPCTrace("trace_crc.txt", true, 0, 4'800'000);
     runner.SetLogDisasmICNotice(500'000);
     runner.ComparePCTrace("trace_crc3.txt", "trace_crc2.txt");
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
@@ -4786,7 +4789,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     //	return;
     //}
 
-    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 3'500'000); // 0 = без лимита по шагам // 800 000 crc copy
+    runner.Run(reinterpret_cast<uintptr_t>(pEntry), 5'500'000); // 0 = без лимита по шагам // 800 000 crc copy
     runner.Shutdown();
 
 
