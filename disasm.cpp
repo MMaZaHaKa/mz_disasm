@@ -103,7 +103,6 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
         case ZYDIS_MNEMONIC_IRET:
         case ZYDIS_MNEMONIC_IRETD:
         case ZYDIS_MNEMONIC_IRETQ:
-            return true;
 
         // Прерывания / системные переходы
 #ifdef AR_SYSCALL_JUMP_CB
@@ -120,8 +119,8 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
         case ZYDIS_MNEMONIC_UD1:
         case ZYDIS_MNEMONIC_UD0:
         case ZYDIS_MNEMONIC_HLT:
-            return true;
 #endif
+            return true;
 
         default:
             return false;
