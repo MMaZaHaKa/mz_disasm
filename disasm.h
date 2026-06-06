@@ -789,6 +789,7 @@ public:
 //https://github.com/colby57/VMP-Imports-Deobfuscator/tree/3d9817024ea58d806a52a2bd85dde5b1c697dc75
 //https://github.com/KuNgia09/vmp3-import-fix
 //https://github.com/pulpgit/Themida-Imports-Deobfuscator-main/tree/84e8edf96a2b8a9134bf40c97ad94e8cb558ff16
+//https://github.com/MMaZaHaKa/awesome_anti_virus_engine
 //
 //https://github.com/unicorn-engine/unicorn
 //https://github.com/DarthTon/Blackbone

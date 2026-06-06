@@ -2640,7 +2640,7 @@ bool AsmRunner::SetTebBase(uintptr_t base)
 }
 
 //bool AsmRunner::SetTebBase(uintptr_t base)
-//{
+//{ // MSR GDT LDT
 //    if (!m_uc)
 //        return false;
 //
