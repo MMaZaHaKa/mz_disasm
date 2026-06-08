@@ -17,10 +17,10 @@
 
 //#define AR_SYSCALL_JUMP_CB
 //#define AR_DEBUG
+#define AR_IDA_WS
 
 // TODO: normal seh, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb
 
-#include "stdint.h"
 #include <vector>
 #include <map>
 #include <functional>
@@ -30,6 +30,8 @@
 #include <sstream>
 #include <algorithm>
 #include <chrono>
+#include <thread>
+#include <mutex>
 #include <unordered_map>
 
 #define ARP(p) ((uintptr_t)p)
@@ -89,6 +91,8 @@ public:
 	bool IsDisasmAfterCB() const { return m_bDisasmAfterCB; }
 	void SetDisasmRVA(bool enabled, uintptr_t disasmCustomASLR = 0) { m_bDisasmRVA = enabled; m_DisasmCustomASLR = disasmCustomASLR; }
 	bool IsDisasmRVA() const { return m_bDisasmRVA; }
+	uintptr_t GetDisasmCASLR() const { return m_DisasmCustomASLR; }
+	uintptr_t CalcWithCASLR(uintptr_t p) const { return p - GetModStart() + GetDisasmCASLR(); }
 	void SetLogDisasm(bool enabled) { m_bLogDisasm = enabled; }
 	bool IsLogDisasm() const { return m_bLogDisasm; }
 	void SetLogDisasmICNotice(uintptr_t disasmICNotice) { m_DisasmICNotice = disasmICNotice; }
@@ -214,7 +218,7 @@ public:
 	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
 	void SetSysCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
 	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
-	tIEFuncNode* FindIATNode(std::string name, bool bLowerCmp = true, bool bContains = false);
+	tIEFuncNode* FindIATNode(std::string funcName, std::string moduleName = "", bool bLowerCmp = true, bool bContains = false);
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
 		OnMemCb mem_cb = nullptr, void* mem_data = nullptr,
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
@@ -274,6 +278,14 @@ public:
 	std::string isData(uintptr_t pAddr);
 	std::string isASCII(uintptr_t pAddr);
 	std::string get_func_name(uintptr_t pAddr);
+#ifdef AR_IDA_WS
+	bool InitIDAWS(const std::string& host = "127.0.0.1", uint16_t port = 27310);
+	bool IsIDAWSConnected() const;
+	void WaitIDAWSConnection() const;
+	bool SendIDAAddr(uintptr_t addr);
+	bool SendIDAIdcBuff(const std::string& idcBuff);
+	void CloseIDAWS();
+#endif
 
 	//MakeCode-AddFunc-SetName
 
@@ -358,7 +370,8 @@ private:
 		void* data = nullptr;
 	};
 
-	struct tDeadzoneIC {
+	struct tDeadzoneIC
+	{
 		uintptr_t startIC;     // Начальный счётчик инструкций
 		uintptr_t endIC;       // Конечный счётчик инструкций
 		bool skipJmps;         // Пропускать JMP колбэки
@@ -366,6 +379,18 @@ private:
 		bool skipOpcode;       // Пропускать Opcode колбэки
 		bool skipAll;          // Пропустить всё
 		bool active;           // Активен ли сейчас
+	};
+
+	struct tIdaWsBridge
+	{
+		std::string bind_addr;
+		int32_t port;
+		uintptr_t listen_sock; // sock_t
+		uintptr_t client_sock; // sock_t
+		std::thread accept_thread;
+		std::mutex client_mutex;
+		std::atomic<bool> running;
+		bool wsa_started;
 	};
 
 	uc_engine* m_uc = nullptr;
@@ -432,6 +457,10 @@ private:
 	std::map<uintptr_t, tBpInfo> m_breakpoints;
 	tTraceState m_trace; // separate run
 	tRTTrace m_rttrace; // default
+
+#ifdef AR_IDA_WS
+	tIdaWsBridge m_ws;
+#endif
 
 #ifdef ZYDIS
 	ZydisDecoder m_decoder{};
@@ -536,227 +565,6 @@ public:
 	}
 	void inline RemovePatch() { if (size && isPatched) { PerformWrite(address, (uintptr_t)originalBytes.data(), originalBytes.size()); isPatched = false; printf("[0x%p/%d]: Disa\n", address, size); } }
 };
-
-
-// OLD
-//class AsmRunner // x86 x64 with macro
-//{
-//public:
-//	// Тип колбэка для опкода: вызывается перед выполнением инструкции
-//	// ctx - контекст Unicorn, address - адрес инструкции, size - размер инструкции, user_data - пользовательские данные
-//	using OnOpcodeCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t size, void* user_data)>;
-//
-//	// Тип колбэка для памяти: вызывается при чтении/записи памяти
-//	// type - UC_MEM_READ/UC_MEM_WRITE, address - адрес доступа, size - размер, value - значение (для записи)
-//	using OnMemCb = std::function<bool(uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, void* user_data)>;
-//
-//	// Тип колбэка для перехода: вызывается при jmp/call/ret
-//	using OnJmpCb = std::function<bool(uc_engine* uc, uintptr_t from, uintptr_t to, void* user_data)>;
-//
-//	// Тип колбэка для брейкпоинта
-//	using OnBreakpointCb = std::function<bool(uc_engine* uc, uintptr_t address, void* user_data)>;
-//
-//	// Тип колбэка для трассировки: возвращает true для остановки трассировки
-//	using TraceCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t instruction_count, void* user_data)>;
-//
-//	// точки останова: addr info
-//	struct tBpInfo
-//	{
-//		uint32_t       size = 1;
-//		eBpType        type = BP_CODE;
-//		OnBreakpointCb cb;
-//		void* data = nullptr;
-//		uc_hook        hook = 0;
-//	};
-//
-//	// состояние трасировки Tenet
-//	struct tTraceState
-//	{
-//		std::ofstream           file;
-//		uint32_t                count = 0;
-//		uint32_t                maxCount = 0;
-//		TraceCb                 cbStop;
-//		bool                    active = false;
-//		std::map<int, uint64_t> prevRegs;  // предыдущие значения регистров для delta
-//		uintptr_t               lastMemAddr = 0;
-//		uint32_t                lastMemSize = 0;
-//		bool                    lastMemWrite = false;
-//		std::vector<uint8_t>    lastMemData;
-//	};
-//
-//	uc_engine* m_uc = nullptr;
-//	bool m_bInitialised = false;
-//	bool m_bLogEnabled = true;
-//	bool m_bLogDisasm = false;
-//	bool m_bLogMemRW = false;
-//	bool m_bLogRunner = false;
-//	bool m_bX64 = false;
-//
-//	std::vector<tFuncNode> m_sym;
-//	uintptr_t m_LoadBase = 0;
-//
-//#ifdef ZYDIS
-//	ZydisDecoder m_decoder{};
-//	ZydisFormatter m_formatter{};
-//#endif
-//#ifdef CAPSTONE
-//	csh m_csHandle = 0;
-//#endif
-//
-//	uintptr_t m_modStart = 0;
-//	uintptr_t m_modEnd = 0;
-//
-//	uintptr_t m_stackBase = 0x00100000;
-//	uintptr_t m_stackSize = 0x00100000;
-//	uintptr_t m_allocBase = 0x20000000;
-//	uintptr_t m_allocCursor = 0x20000000;
-//
-//	uintptr_t m_instrCount = 0;
-//	uc_hook m_hkCode = 0;
-//	uc_hook m_hkMem = 0;
-//
-//	OnOpcodeCb m_cbOpcode;
-//	void* m_cbOpcodeData = nullptr;
-//	OnMemCb m_cbMem;
-//	void* m_cbMemData = nullptr;
-//	OnJmpCb m_cbJmp;
-//	void* m_cbJmpData = nullptr;
-//	OnBreakpointCb m_cbBreak;
-//	void* m_cbBreakData = nullptr;
-//
-//	// флаги управления эмуляцией
-//	bool m_bPaused = false;
-//	bool m_bStopped = false;
-//
-//	std::map<uintptr_t, tBpInfo> m_breakpoints;
-//	tTraceState m_trace;
-//
-//#ifdef _M_X64
-//	static constexpr bool kBuild64 = true;
-//#else
-//	static constexpr bool kBuild64 = false;
-//#endif
-//
-//	AsmRunner();
-//	~AsmRunner();
-//
-//	// logger
-//	void SetLogging(bool enabled) { m_bLogEnabled = enabled; }
-//	bool IsLogging() const { return m_bLogEnabled; }
-//
-//	// core lifecycle
-//	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogRunner); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
-//	void Shutdown();
-//	uc_engine* GetCTX();
-//
-//	// tools
-//	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
-//	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
-//	void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output);
-//	bool CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size);
-//
-//	// Mem
-//	uintptr_t AddMemory(uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
-//	uintptr_t AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
-//	void AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType);
-//	void _CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
-//	void FreeMemory(uintptr_t pVTo);
-//	void ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
-//	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
-//	void DumpMemory(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
-//	void DumpMemory(uintptr_t pNativeStart, uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
-//	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
-//
-//	// asm / registers / stack
-//	void SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg); // bLogRunner log st ptr // default // 0=ebp+4?
-//	void SetStackArgEbpIndex(uint32_t nIdx, uintptr_t arg); // ebp+4 +8 +C ...  // bLogRunner log st ptr // custom stack arg // 4=ebpdefault 0arg?
-//	void SetRegister(uint32_t nRegister, uintptr_t arg); // todo unicorn types?
-//	uintptr_t GetRegister(uint32_t nRegister);
-//	void SetStack(uintptr_t pStack, uintptr_t nSize); // if bLogRunner log stack
-//	void SetStack(); // if bLogRunner log stack
-//	uintptr_t GetStack(uint32_t nIdx);
-//	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
-//
-//	// callbacks / execution
-//	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
-//		OnMemCb mem_cb = nullptr, void* mem_data = nullptr,
-//		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
-//	void CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
-//	void CopyModule(uintptr_t pFrom, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
-//	void LoadModule(const char* szModule); // mz pe? (exe+dll)
-//	std::vector<tFuncNode> GetModuleExports();
-//	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
-//	void Run(uintptr_t pEntry, uintptr_t nStepsDeep);
-//	void Pause();
-//	void Resume();
-//	void Stop();
-//	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
-//	void DumpRegisters(); // and flags
-//
-//	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
-//	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
-//	tFuncNode GetSymByName(const char* szName);
-//	tFuncNode GetSymByAddr(uintptr_t pAddr);
-//	void DisassembleWithZydis();
-//	void DisassembleWithCapstone();
-//
-//	void SetBreakpoint(uintptr_t pAddr, eBpType type = BP_CODE, uint32_t size = 1, OnBreakpointCb cb = nullptr, void* data = nullptr);
-//	void RemoveBreakpoint(uintptr_t pAddr);
-//	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr); // 0 until end, cb can null autofalse
-//	
-//	uint32_t PcReg() const { return m_bX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP; }
-//	uint32_t SpReg() const { return m_bX64 ? UC_X86_REG_RSP : UC_X86_REG_ESP; }
-//	uint32_t FpReg() const { return m_bX64 ? UC_X86_REG_RBP : UC_X86_REG_EBP; }
-//	static inline uintptr_t AlignUp(uintptr_t x, uintptr_t a) { return (x + a - 1) & ~(a - 1); }
-//	static inline bool is_printable_ascii(uint8_t c) { return c >= 0x20 && c <= 0x7e; }
-//
-//	void Log(const char* fmt, ...) const
-//	{
-//		if (!m_bLogEnabled) return;
-//		va_list ap;
-//		va_start(ap, fmt);
-//		std::vfprintf(stdout, fmt, ap);
-//		std::fputc('\n', stdout);
-//		va_end(ap);
-//	}
-//
-//	static void HookCodeTrampoline(uc_engine* uc, uint64_t address, uint32_t size, void* user_data);
-//	static bool HookMemTrampoline(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
-//
-//	// внутренние колбэки Unicorn (static, this передаётся через user_data)
-//	// _OnInstructionStep // for disasm // +call user cb // before perform eip // + breakpoint?
-//	// _OnMemory // for bLogMemRW // +call user cb
-//	// _OnJmp // on non next op? like any ret call jmp
-//	// _OnBreakpoint
-//	// _OnTraceStep
-//
-//	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
-//	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
-//	void _OnJmp(uc_engine* uc, uintptr_t from, uintptr_t to);        // jmp/call/ret детектируется в _OnInstructionStep
-//	void _OnBreakpoint(uc_engine* uc, uintptr_t address);             // срабатывание точки останова
-//	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
-//
-//	// symbol helpers
-//	const tFuncNode* FindSymbolByRuntime(uintptr_t rtAddr) const;
-//	std::string FormatRuntimeAddress(uintptr_t rtAddr) const;
-//	std::string FormatRuntimeAddressWithSymbol(uintptr_t rtAddr) const;
-//	bool ResolveDirectBranchTarget(const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const;
-//
-//	// more helpers
-//	bool ReadBytes(uc_engine* uc, uint64_t address, uint32_t size, std::vector<uint8_t>& out) const;
-//	std::string RegName(uint32_t reg) const;
-//	uintptr_t CurrentPc(uc_engine* uc) const;
-//	uintptr_t CurrentSp(uc_engine* uc) const;
-//	bool IsInModule(uintptr_t addr) const;
-//	bool MatchBreakpoint(uintptr_t addr, eBpType accessType, uintptr_t size, tBpInfo*& outBp);
-//	void TraceWriteLine(const std::string& s);
-//	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress);
-//
-//	// exports / PE helpers
-//	static void TrimInPlace(std::string& s);
-//	static bool ParseHexPtr(const std::string& s, uintptr_t& out);
-//	bool LoadExportsFromBase(uintptr_t base, std::vector<tFuncNode>& out) const;
-//};
 
 //TraceInstruction format like Tenet ida plugin
 //ax = 0xf4, eip = 0x502612, mr = 0x4ccbdf:f4

@@ -1,3 +1,10 @@
+#ifdef _WIN32 // AR_IDA_WS
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
+#endif
+
 #include "disasm.h"
 #include <Windows.h>
 #include <psapi.h>
@@ -1154,8 +1161,10 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
             std::ostringstream oss;
             oss << "[" << m_instrCount << "] [IN DEAD ZONE " << m_currentDeadzoneICIndex << "] ";
-            if (m_bDisasmRVA)
-                oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR);
+            if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
+            else if (m_bDisasmRVA)
+                oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR) << " ( +0x" << (curPc - m_modStart) << ")";
             else
                 oss << "0x" << std::hex << std::uppercase << curPc;
             oss << ": " << disasm;
@@ -1231,8 +1240,10 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if (!m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
-        if(m_bDisasmRVA)
-            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR);
+        if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
+        else if (m_bDisasmRVA)
+            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR) << " ( +0x" << (curPc - m_modStart) << ")";
         else
             oss << "0x" << std::hex << std::uppercase << curPc;
         oss << ": " << disasm;
@@ -1423,8 +1434,10 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if (m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
-        if (m_bDisasmRVA)
-            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR);
+        if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
+        else if (m_bDisasmRVA)
+            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR) << " ( +0x" << (curPc - m_modStart) << ")";
         else
             oss << "0x" << std::hex << std::uppercase << curPc;
         oss << ": " << disasm;
@@ -3303,31 +3316,39 @@ tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
     return nullptr;
 }
 
-tIEFuncNode* AsmRunner::FindIATNode(std::string name, bool bLowerCmp, bool bContains)
+tIEFuncNode* AsmRunner::FindIATNode(std::string funcName, std::string moduleName, bool bLowerCmp, bool bContains)
 {
-    std::string searchName = name;
-    if (bLowerCmp)
-        std::transform(searchName.begin(), searchName.end(), searchName.begin(), ::tolower);
+    std::string searchFunc = funcName;
+    std::string searchModule = moduleName;
+
+    if (bLowerCmp) {
+        std::transform(searchFunc.begin(), searchFunc.end(), searchFunc.begin(), ::tolower);
+        std::transform(searchModule.begin(), searchModule.end(), searchModule.begin(), ::tolower);
+    }
 
     for (auto& e : exportsENV) {
-        std::string funcName = e.second.funcName;
-        std::string moduleName = e.second.moduleName;
+        std::string currentFunc = e.second.funcName;
+        std::string currentModule = e.second.moduleName;
 
         if (bLowerCmp) {
-            std::transform(funcName.begin(), funcName.end(), funcName.begin(), ::tolower);
-            std::transform(moduleName.begin(), moduleName.end(), moduleName.begin(), ::tolower);
+            std::transform(currentFunc.begin(), currentFunc.end(), currentFunc.begin(), ::tolower);
+            std::transform(currentModule.begin(), currentModule.end(), currentModule.begin(), ::tolower);
         }
 
+        bool funcMatches = false;
+        bool moduleMatches = false;
+
         if (bContains) {
-            if (funcName.find(searchName) != std::string::npos ||
-                moduleName.find(searchName) != std::string::npos) {
-                return &e.second;
-            }
+            funcMatches = searchFunc.empty() || currentFunc.find(searchFunc) != std::string::npos;
+            moduleMatches = searchModule.empty() || currentModule.find(searchModule) != std::string::npos;
         }
         else {
-            if (funcName == searchName || moduleName == searchName) {
-                return &e.second;
-            }
+            funcMatches = searchFunc.empty() || currentFunc == searchFunc;
+            moduleMatches = searchModule.empty() || currentModule == searchModule;
+        }
+
+        if (funcMatches && moduleMatches) {
+            return &e.second;
         }
     }
 
@@ -4104,10 +4125,11 @@ void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll, 
 void AsmRunner::InstallDefaultHooks()
 {
     // kernel32.dll
-    LoadLibraryA("kernel32.dll");
+    const char* szModule = "kernel32.dll";
+    LoadLibraryA(szModule);
 
     SetIAT(0, 0, false); // collect temp ENV
-    SetAnyJmpHook(FindIATNode("VirtualAlloc")->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("VirtualAlloc", szModule)->GetAbsolute(),
         [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
             auto* self = static_cast<AsmRunner*>(user_data);
@@ -4181,7 +4203,7 @@ void AsmRunner::InstallDefaultHooks()
             return true;
         }, this);
 
-    SetAnyJmpHook(FindIATNode("VirtualFree")->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("VirtualFree", szModule)->GetAbsolute(),
         [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
@@ -4234,7 +4256,7 @@ void AsmRunner::InstallDefaultHooks()
             return true;
         }, this);
 
-    SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime")->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsolute(),
         [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
@@ -4576,6 +4598,585 @@ std::string AsmRunner::get_func_name(uintptr_t pAddr)
     return std::string(buff);
 }
 #undef BUFF_SIZE
+
+#ifdef AR_IDA_WS
+
+#if 1 // async
+bool AsmRunner::InitIDAWS(const std::string& host, uint16_t port)
+{
+    CloseIDAWS();
+
+    m_ws.bind_addr = host.empty() ? "127.0.0.1" : host;
+    m_ws.port = port ? static_cast<int32_t>(port) : 27310;
+    m_ws.listen_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+    m_ws.client_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+    m_ws.running.store(false);
+    m_ws.wsa_started = false;
+
+#ifdef _WIN32
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return false;
+    m_ws.wsa_started = true;
+#endif
+
+    SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET)
+    {
+        CloseIDAWS();
+        return false;
+    }
+    m_ws.listen_sock = static_cast<uintptr_t>(listenSock);
+
+    int opt = 1;
+    ::setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(m_ws.port));
+
+    if (m_ws.bind_addr.empty() || m_ws.bind_addr == "0.0.0.0")
+    {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
+    else
+    {
+        if (inet_pton(AF_INET, m_ws.bind_addr.c_str(), &addr.sin_addr) != 1)
+        {
+            CloseIDAWS();
+            return false;
+        }
+    }
+
+    if (bind(listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+    {
+        CloseIDAWS();
+        return false;
+    }
+
+    if (listen(listenSock, 1) != 0)
+    {
+        CloseIDAWS();
+        return false;
+    }
+
+    m_ws.running.store(true);
+
+    m_ws.accept_thread = std::thread([this]()
+        {
+            auto close_client_locked = [this]()
+            {
+                if (m_ws.client_sock != static_cast<uintptr_t>(INVALID_SOCKET))
+                {
+                    SOCKET s = static_cast<SOCKET>(m_ws.client_sock);
+                    ::shutdown(s, SD_BOTH);
+                    ::closesocket(s);
+                    m_ws.client_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+                }
+            };
+
+            while (m_ws.running.load())
+            {
+                sockaddr_in clientAddr{};
+#ifdef _WIN32
+                int clientLen = static_cast<int>(sizeof(clientAddr));
+#else
+                socklen_t clientLen = static_cast<socklen_t>(sizeof(clientAddr));
+#endif
+                SOCKET client = ::accept(static_cast<SOCKET>(m_ws.listen_sock),
+                    reinterpret_cast<sockaddr*>(&clientAddr),
+                    &clientLen);
+
+                if (!m_ws.running.load())
+                    break;
+
+                if (client == INVALID_SOCKET)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
+
+#ifdef _WIN32
+                u_long nonBlocking = 1;
+                ioctlsocket(client, FIONBIO, &nonBlocking);
+#endif
+
+                {
+                    std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+                    close_client_locked();
+                    m_ws.client_sock = static_cast<uintptr_t>(client);
+                }
+
+                while (m_ws.running.load())
+                {
+                    char tmp = 0;
+                    int r = ::recv(client, &tmp, 1, MSG_PEEK);
+
+                    if (r == 0)
+                        break;
+
+                    if (r < 0)
+                    {
+#ifdef _WIN32
+                        const int err = WSAGetLastError();
+                        if (err == WSAEWOULDBLOCK || err == WSAEINTR)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            continue;
+                        }
+#else
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            continue;
+                        }
+#endif
+                        break;
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+                    if (m_ws.client_sock == static_cast<uintptr_t>(client))
+                        close_client_locked();
+                    else
+                        ::closesocket(client);
+                }
+            }
+        });
+
+    return true;
+}
+
+bool AsmRunner::IsIDAWSConnected() const
+{
+    return m_ws.client_sock != static_cast<uintptr_t>(INVALID_SOCKET);
+}
+
+void AsmRunner::WaitIDAWSConnection() const
+{
+    // Wait until we have a connected client
+    while (!IsIDAWSConnected())
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Optional: add a small delay after connection is detected
+    // to ensure the client is fully ready
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+bool AsmRunner::SendIDAAddr(uintptr_t addr)
+{
+    if (!IsIDAWSConnected())
+        return false;
+
+    SOCKET client = static_cast<SOCKET>(m_ws.client_sock);
+
+    const uint8_t addrSize = static_cast<uint8_t>(sizeof(uintptr_t));
+    std::array<uint8_t, 2 + sizeof(uintptr_t)> packet{};
+    packet[0] = 'A';
+    packet[1] = addrSize;
+
+    for (uint8_t i = 0; i < addrSize; ++i)
+        packet[2 + i] = static_cast<uint8_t>((addr >> (i * 8)) & 0xFF);
+
+    size_t sent = 0;
+    while (sent < packet.size())
+    {
+        int s = ::send(client,
+            reinterpret_cast<const char*>(packet.data() + sent),
+            static_cast<int>(packet.size() - sent),
+            0);
+        if (s <= 0)
+        {
+            CloseIDAWS();
+            return false;
+        }
+        sent += static_cast<size_t>(s);
+    }
+
+    return true;
+}
+
+bool AsmRunner::SendIDAIdcBuff(const std::string& idcBuff)
+{
+    if (!IsIDAWSConnected())
+        return false;
+
+    SOCKET client = static_cast<SOCKET>(m_ws.client_sock);
+
+    const uint32_t len = static_cast<uint32_t>(idcBuff.size());
+    std::vector<uint8_t> packet;
+    packet.reserve(1 + 4 + len);
+    packet.push_back('I');
+    packet.push_back(static_cast<uint8_t>(len & 0xFF));
+    packet.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+    packet.push_back(static_cast<uint8_t>((len >> 16) & 0xFF));
+    packet.push_back(static_cast<uint8_t>((len >> 24) & 0xFF));
+    packet.insert(packet.end(), idcBuff.begin(), idcBuff.end());
+
+    size_t sent = 0;
+    while (sent < packet.size())
+    {
+        int s = ::send(client,
+            reinterpret_cast<const char*>(packet.data() + sent),
+            static_cast<int>(packet.size() - sent),
+            0);
+        if (s <= 0)
+        {
+            CloseIDAWS();
+            return false;
+        }
+        sent += static_cast<size_t>(s);
+    }
+
+    return true;
+}
+
+void AsmRunner::CloseIDAWS()
+{
+    m_ws.running.store(false);
+
+    if (m_ws.listen_sock != static_cast<uintptr_t>(INVALID_SOCKET))
+    {
+        SOCKET s = static_cast<SOCKET>(m_ws.listen_sock);
+        ::shutdown(s, SD_BOTH);
+        ::closesocket(s);
+        m_ws.listen_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+        if (m_ws.client_sock != static_cast<uintptr_t>(INVALID_SOCKET))
+        {
+            SOCKET s = static_cast<SOCKET>(m_ws.client_sock);
+            ::shutdown(s, SD_BOTH);
+            ::closesocket(s);
+            m_ws.client_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+        }
+    }
+
+    if (m_ws.accept_thread.joinable() &&
+        m_ws.accept_thread.get_id() != std::this_thread::get_id())
+    {
+        m_ws.accept_thread.join();
+    }
+
+#ifdef _WIN32
+    if (m_ws.wsa_started)
+    {
+        WSACleanup();
+        m_ws.wsa_started = false;
+    }
+#endif
+}
+#else
+bool AsmRunner::InitIDAWS(const std::string& host, uint16_t port)
+{
+    CloseIDAWS();
+
+    m_ws.bind_addr = host.empty() ? "127.0.0.1" : host;
+    m_ws.port = port ? static_cast<int32_t>(port) : 27310;
+    m_ws.listen_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+    m_ws.client_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+    m_ws.running.store(false);
+    m_ws.wsa_started = false;
+
+#ifdef _WIN32
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return false;
+    m_ws.wsa_started = true;
+#endif
+
+    SOCKET listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET)
+    {
+        CloseIDAWS();
+        return false;
+    }
+    m_ws.listen_sock = static_cast<uintptr_t>(listenSock);
+
+    int opt = 1;
+    ::setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR,
+        reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(m_ws.port));
+
+    if (m_ws.bind_addr.empty() || m_ws.bind_addr == "0.0.0.0")
+    {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
+    else
+    {
+        if (inet_pton(AF_INET, m_ws.bind_addr.c_str(), &addr.sin_addr) != 1)
+        {
+            CloseIDAWS();
+            return false;
+        }
+    }
+
+    if (bind(listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0)
+    {
+        CloseIDAWS();
+        return false;
+    }
+
+    if (listen(listenSock, 1) != 0)
+    {
+        CloseIDAWS();
+        return false;
+    }
+
+    m_ws.running.store(true);
+
+    m_ws.accept_thread = std::thread([this]()
+        {
+            auto close_client_locked = [this]()
+            {
+                if (m_ws.client_sock != static_cast<uintptr_t>(INVALID_SOCKET))
+                {
+                    SOCKET s = static_cast<SOCKET>(m_ws.client_sock);
+                    ::shutdown(s, SD_BOTH);
+                    ::closesocket(s);
+                    m_ws.client_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+                }
+            };
+
+            while (m_ws.running.load())
+            {
+                sockaddr_in clientAddr{};
+#ifdef _WIN32
+                int clientLen = static_cast<int>(sizeof(clientAddr));
+#else
+                socklen_t clientLen = static_cast<socklen_t>(sizeof(clientAddr));
+#endif
+                SOCKET client = ::accept(static_cast<SOCKET>(m_ws.listen_sock),
+                    reinterpret_cast<sockaddr*>(&clientAddr),
+                    &clientLen);
+
+                if (!m_ws.running.load())
+                    break;
+
+                if (client == INVALID_SOCKET)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+
+#ifdef _WIN32
+                u_long nonBlocking = 1;
+                ioctlsocket(client, FIONBIO, &nonBlocking);
+#endif
+
+                {
+                    std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+                    close_client_locked();
+                    m_ws.client_sock = static_cast<uintptr_t>(client);
+                }
+
+                while (m_ws.running.load())
+                {
+                    char tmp = 0;
+                    int r = ::recv(client, &tmp, 1, MSG_PEEK);
+
+                    if (r == 0)
+                        break;
+
+                    if (r < 0)
+                    {
+#ifdef _WIN32
+                        const int err = WSAGetLastError();
+                        if (err == WSAEWOULDBLOCK || err == WSAEINTR)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                            continue;
+                        }
+#else
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                            continue;
+                        }
+#endif
+                        break;
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+                    if (m_ws.client_sock == static_cast<uintptr_t>(client))
+                        close_client_locked();
+                    else
+                        ::closesocket(client);
+                }
+            }
+        });
+
+    // Ждём, пока new_listener.py реально подключится.
+    // После возврата отсюда SendIdcBuff / SendAddr уже можно вызывать сразу.
+    constexpr auto kWaitTimeout = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+            if (m_ws.client_sock != static_cast<uintptr_t>(INVALID_SOCKET))
+                return true;
+        }
+
+        if (!m_ws.running.load())
+            break;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    CloseIDAWS();
+    return false;
+}
+
+bool AsmRunner::IsIDAWSConnected() const
+{
+    std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(m_ws.client_mutex));
+    return m_ws.client_sock != static_cast<uintptr_t>(INVALID_SOCKET);
+}
+
+void AsmRunner::WaitIDAWSConnection() const
+{
+    // Wait until we have a connected client
+    while (!IsIDAWSConnected())
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Optional: add a small delay after connection is detected
+    // to ensure the client is fully ready
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+bool AsmRunner::SendIDAAddr(uintptr_t addr)
+{
+    SOCKET client = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+        if (m_ws.client_sock == static_cast<uintptr_t>(INVALID_SOCKET))
+            return false;
+        client = static_cast<SOCKET>(m_ws.client_sock);
+    }
+
+    const uint8_t addrSize = static_cast<uint8_t>(sizeof(uintptr_t));
+    std::array<uint8_t, 2 + sizeof(uintptr_t)> packet{};
+    packet[0] = 'A';
+    packet[1] = addrSize;
+
+    for (uint8_t i = 0; i < addrSize; ++i)
+        packet[2 + i] = static_cast<uint8_t>((addr >> (i * 8)) & 0xFF);
+
+    size_t sent = 0;
+    while (sent < packet.size())
+    {
+        int s = ::send(client,
+            reinterpret_cast<const char*>(packet.data() + sent),
+            static_cast<int>(packet.size() - sent),
+            0);
+        if (s <= 0)
+        {
+            CloseIDAWS();
+            return false;
+        }
+        sent += static_cast<size_t>(s);
+    }
+
+    return true;
+}
+
+bool AsmRunner::SendIDAIdcBuff(const std::string& idcBuff)
+{
+    SOCKET client = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+        if (m_ws.client_sock == static_cast<uintptr_t>(INVALID_SOCKET))
+            return false;
+        client = static_cast<SOCKET>(m_ws.client_sock);
+    }
+
+    const uint32_t len = static_cast<uint32_t>(idcBuff.size());
+    std::vector<uint8_t> packet;
+    packet.reserve(1 + 4 + len);
+
+    packet.push_back('I');
+    packet.push_back(static_cast<uint8_t>(len & 0xFF));
+    packet.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+    packet.push_back(static_cast<uint8_t>((len >> 16) & 0xFF));
+    packet.push_back(static_cast<uint8_t>((len >> 24) & 0xFF));
+    packet.insert(packet.end(), idcBuff.begin(), idcBuff.end());
+
+    size_t sent = 0;
+    while (sent < packet.size())
+    {
+        int s = ::send(client,
+            reinterpret_cast<const char*>(packet.data() + sent),
+            static_cast<int>(packet.size() - sent),
+            0);
+        if (s <= 0)
+        {
+            CloseIDAWS();
+            return false;
+        }
+        sent += static_cast<size_t>(s);
+    }
+
+    return true;
+}
+
+void AsmRunner::CloseIDAWS()
+{
+    m_ws.running.store(false);
+
+    if (m_ws.listen_sock != static_cast<uintptr_t>(INVALID_SOCKET))
+    {
+        SOCKET s = static_cast<SOCKET>(m_ws.listen_sock);
+        ::shutdown(s, SD_BOTH);
+        ::closesocket(s);
+        m_ws.listen_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(m_ws.client_mutex);
+        if (m_ws.client_sock != static_cast<uintptr_t>(INVALID_SOCKET))
+        {
+            SOCKET s = static_cast<SOCKET>(m_ws.client_sock);
+            ::shutdown(s, SD_BOTH);
+            ::closesocket(s);
+            m_ws.client_sock = static_cast<uintptr_t>(INVALID_SOCKET);
+        }
+    }
+
+    if (m_ws.accept_thread.joinable() &&
+        m_ws.accept_thread.get_id() != std::this_thread::get_id())
+    {
+        m_ws.accept_thread.join();
+    }
+
+#ifdef _WIN32
+    if (m_ws.wsa_started)
+    {
+        WSACleanup();
+        m_ws.wsa_started = false;
+    }
+#endif
+}
+#endif
+
+#endif
 
 // Проверка допустимых режимов:
 // "r"  - чтение (файл должен существовать)
@@ -5112,6 +5713,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
         if (self->GetInstructionCount() > /*5080*/(/*nCrcSumEnd*/ nCpyEnd)) {
             self->SetLogDisasm(true);
+            self->SendIDAAddr(self->CalcWithCASLR(address));
         }
         else {
             self->SetLogDisasm(false);
@@ -5169,6 +5771,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
         if (isUnmapped)
         {
+            self->DumpRegisters();
             SetConsoleColor(3);
             printf("[!] Unmapped access at 0x%p, mapping 0x%zx bytes from 0x%p size 0x%zx bytes\n", (void*)address, (size_t)mapSize, (void*)base, size);
             MboxSTD("Warn! isUnmapped", "MemCb");
@@ -5270,8 +5873,8 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     //	&runner);
 
     runner.SetIAT(0, 0, false); // collect temp ENV
-    //printf("0x%p\n", runner.FindIATNode("VirtualAlloc")->GetAbsolute());
-    runner.SetAnyJmpHook(runner.FindIATNode("VirtualAlloc")->GetAbsolute(), [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+    //printf("0x%p\n", runner.FindIATNode("VirtualAlloc", "kernel32.dll")->GetAbsolute());
+    runner.SetAnyJmpHook(runner.FindIATNode("VirtualAlloc", "kernel32.dll")->GetAbsolute(), [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -5349,7 +5952,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             return true;
         },
         &runner);
-    runner.SetAnyJmpHook(runner.FindIATNode("VirtualFree")->GetAbsolute(), [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+    runner.SetAnyJmpHook(runner.FindIATNode("VirtualFree", "kernel32.dll")->GetAbsolute(), [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -5411,7 +6014,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
         },
         &runner);
 
-    runner.SetAnyJmpHook(runner.FindIATNode("GetSystemTimeAsFileTime")->GetAbsolute(),
+    runner.SetAnyJmpHook(runner.FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsolute(),
         [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
@@ -5477,6 +6080,8 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     //runner.AddDeadzoneIC(nCpyStart, nCpyEnd); // skip rep movsd
     //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd); // skip crc eax sum
     runner.AddDeadzoneIC(nCpyStart, nCrcSumEnd);
+    runner.InitIDAWS();
+    //runner.WaitIDAWSConnection();
     runner.ComparePCTrace("trace_crc3.txt", "trace_crc2.txt");
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
     if (!bCRC) {
