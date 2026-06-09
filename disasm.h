@@ -19,7 +19,7 @@
 //#define AR_DEBUG
 #define AR_IDA_WS
 
-// TODO: normal seh, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb
+// TODO: normal seh, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb, cb UC_HOOK_INSN, UC_HOOK_INTR, cb on register change?, trace deadzone?
 
 #include <vector>
 #include <map>
@@ -52,6 +52,7 @@ struct tIEFuncNode
 	uintptr_t funcRva;
 
 	inline uintptr_t GetAbsolute() { return moduleBase + funcRva; }
+	inline std::string GetAbsoluteName() { return funcName + " " + moduleName; }
 };
 
 enum eBpType : uint32_t
@@ -106,6 +107,8 @@ public:
 	bool IsX64() const { return m_bX64; }
 	void SetUpdatedPC(bool bUpdatedPCInCB) { m_bUpdatedPCInCB = bUpdatedPCInCB; }
 	bool IsUpdatedPC() const { return m_bUpdatedPCInCB; }
+	void SetRWHistory(bool enabled) { m_bRWHistory = enabled; }
+	bool IsRWHistory() const { return m_bRWHistory; }
 	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
 	uintptr_t GetModStart() const { return m_modStart; }
 	uintptr_t GetModEnd() const { return m_modEnd; }
@@ -203,6 +206,7 @@ public:
 	uintptr_t StackPop();
 	bool StackPeek(uintptr_t& v, uint32_t nIdx = 0);
 	uintptr_t StackPeek(uint32_t nIdx = 0);
+	uintptr_t ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size);
 	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	void CopyNTSeh(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	bool SetTebBase(uintptr_t base);
@@ -241,6 +245,8 @@ public:
 	void DumpRegisters(bool bCol = true); // and flags
 	void DumpSegmentRegisters();
 	void DumpStack(intptr_t nCount = -1);
+	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true);
+	void ClearRWHistory();
 	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
 	void InstallDefaultHooks();
 
@@ -393,6 +399,15 @@ private:
 		bool wsa_started;
 	};
 
+	struct tRWHistory
+	{
+		uintptr_t pc; // who
+		uintptr_t addr; // when
+		uintptr_t value; // res
+		uintptr_t size;
+		bool bRead;
+	};
+
 	uc_engine* m_uc = nullptr;
 	bool m_bInitialised = false;
 	bool m_bLogEnabled = true;
@@ -419,6 +434,8 @@ private:
 	std::vector<tDeadzoneIC> m_deadzonesIC;
 	bool m_bInDeadzoneIC = false;
 	int32_t m_currentDeadzoneICIndex = -1;
+	std::vector<tRWHistory> m_RWHistory;
+	bool m_bRWHistory = false;
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
@@ -430,11 +447,13 @@ private:
 	uintptr_t m_modStart = 0;
 	uintptr_t m_modEnd = 0;
 
-	uintptr_t m_stackBase = 0x00100000;
-	uintptr_t m_stackSize = 0x00100000;
+	uintptr_t m_stackBase = 0x00100000; // max esp
+	uintptr_t m_stackSize = 0x00100000; // real base ebp (m_stackBase+m_stackSize)
 	uintptr_t m_stackEPSize = 0x100; // m_bX64 ? 0x20 : 8
 	uintptr_t m_allocBase = 0x20000000;
 	uintptr_t m_allocCursor = 0x20000000;
+	uintptr_t m_fsBase = 0;
+	uintptr_t m_fsSize = 0;
 	uintptr_t m_halt = 0;
 
 	uintptr_t m_instrCount = 0;

@@ -134,6 +134,162 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
     }
 }
 
+uintptr_t AsmRunner::ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size) // from - curr transfer op
+{
+    const uintptr_t fallback = (from + size);
+
+    if (!m_uc || !m_bInitedStack)
+        return fallback;
+
+    uintptr_t retaddr = 0;
+
+    switch (mn)
+    {
+        case ZYDIS_MNEMONIC_CALL:
+            // call already has a canonical return address
+            return fallback;
+
+        case ZYDIS_MNEMONIC_RET:
+        case ZYDIS_MNEMONIC_IRET:
+        case ZYDIS_MNEMONIC_IRETD:
+        case ZYDIS_MNEMONIC_IRETQ:
+            // push ret; push func; ret  -> [to, return]
+            (void)StackPop(retaddr); // to
+            if (StackPop(retaddr)) // return
+                return retaddr;
+            return fallback;
+
+        case ZYDIS_MNEMONIC_JMP:
+        case ZYDIS_MNEMONIC_JB:
+        case ZYDIS_MNEMONIC_JBE:
+        case ZYDIS_MNEMONIC_JNB:
+        case ZYDIS_MNEMONIC_JNBE:
+        case ZYDIS_MNEMONIC_JL:
+        case ZYDIS_MNEMONIC_JLE:
+        case ZYDIS_MNEMONIC_JNL:
+        case ZYDIS_MNEMONIC_JNLE:
+        case ZYDIS_MNEMONIC_JNO:
+        case ZYDIS_MNEMONIC_JNP:
+        case ZYDIS_MNEMONIC_JNS:
+        case ZYDIS_MNEMONIC_JNZ:
+        case ZYDIS_MNEMONIC_JO:
+        case ZYDIS_MNEMONIC_JP:
+        case ZYDIS_MNEMONIC_JS:
+        case ZYDIS_MNEMONIC_JZ:
+        case ZYDIS_MNEMONIC_JCXZ:
+        case ZYDIS_MNEMONIC_JECXZ:
+        case ZYDIS_MNEMONIC_JRCXZ:
+        case ZYDIS_MNEMONIC_JKNZD:
+        case ZYDIS_MNEMONIC_JKZD:
+        case ZYDIS_MNEMONIC_LOOP:
+        case ZYDIS_MNEMONIC_LOOPE:
+        case ZYDIS_MNEMONIC_LOOPNE:
+#ifdef AR_SYSCALL_JUMP_CB
+        case ZYDIS_MNEMONIC_INT:
+        case ZYDIS_MNEMONIC_INT1:
+        case ZYDIS_MNEMONIC_INT3:
+        case ZYDIS_MNEMONIC_INTO:
+        case ZYDIS_MNEMONIC_SYSCALL:
+        case ZYDIS_MNEMONIC_SYSENTER:
+        case ZYDIS_MNEMONIC_SYSEXIT:
+        case ZYDIS_MNEMONIC_SYSRET:
+        case ZYDIS_MNEMONIC_UD2:
+        case ZYDIS_MNEMONIC_UD1:
+        case ZYDIS_MNEMONIC_UD0:
+        case ZYDIS_MNEMONIC_HLT:
+#endif
+            // push ret; jmp func  -> [ret]
+            if (StackPop(retaddr)) // return
+                return retaddr;
+            return fallback;
+
+        default:
+            return fallback;
+    }
+}
+
+#if 0
+uintptr_t AsmRunner::CalcAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size) // from - curr transfer op
+{
+    const uintptr_t fallback = (from + size);
+
+    if (!m_uc || !m_bInitedStack)
+        return fallback;
+
+    uintptr_t retaddr = 0;
+    const auto try_stack_top = [&](uint32_t idx, uintptr_t& out) -> bool
+    {
+        out = 0;
+        return StackPeek(out, idx);
+    };
+
+    switch (mn)
+    {
+        case ZYDIS_MNEMONIC_CALL:
+            // call already has a canonical return address
+            return fallback;
+
+        case ZYDIS_MNEMONIC_RET:
+        case ZYDIS_MNEMONIC_IRET:
+        case ZYDIS_MNEMONIC_IRETD:
+        case ZYDIS_MNEMONIC_IRETQ:
+            // push ret; push func; ret  -> [to, return]
+            if (try_stack_top(1, retaddr))
+                return retaddr;
+            if (try_stack_top(0, retaddr))
+                return retaddr;
+            return fallback;
+
+        case ZYDIS_MNEMONIC_JMP:
+        case ZYDIS_MNEMONIC_JB:
+        case ZYDIS_MNEMONIC_JBE:
+        case ZYDIS_MNEMONIC_JNB:
+        case ZYDIS_MNEMONIC_JNBE:
+        case ZYDIS_MNEMONIC_JL:
+        case ZYDIS_MNEMONIC_JLE:
+        case ZYDIS_MNEMONIC_JNL:
+        case ZYDIS_MNEMONIC_JNLE:
+        case ZYDIS_MNEMONIC_JNO:
+        case ZYDIS_MNEMONIC_JNP:
+        case ZYDIS_MNEMONIC_JNS:
+        case ZYDIS_MNEMONIC_JNZ:
+        case ZYDIS_MNEMONIC_JO:
+        case ZYDIS_MNEMONIC_JP:
+        case ZYDIS_MNEMONIC_JS:
+        case ZYDIS_MNEMONIC_JZ:
+        case ZYDIS_MNEMONIC_JCXZ:
+        case ZYDIS_MNEMONIC_JECXZ:
+        case ZYDIS_MNEMONIC_JRCXZ:
+        case ZYDIS_MNEMONIC_JKNZD:
+        case ZYDIS_MNEMONIC_JKZD:
+        case ZYDIS_MNEMONIC_LOOP:
+        case ZYDIS_MNEMONIC_LOOPE:
+        case ZYDIS_MNEMONIC_LOOPNE:
+#ifdef AR_SYSCALL_JUMP_CB
+        case ZYDIS_MNEMONIC_INT:
+        case ZYDIS_MNEMONIC_INT1:
+        case ZYDIS_MNEMONIC_INT3:
+        case ZYDIS_MNEMONIC_INTO:
+        case ZYDIS_MNEMONIC_SYSCALL:
+        case ZYDIS_MNEMONIC_SYSENTER:
+        case ZYDIS_MNEMONIC_SYSEXIT:
+        case ZYDIS_MNEMONIC_SYSRET:
+        case ZYDIS_MNEMONIC_UD2:
+        case ZYDIS_MNEMONIC_UD1:
+        case ZYDIS_MNEMONIC_UD0:
+        case ZYDIS_MNEMONIC_HLT:
+#endif
+            // push ret; jmp func  -> [ret]
+            if (try_stack_top(0, retaddr))
+                return retaddr;
+            return fallback;
+
+        default:
+            return fallback;
+    }
+}
+#endif
+
 #ifndef AR_DEBUG
 bool AsmRunner::TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t curPc, uintptr_t& outTarget)
 {
@@ -895,6 +1051,8 @@ void AsmRunner::Shutdown()
     m_deadzonesIC.clear();
     m_bInDeadzoneIC = false;
     m_currentDeadzoneICIndex = -1;
+    m_RWHistory.clear();
+    m_bRWHistory = false;
 }
 
 uc_engine* AsmRunner::GetCTX()
@@ -1319,6 +1477,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     };
 
+    // what about UC_HOOK_INTR?
     if (m_cbSysCall && IsSysCallLike(mnemonic)) {
         if (!m_cbSysCall(uc, curPc, size, mnemonic, m_cbSysCallData)) {
             uc_emu_stop(uc);
@@ -1479,6 +1638,29 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
 
     bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
     bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT);
+
+    if (m_bRWHistory)
+    {
+        uintptr_t pc = CurrentPc(uc);
+        uintptr_t histVal = 0;
+
+        if (isWrite)
+        {
+            histVal = static_cast<uintptr_t>(value);
+            if (!m_bX64)
+                histVal = static_cast<uint32_t>(histVal);
+        }
+        else if (isRead)
+        {
+            // пробуем зафиксировать фактически прочитанное значение
+            // (если память доступна; если нет — останется 0)
+            (void)uc_mem_read(uc, addr, &histVal, static_cast<size_t>(sz));
+            if (!m_bX64)
+                histVal = static_cast<uint32_t>(histVal);
+        }
+
+        m_RWHistory.push_back({pc, addr, histVal, sz, isRead });
+    }
 
     ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
 
@@ -2536,9 +2718,6 @@ bool AsmRunner::IsRetHaltOrNull(uintptr_t pAddr)
 
 bool AsmRunner::IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd)
 {
-    if (pStart == 0 || pEnd == 0)
-        return false;
-
     return (pAddr >= pStart && pAddr < pEnd);
 }
 
@@ -2796,6 +2975,9 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
         if (m_bLogRunner)
             Log("[!] write zero page failed: %s", uc_strerror(err));
     }
+    m_fsBase = pAddr;
+    m_fsSize = nSize;
+
     m_bInitedSehFS = true;
 }
 #else
@@ -2856,6 +3038,8 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
             Log("[!] Failed to set TEB base for %s", m_bX64 ? "GS" : "FS");
         return;
     }
+    m_fsBase = pAddr;
+    m_fsSize = nSize;
 
     m_bInitedSehFS = true;
     if (m_bLogRunner)
@@ -2933,6 +3117,8 @@ void AsmRunner::CopyNTSeh(uintptr_t pAddr, uintptr_t nSize)
         // если FS_BASE не выставляется в твоей сборке Unicorn, zero-page mirror всё равно работает
         (void)SetTebBase(0);
     }
+    m_fsBase = pAddr;
+    m_fsSize = nSize;
 
     m_bInitedSehFS = true;
 
@@ -3296,6 +3482,7 @@ void AsmRunner::SetIATCallCB(OnOpcodeCb cb, void* data)
 
 void AsmRunner::SetSysCallCB(OnOpcodeCb cb, void* data)
 {
+    // what about UC_HOOK_INTR?
     m_cbSysCall = std::move(cb);
     m_cbSysCallData = data;
 }
@@ -3901,6 +4088,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE |
             UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
             UC_HOOK_MEM_FETCH_UNMAPPED | UC_HOOK_MEM_READ_PROT |
+            //UC_HOOK_MEM_FETCH | // чтение самой инструкции, warn! old+unused
             UC_HOOK_MEM_WRITE_PROT | UC_HOOK_MEM_FETCH_PROT,
             reinterpret_cast<void*>(HookMemTrampoline), this, 1, 0);
         if (err != UC_ERR_OK) {
@@ -3908,6 +4096,8 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             return;
         }
     }
+
+    // TODO? UC_HOOK_INSN  UC_HOOK_INTR
 
     m_bPaused = false;
     m_bStopped = false;
@@ -4071,14 +4261,48 @@ void AsmRunner::DumpStack(intptr_t nCount)
     const uintptr_t sp = CurrentSp(m_uc);
     const uintptr_t fp = GetRegister(FpReg());
 
-    const uintptr_t stackLow = m_stackBase;
-    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+    const uintptr_t stackLow = m_stackBase; // 0x00100000
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000); // 0x00200000
 
     const char* regNameSp = m_bX64 ? "rsp" : "esp";
     const char* regNameFp = m_bX64 ? "rbp" : "ebp";
 
+    auto printableChar = [](uintptr_t v) -> char
+    {
+        const uint8_t c = static_cast<uint8_t>(v & 0xFF);
+        return IsPrintableAscii(c) ? static_cast<char>(c) : '.';
+    };
+
+    auto valueTag = [&](uintptr_t v) -> std::string
+    {
+        std::ostringstream s;
+        s << "[value 0x" << std::hex << std::uppercase << v
+            << std::dec << " (" << static_cast<uint64_t>(v) << ") '"
+            << printableChar(v) << "']";
+        return s.str();
+    };
+
+    auto readPtr = [&](uintptr_t addr, uintptr_t& out) -> bool
+    {
+        out = 0;
+        if (!m_uc)
+            return false;
+
+        if (IsInAddr(addr, m_fsBase, m_fsBase + m_fsSize)) // skip fake tid
+            return false;
+
+        if (uc_mem_read(m_uc, addr, &out, static_cast<size_t>(ptrSize)) != UC_ERR_OK)
+            return false;
+
+        if (!m_bX64)
+            out = static_cast<uint32_t>(out);
+
+        return true;
+    };
+
     intptr_t idx = 0;
     uintptr_t addr = sp;
+    printf("=== STACK [0x%p -> 0x%p] ===\n", stackHigh, stackLow);
 
     while (true)
     {
@@ -4103,11 +4327,199 @@ void AsmRunner::DumpStack(intptr_t nCount)
         if (nCount == -1 && fp != 0 && addr == fp)
             printf(" <- %s", regNameFp);
 
+        uintptr_t dref = 0;
+        const bool isStack = IsInAddr(val, stackLow, stackHigh);
+        const bool hasDref = readPtr(val, dref);
+
+        if (isStack && hasDref) {
+            printf(" <- valptr to stack %s", valueTag(dref).c_str());
+        }
+        else if (isStack && !hasDref) { // when is it? can't read value at stack range?
+            printf(" <- valptr to stack [ERROR]");
+        }
+        else if (hasDref) {
+            //printf(" <- possible memptr %s", valueTag(dref).c_str());
+            printf(" <- valptr to mem %s", valueTag(dref).c_str());
+        }
+        else if (FindIATNode(val)) {
+            printf(" <- valptr iat %s", FindIATNode(val)->GetAbsoluteName().c_str());
+        }
+        else {
+            printf(" <- data");
+        }
+
         printf("\n");
 
         ++idx;
         addr += ptrSize;
     }
+}
+
+void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite)
+{
+    if (m_RWHistory.empty())
+    {
+        Log("[RW] history is empty");
+        return;
+    }
+
+    const size_t total = m_RWHistory.size();
+    size_t begin = 0;
+    size_t end = total;
+
+    if (nLimSize != 0 && nLimSize < total)
+    {
+        if (bStartLim)
+        {
+            begin = 0;
+            end = static_cast<size_t>(nLimSize);
+        }
+        else
+        {
+            begin = total - static_cast<size_t>(nLimSize);
+            end = total;
+        }
+    }
+
+    const uintptr_t stackLow = m_stackBase;
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    auto printableChar = [](uintptr_t v) -> char
+    {
+        const uint8_t c = static_cast<uint8_t>(v & 0xFF);
+        return IsPrintableAscii(c) ? static_cast<char>(c) : '.';
+    };
+
+    auto valueTag = [&](uintptr_t v) -> std::string
+    {
+        std::ostringstream s;
+        s << "[value 0x" << std::hex << std::uppercase << v
+            << std::dec << " (" << static_cast<uint64_t>(v) << ") '"
+            << printableChar(v) << "']";
+        return s.str();
+    };
+
+    auto readPtr = [&](uintptr_t addr, uintptr_t& out) -> bool
+    {
+        out = 0;
+        if (!m_uc)
+            return false;
+
+        if(IsInAddr(addr, m_fsBase, m_fsBase + m_fsSize)) // skip fake tid
+            return false;
+
+        if (uc_mem_read(m_uc, addr, &out, static_cast<size_t>(PointerSize())) != UC_ERR_OK)
+            return false;
+
+        if (!m_bX64)
+            out = static_cast<uint32_t>(out);
+
+        return true;
+    };
+
+#ifdef _WIN32
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    bool bHaveConsole = (hConsole != INVALID_HANDLE_VALUE) &&
+        (hConsole != nullptr) &&
+        GetConsoleScreenBufferInfo(hConsole, &csbi);
+    const WORD savedAttrs = bHaveConsole ? csbi.wAttributes : 0;
+#endif
+
+    auto setColor = [&](WORD attrs)
+    {
+#ifdef _WIN32
+        if (bHaveConsole)
+            SetConsoleTextAttribute(hConsole, attrs);
+#else
+        (void)attrs;
+#endif
+    };
+
+    auto resetColor = [&]()
+    {
+#ifdef _WIN32
+        if (bHaveConsole)
+            SetConsoleTextAttribute(hConsole, savedAttrs);
+#endif
+    };
+
+    for (size_t i = begin; i < end; ++i)
+    {
+        const auto& h = m_RWHistory[i];
+        if ((h.bRead && !bRead) || (!h.bRead && !bWrite))
+            continue;
+
+        std::ostringstream oss;
+        oss << "[" << i << "] " << (h.bRead ? 'R' : 'W') << "  "
+            << "PC 0x" << std::hex << std::uppercase << h.pc << ": "
+            << "MEM 0x" << std::hex << std::uppercase << h.addr << " -> value "
+            << "0x" << std::hex << std::uppercase << h.value
+            << std::dec << " (" << static_cast<uint64_t>(h.value) << ") '"
+            << printableChar(h.value) << "' size: " << std::dec << h.size;
+
+        const bool isStackAddr = IsInAddr(h.addr, stackLow, stackHigh); // isStack операнд лежит в стеке
+        const bool isStackValueAddr = IsInAddr(h.value, stackLow, stackHigh); // isStack операнд указывает на стеке
+
+        // h.addr указатель, возможно на стек // то что где мы читали писали
+        // h.value операнд истории, возможно указатель на стек или на память если читается
+
+        // метка характеристики где лежали данные
+        if (isStackAddr) {
+            //uintptr_t adref = 0;
+            //if (readPtr(h.addr, adref))
+            //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
+            //else // when is it? error
+            oss << " <- haddr to stack"; // h.addr просто лежит в стеке
+        }
+        else {
+            //oss << " <- haddr to mem"; // и так работаем с памятью в history
+        }
+
+        // метка характеристики самих данных которые читали
+        uintptr_t vdref = 0;
+        if (isStackValueAddr) {
+            //uintptr_t vdref = 0;
+            //if (readPtr(h.value, vdref))
+            //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
+            //else // when is it? error
+            oss << " <- hvalptr to stack";
+        }
+        else if (!isStackValueAddr && m_uc && h.size == PointerSize() && readPtr(h.value, vdref)) { // не в диапазоне стека, возможно указатель на память
+            oss << " <- hvalptr to mem, now its" << valueTag(vdref);
+        }
+        else if (FindIATNode(h.value)) {
+            printf(" <- hvalptr iat %s", FindIATNode(h.value)->GetAbsoluteName().c_str());
+        }
+        else {
+            //oss << " <- data";
+        }
+
+#ifdef _WIN32
+        if (h.bRead)
+        {
+            // жёлтый
+            //setColor(isStack ? (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY) : (FOREGROUND_RED | FOREGROUND_GREEN));
+            setColor(FOREGROUND_RED | FOREGROUND_GREEN);
+        }
+        else
+        {
+            // розовый / magenta
+            //setColor(isStack ? (FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY) : (FOREGROUND_RED | FOREGROUND_BLUE));
+            setColor(FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+        }
+#endif
+
+        Log("%s", oss.str().c_str());
+        resetColor();
+    }
+
+    resetColor();
+}
+
+void AsmRunner::ClearRWHistory()
+{
+    m_RWHistory.clear();
 }
 
 void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode)
@@ -4149,7 +4561,7 @@ void AsmRunner::InstallDefaultHooks()
             uintptr_t dwSize = 0;
             uintptr_t flAllocationType = 0;
             uintptr_t flProtect = 0;
-            uintptr_t retaddr = from + size;
+            uintptr_t retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
 
             if (self->IsX64())
             {
@@ -4221,7 +4633,7 @@ void AsmRunner::InstallDefaultHooks()
             uintptr_t lpAddress = 0;
             uintptr_t dwSize = 0;
             uintptr_t dwFreeType = 0;
-            uintptr_t retaddr = from + size;
+            uintptr_t retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
 
             if (self->IsX64())
             {
@@ -4265,7 +4677,7 @@ void AsmRunner::InstallDefaultHooks()
             //printf("[hook] GetSystemTimeAsFileTime hit: from=0x%p to=0x%p\n", (void*)from, (void*)to);
 
             uintptr_t lpSystemTimeAsFileTime = 0;
-            uintptr_t retaddr = from + size;
+            uintptr_t retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
 
             if (self->IsX64())
                 lpSystemTimeAsFileTime = self->GetRegister(UC_X86_REG_RCX);
@@ -5711,9 +6123,16 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             SetConsoleColor(1);
         }
 
-        if (self->GetInstructionCount() > /*5080*/(/*nCrcSumEnd*/ nCpyEnd)) {
+        if (self->GetInstructionCount() > /*5080*/(/*nCrcSumEnd*/ nCpyEnd * 0) + 93130827) {
             self->SetLogDisasm(true);
+
+            self->SetRWHistory(true);
+            self->DumpRWHistory();
+            self->SetDisasmAfterCB(false);
             self->SendIDAAddr(self->CalcWithCASLR(address));
+            self->DumpRegisters();
+            self->DumpStack(7);
+            MboxSTD("apply this opcode", "disasm");
         }
         else {
             self->SetLogDisasm(false);
@@ -5841,7 +6260,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
     //		printf("[memcpy hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u", (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic);
 
-    //		const uintptr_t retaddr = from + size;
+    //		uintptr_t retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
     //		uintptr_t dst = 0;
     //		uintptr_t src = 0;
     //		uintptr_t n = 0;
@@ -5898,7 +6317,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             uintptr_t dwSize = 0;
             uintptr_t flAllocationType = 0;
             uintptr_t flProtect = 0;
-            uintptr_t retaddr = from + size;
+            uintptr_t retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
 
             if (self->IsX64())
             {
@@ -5976,7 +6395,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             uintptr_t lpAddress = 0;
             uintptr_t dwSize = 0;
             uintptr_t dwFreeType = 0;
-            uintptr_t retaddr = from + size;
+            uintptr_t retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
 
             if (self->IsX64())
             {
@@ -6020,13 +6439,15 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self) return true;
 
+            self->DumpRegisters();
+            self->DumpStack(7);
             MboxSTD("custom wait", "GetSystemTimeAsFileTime");
 
             printf("[hook] GetSystemTimeAsFileTime hit: from=0x%p to=0x%p\n", (void*)from, (void*)to);
 
             // Получаем аргументы
             uintptr_t lpSystemTimeAsFileTime = 0;
-            uintptr_t retaddr = from + size;
+            uintptr_t retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
 
             if (self->IsX64())
             {
@@ -6074,9 +6495,10 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
     runner.SetDisasmAfterCB(true);
+    //runner.SetRWHistory(true);
     runner.SetDisasmRVA(true, 0x60F00000);
     //runner.SetPCTrace("trace_crc.txt", true, 0, 9'500'000);
-    runner.SetLogDisasmICNotice(500'000 * 2);
+    runner.SetLogDisasmICNotice(500'000 * 20);
     //runner.AddDeadzoneIC(nCpyStart, nCpyEnd); // skip rep movsd
     //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd); // skip crc eax sum
     runner.AddDeadzoneIC(nCpyStart, nCrcSumEnd);
