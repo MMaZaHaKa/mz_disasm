@@ -1197,12 +1197,14 @@ bool AsmRunner::IsInModule(uintptr_t addr) const
     return (m_modStart != 0 && m_modEnd != 0 && addr >= m_modStart && addr < m_modEnd);
 }
 
-std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress)
+std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisMnemonic& outMn)
 {
 #ifdef ZYDIS
     ZydisDecodedInstruction instr{};
     //ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+
+    outMn = ZYDIS_MNEMONIC_INVALID;
 
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
         bytes,
@@ -1211,6 +1213,8 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
         operands))) {
         return "???";
     }
+
+    outMn = instr.mnemonic;
 
     char buffer[256] = {};
     ZydisFormatterFormatInstruction(&m_formatter,
@@ -1225,7 +1229,9 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
     std::ostringstream oss;
     oss << buffer;
 
-    if (instr.mnemonic == ZYDIS_MNEMONIC_CALL || instr.mnemonic == ZYDIS_MNEMONIC_JMP) {
+    //if (instr.mnemonic == ZYDIS_MNEMONIC_CALL || instr.mnemonic == ZYDIS_MNEMONIC_JMP)
+    if (IsAnyIpTransfer(instr.mnemonic))
+    {
         uintptr_t target = 0;
         if (ResolveDirectBranchTarget(m_uc, instr, operands, runtimeAddress, target)) {
             oss << " ; -> " << FormatRuntimeAddressWithSymbol(target);
@@ -1234,6 +1240,7 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
 
     return oss.str();
 #else
+    outMn = 0;
     (void)bytes;
     (void)size;
     (void)runtimeAddress;
@@ -1252,7 +1259,8 @@ void AsmRunner::DisassembleWithZydis()
         return;
     }
 
-    std::string s = MakeDisasmLine(bytes.data(), bytes.size(), pc);
+    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+    std::string s = MakeDisasmLine(bytes.data(), bytes.size(), pc, mnemonic);
     Log("[DISASM] 0x%p (%s): %s", (void*)(m_bDisasmRVA ? (pc - m_modStart + m_DisasmCustomASLR) : pc), FormatRuntimeAddressWithSymbol(pc).c_str(), s.c_str());
 }
 
@@ -1313,9 +1321,10 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
                 }
             }
 
+            ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
             std::vector<uint8_t> bytes;
             bool readOk = ReadBytes(uc, address, size, bytes);
-            std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc) : "[READ ERROR]";
+            std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, mnemonic) : "[READ ERROR]";
             std::string curSym = FormatCurrentSymbolSuffix(curPc);
 
             std::ostringstream oss;
@@ -1385,10 +1394,11 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
+    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
     std::vector<uint8_t> bytes;
     bool readOk = ReadBytes(uc, address, size, bytes);
 
-    std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc) : "[READ ERROR]";
+    std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, mnemonic) : "[READ ERROR]";
     std::string curSym = FormatCurrentSymbolSuffix(curPc);
 
     if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
@@ -1456,24 +1466,6 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             }
         }
     }
-
-    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
-
-#ifdef ZYDIS
-    ZydisDecodedInstruction instr{};
-    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
-
-    if (readOk && !bytes.empty()) {
-        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
-            bytes.data(),
-            static_cast<ZyanUSize>(bytes.size()),
-            &instr,
-            operands)))
-        {
-            mnemonic = instr.mnemonic;
-        }
-    }
-#endif
 
     auto IsSysCallLike = [](ZydisMnemonic mn) -> bool
     {
@@ -4250,8 +4242,9 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             }
 
             DumpRegisters();
+            DumpFlags();
             DumpSegmentRegisters();
-            DumpStack(50);
+            DumpStack(10);
             SetConsoleColor(6);
         }
     }
@@ -4390,6 +4383,7 @@ void AsmRunner::DumpSegmentRegisters()
     uint64_t fs_base = 0;
     uint64_t gs_base = 0;
 
+    printf("=== SEGMENT REGISTERS ===\n");
     if (m_bX64) {
         uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
         uc_reg_read(m_uc, UC_X86_REG_GS_BASE, &gs_base);
@@ -4400,6 +4394,88 @@ void AsmRunner::DumpSegmentRegisters()
         uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
         Log("FS_BASE = 0x%08X", (uint32_t)fs_base);
     }
+}
+
+void AsmRunner::DumpFlags()
+{
+    if (!m_uc) return;
+
+    uintptr_t eflags = GetRegister(FlagsReg());
+
+    // bits for x86/x64
+    const uintptr_t CF_MASK  = BIT(0);  // Carry Flag
+    const uintptr_t PF_MASK  = BIT(2);  // Parity Flag
+    const uintptr_t AF_MASK  = BIT(4);  // Auxiliary Carry Flag
+    const uintptr_t ZF_MASK  = BIT(6);  // Zero Flag
+    const uintptr_t SF_MASK  = BIT(7);  // Sign Flag
+    const uintptr_t TF_MASK  = BIT(8);  // Trap Flag
+    const uintptr_t IF_MASK  = BIT(9);  // Interrupt Enable Flag
+    const uintptr_t DF_MASK  = BIT(10); // Direction Flag
+    const uintptr_t OF_MASK  = BIT(11); // Overflow Flag
+    const uintptr_t NT_MASK  = BIT(14); // Nested Task
+    const uintptr_t RF_MASK  = BIT(16); // Resume Flag
+    const uintptr_t VM_MASK  = BIT(17); // Virtual-8086 Mode
+    const uintptr_t AC_MASK  = BIT(18); // Alignment Check
+    const uintptr_t VIF_MASK = BIT(19); // Virtual Interrupt Flag
+    const uintptr_t VIP_MASK = BIT(20); // Virtual Interrupt Pending
+    const uintptr_t ID_MASK  = BIT(21); // ID Flag
+
+    auto flag_status = [&](uintptr_t mask) -> const char* {
+        return (eflags & mask) ? "1" : "0";
+    };
+
+    auto flag_desc = [&](uintptr_t mask, const char* name, const char* desc_true, const char* desc_false) -> void {
+        bool is_set = (eflags & mask) != 0;
+        printf("%-4s %-32s %s (%s)\n",
+            flag_status(mask),
+            name,
+            is_set ? desc_true : desc_false,
+            is_set ? "Set" : "Clear");
+    };
+
+    printf("\n=== EFLAGS (0x%08X) ===\n", static_cast<uint32_t>(eflags));
+    printf("%-4s %-32s %s\n", "Bit", "Flag", "Status");
+    printf("%-4s %-32s %s\n", "---", "----", "------");
+
+    // base flags
+    flag_desc(CF_MASK, "CF (Carry Flag)", "Carry/Borrow occurred", "No carry/borrow");
+    flag_desc(PF_MASK, "PF (Parity Flag)", "Low byte has even parity", "Low byte has odd parity");
+    flag_desc(AF_MASK, "AF (Auxiliary Carry Flag)", "Auxiliary carry occurred (BCD)", "No auxiliary carry");
+    flag_desc(ZF_MASK, "ZF (Zero Flag)", "Result is zero", "Result is non-zero");
+    flag_desc(SF_MASK, "SF (Sign Flag)", "Result is negative", "Result is non-negative");
+    flag_desc(TF_MASK, "TF (Trap Flag)", "Single-step mode enabled", "Single-step mode disabled");
+    flag_desc(IF_MASK, "IF (Interrupt Flag)", "Interrupts enabled", "Interrupts disabled");
+    flag_desc(DF_MASK, "DF (Direction Flag)", "String operations decrement address", "String operations increment address");
+    flag_desc(OF_MASK, "OF (Overflow Flag)", "Signed overflow occurred", "No signed overflow");
+
+    // extra
+    printf("%-4s %-32s %s\n", "---", "----", "------");
+    flag_desc(NT_MASK,  "NT (Nested Task Flag)", "Nested task", "Not nested task");
+    flag_desc(RF_MASK,  "RF (Resume Flag)", "Debug exception resume", "No debug resume");
+    flag_desc(VM_MASK,  "VM (Virtual-8086 Mode)", "Virtual-8086 mode", "Not in Virtual-8086 mode");
+    flag_desc(AC_MASK,  "AC (Alignment Check)", "Alignment check enabled", "Alignment check disabled");
+    flag_desc(VIF_MASK, "VIF (Virtual Interrupt Flag)", "Virtual interrupt pending", "No virtual interrupt");
+    flag_desc(VIP_MASK, "VIP (Virtual Interrupt Pending)", "Virtual interrupt pending", "No virtual interrupt pending");
+    flag_desc(ID_MASK,  "ID (ID Flag)", "CPUID supported", "CPUID not supported");
+
+    printf("[FLAGS] ");
+    printf("%c ", (eflags & CF_MASK) ? 'C' : '-');
+    printf("%c ", (eflags & PF_MASK) ? 'P' : '-');
+    printf("%c ", (eflags & AF_MASK) ? 'A' : '-');
+    printf("%c ", (eflags & ZF_MASK) ? 'Z' : '-');
+    printf("%c ", (eflags & SF_MASK) ? 'S' : '-');
+    printf("%c ", (eflags & TF_MASK) ? 'T' : '-');
+    printf("%c ", (eflags & IF_MASK) ? 'I' : '-');
+    printf("%c ", (eflags & DF_MASK) ? 'D' : '-');
+    printf("%c", (eflags & OF_MASK) ? 'O' : '-');
+    printf("  |  EXTRA: ");
+    printf("%c ", (eflags & NT_MASK) ? 'N' : '-');
+    printf("%c ", (eflags & RF_MASK) ? 'R' : '-');
+    printf("%c ", (eflags & VM_MASK) ? 'V' : '-');
+    printf("%c ", (eflags & AC_MASK) ? 'A' : '-');
+    printf("%c ", (eflags & VIF_MASK) ? 'i' : '-');
+    printf("%c ", (eflags & VIP_MASK) ? 'p' : '-');
+    printf("%c\n", (eflags & ID_MASK) ? 'I' : '-');
 }
 
 void AsmRunner::DumpStack(intptr_t nCount, bool bValNotice)
@@ -6433,6 +6509,8 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             self->SetDisasmAfterCB(false);
             self->SendIDAAddr(self->CalcWithCASLR(address));
             self->DumpRegisters();
+            self->DumpFlags();
+            self->DumpSegmentRegisters();
             self->DumpStack(7);
             MboxSTD("apply this opcode", "disasm");
         }

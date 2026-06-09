@@ -37,6 +37,25 @@
 #define ARP(p) ((uintptr_t)p)
 #define ARV(p) ((void*)p)
 
+#define GET_REG(reg, varname) \
+    uint32_t varname; \
+    __asm { mov varname, reg }
+
+#define SET_REG(reg, value) \
+    __asm { mov reg, value }
+
+#define BIT(num) (1<<(num))
+#define GET_BITS(value, mask, shift) (((value) & (mask)) >> (shift))
+#define GET_BIT(num, n) (((num) >> (n)) & 1)
+#define SET_BIT(num, n, val) ((num) = ((num) & ~BIT(n)) | ((val) << (n)))
+#define GET_BYTE(num, n) ((num >> (8 * n)) & 0xFF)
+#define SET_BYTE(num, n, val) ((num) = ((num) & ~(0xFF << (8 * (n)))) | ((val) << (8 * (n))))
+#define SWAP_BIT(num, n) SET_BIT(num, n, !GET_BIT(num, n))
+#define SWAP_ENDIAN(x) ((((uint32_t)(x)&0x000000ff)<<24)|(((uint32_t)(x)&0x0000ff00)<<8)|(((uint32_t)(x)&0x00ff0000)>>8)|(((uint32_t)(x)&0xff000000) >> 24))
+#define OFFSET(base, off, type) ((type)&(((uint8_t*)base)[off]) )
+#define ALIGN4BYTES(s) ((((uint32_t)s) + 3) & 0xFFFFFFFC)
+#define MASK(p, s) (((1 << (s)) - 1) << (p))
+
 struct tFuncNode //tmp, use tIEFuncNode
 {
 	uintptr_t rva = 0;
@@ -249,6 +268,7 @@ public:
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
 	void DumpRegisters(bool bFull = true); // and flags
 	void DumpSegmentRegisters();
+	void DumpFlags();
 	void DumpStack(intptr_t nCount = -1, bool bValNotice = true);
 	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true);
 	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true);
@@ -536,7 +556,7 @@ private:
 	std::string RegName(uint32_t reg) const;
 	bool IsInModule(uintptr_t addr) const;
 	void TraceWriteLine(const std::string& s);
-	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress);
+	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisMnemonic& outMn);
 
 	// exports / PE helpers
 	static void TrimInPlace(std::string& s);
