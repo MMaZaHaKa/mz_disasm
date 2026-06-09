@@ -127,6 +127,8 @@ public:
 	static std::chrono::steady_clock::time_point CaptureTime();
 	static void DumpTime(std::chrono::steady_clock::time_point start, const char* label = nullptr);
 	static void DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label = nullptr);
+	static std::string PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec = false);
+	static std::string PrintHexOnly(uintptr_t v, bool bDec = false);
 
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
 	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
@@ -170,6 +172,8 @@ public:
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
 	bool IsModuleAddr(uintptr_t pAddr);
 	bool IsRetHaltOrNull(uintptr_t pAddr);
+	bool InExtraRegion(uintptr_t pAddr);
+	bool IsPCNormal(uintptr_t pAddr);
 	static bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
 
 	// asm / registers / stack
@@ -192,6 +196,8 @@ public:
 	uint32_t R14Reg() const { return m_bX64 ? UC_X86_REG_R14 : UC_X86_REG_R14D; }
 	uint32_t R15Reg() const { return m_bX64 ? UC_X86_REG_R15 : UC_X86_REG_R15D; }
 	uint32_t PointerSize() const { return m_bX64 ? 8 : 4; }
+	uintptr_t CurrentPc(uc_engine* uc) const;
+	uintptr_t CurrentSp(uc_engine* uc) const;
 
 	void SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg); // bLogRunner log st ptr // default // 0=ebp+4?
 	void SetStackArgEbpIndex(uint32_t nIdx, uintptr_t arg); // ebp+4 +8 +C ...  // bLogRunner log st ptr // custom stack arg // 4=ebpdefault 0arg?
@@ -217,7 +223,7 @@ public:
 	uint32_t GetTebLastError() const;
 
 	// callbacks / execution
-	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr);
+	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false);
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
 	void SetSysCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
@@ -232,7 +238,6 @@ public:
 	void LoadModule(const char* szModule); // mz pe? (exe+dll)
 	void ResolveIATModule();
 	void AddExecRegion(uintptr_t pStart, uintptr_t pEnd);
-	bool InExtraRegion(uintptr_t pAddr) const;
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
 	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0);
@@ -242,10 +247,11 @@ public:
 	void Resume();
 	void Stop();
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
-	void DumpRegisters(bool bCol = true); // and flags
+	void DumpRegisters(bool bFull = true); // and flags
 	void DumpSegmentRegisters();
-	void DumpStack(intptr_t nCount = -1);
-	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true);
+	void DumpStack(intptr_t nCount = -1, bool bValNotice = true);
+	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true);
+	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true);
 	void ClearRWHistory();
 	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
 	void InstallDefaultHooks();
@@ -352,6 +358,15 @@ private:
 		uintptr_t pAddr = 0;
 		OnJmpCb cb = nullptr;
 		void* data = nullptr;
+		bool before = false; // true - call when next op our pAddr, false when pc == pAddr (avoid ExtractAnyIpTransferReturn)
+		struct tJmpCBArgs
+		{
+			uintptr_t from = 0;
+			uintptr_t to = 0;
+			uint32_t size = 0;
+			ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+			bool valid = false;
+		} bfArgs; // delayed before OnJmpCb args
 	};
 
 	struct tExecRegion
@@ -405,6 +420,7 @@ private:
 		uintptr_t addr; // when
 		uintptr_t value; // res
 		uintptr_t size;
+		uintptr_t ic;
 		bool bRead;
 	};
 
@@ -518,8 +534,6 @@ private:
 	// more helpers
 	bool ReadBytes(uc_engine* uc, uint64_t address, uint32_t size, std::vector<uint8_t>& out) const;
 	std::string RegName(uint32_t reg) const;
-	uintptr_t CurrentPc(uc_engine* uc) const;
-	uintptr_t CurrentSp(uc_engine* uc) const;
 	bool IsInModule(uintptr_t addr) const;
 	void TraceWriteLine(const std::string& s);
 	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress);
@@ -648,6 +662,8 @@ public:
 //https://github.com/KuNgia09/vmp3-import-fix
 //https://github.com/pulpgit/Themida-Imports-Deobfuscator-main/tree/84e8edf96a2b8a9134bf40c97ad94e8cb558ff16
 //https://github.com/MMaZaHaKa/awesome_anti_virus_engine
+//https://github.com/gmh5225/awesome-game-security/tree/1f857416ca85858759eb44da277bf070046498b0
+//https://github.com/samshine/VoyagerWithEPT
 //
 //https://github.com/unicorn-engine/unicorn
 //https://github.com/DarthTon/Blackbone
