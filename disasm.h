@@ -137,6 +137,8 @@ public:
 	// Тип колбэка для трассировки: возвращает true для остановки трассировки
 	using TraceCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t instruction_count, void* user_data)>;
 
+	using HookNotifyCb = std::function<void(tIEFuncNode* pNode)>;
+
 	AsmRunner(bool bX64 = false);
 	~AsmRunner();
 
@@ -181,7 +183,7 @@ public:
 	static std::chrono::steady_clock::time_point CaptureTime();
 	static void DumpTime(std::chrono::steady_clock::time_point start, const char* label = nullptr);
 	static void DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label = nullptr);
-	static std::string PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec = false);
+	static std::string PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec = false, bool bDecBracket = true);
 	static std::string PrintHexOnly(uintptr_t v, bool bDec = false);
 
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
@@ -221,7 +223,7 @@ public:
 	bool ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
 	void DumpMemory(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
-	void DumpMemory(uintptr_t pNativeStart, uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
+	void DumpMemory(uintptr_t pNativeStart, uintptr_t pVTStart, uintptr_t nSize);
 	uintptr_t DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize);
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
 	bool IsModuleAddr(uintptr_t pAddr);
@@ -295,7 +297,7 @@ public:
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
 	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0);
-	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB);
+	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr);
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep);
 	void Pause();
 	void Resume();
@@ -307,11 +309,11 @@ public:
 	bool GetFlag(eFlags flag);
 	void SetFlag(eFlags flag, bool value);
 	void DumpStack(intptr_t nCount = -1, bool bValNotice = true);
-	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true);
-	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true);
+	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
+	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
 	void ClearRWHistory();
 	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
-	void InstallDefaultHooks();
+	void InstallDefaultHooks(HookNotifyCb cb);
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
@@ -381,7 +383,49 @@ public:
 	void CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly = true);
 
 	template <typename T>
-	bool WriteMemory(uintptr_t pAddr, const T& val, bool bCreateRegion = false);
+	bool WriteMemory(uintptr_t pAddr, const T& val, bool bCreateRegion = false)
+	{
+		static_assert(std::is_trivially_copyable_v<T>,
+			"WriteMemory<T> requires trivially copyable T");
+
+		if (!m_uc || !pAddr)
+			return false;
+
+		const auto tryWrite = [&]() -> bool
+		{
+			return uc_mem_write(m_uc, pAddr, &val, sizeof(T)) == UC_ERR_OK;
+		};
+
+		if (tryWrite())
+			return true;
+
+		if (!bCreateRegion)
+		{
+			if (m_bLogRunner)
+				Log("WriteMemory: write failed at 0x%p, size=%zu", (void*)pAddr, sizeof(T));
+			return false;
+		}
+
+		const uintptr_t pageSize = 0x1000;
+		const uintptr_t base = AlignDownPage(pAddr);
+		const uintptr_t end = AlignUp(pAddr + sizeof(T), pageSize);
+		const uintptr_t mapSize = end - base;
+
+		if (!AddMemoryTo(base, mapSize, UC_PROT_READ | UC_PROT_WRITE))
+		{
+			if (m_bLogRunner)
+				Log("WriteMemory: failed to map region at 0x%p, size=0x%zx", (void*)base, (size_t)mapSize);
+			return false;
+		}
+
+		if (tryWrite())
+			return true;
+
+		if (m_bLogRunner)
+			Log("WriteMemory: write still failed after mapping at 0x%p, size=%zu", (void*)pAddr, sizeof(T));
+
+		return false;
+	}
 
 private:
 	// точки останова: addr info

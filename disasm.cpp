@@ -1955,7 +1955,7 @@ void AsmRunner::DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chro
     else printf("[Delta] %.3fms (%lldus)\n", us / 1000.0, us);
 }
 
-std::string AsmRunner::PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec)
+std::string AsmRunner::PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec, bool bDecBracket)
 {
     std::string ascii;
     ascii.reserve(width);
@@ -1968,7 +1968,7 @@ std::string AsmRunner::PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec)
 
     std::ostringstream oss;
     if(bDec)
-        oss << "0x" << std::hex << std::uppercase << v << std::dec << " (" << static_cast<uint64_t>(v) << ") '" << ascii << "'";
+        oss << "0x" << std::hex << std::uppercase << v << std::dec << (bDecBracket ? " (" : " ") << static_cast<uint64_t>(v) << (bDecBracket ? ") '" : " '") << ascii << "'";
     else
         oss << "0x" << std::hex << std::uppercase << v << " '" << ascii << "'";
     return oss.str();
@@ -2145,7 +2145,7 @@ void AsmRunner::DataToHexString(int indent, uintptr_t startAddr, const uint8_t* 
             if (indent > 0) output->append(static_cast<size_t>(indent), ' ');
             uintptr_t addr = startAddr + static_cast<uintptr_t>(i);
             std::ostringstream a;
-            a << std::uppercase << std::hex << std::setw(addr_width) << std::setfill('0') << addr;
+            a << "0x" << std::uppercase << std::hex << std::setw(addr_width) << std::setfill('0') << addr;
             output->append(a.str());
             output->append("  ");
         }
@@ -2220,7 +2220,7 @@ void AsmRunner::DataToHexString(int indent, uintptr_t startAddr, const uint8_t* 
                 putStr(std::string(static_cast<size_t>(indent), ' '));
 
             std::ostringstream a;
-            a << std::uppercase << std::hex << std::setw(addr_width) << std::setfill('0') << (startAddr + static_cast<uintptr_t>(i));
+            a << "0x" << std::uppercase << std::hex << std::setw(addr_width) << std::setfill('0') << (startAddr + static_cast<uintptr_t>(i));
             setColor(kWhite);
             putStr(a.str());
             putStr("  ");
@@ -2725,10 +2725,11 @@ void AsmRunner::DumpMemory(uintptr_t pStart, uintptr_t nSize)
     Log("%s", out.c_str());
 }
 
-void AsmRunner::DumpMemory(uintptr_t pNativeStart, uintptr_t pStart, uintptr_t nSize)
+void AsmRunner::DumpMemory(uintptr_t pNativeStart, uintptr_t pVTStart, uintptr_t nSize)
 {
-    (void)pNativeStart;
-    DumpMemory(pStart, nSize);
+    if (!m_uc || !pNativeStart || !pVTStart || !nSize) return;
+
+    uc_mem_read(m_uc, pVTStart, reinterpret_cast<void*>(pNativeStart), static_cast<size_t>(nSize));
 }
 
 uintptr_t AsmRunner::DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize)
@@ -3971,7 +3972,7 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA, uintptr_
     m_rttrace.inited = true;
 }
 
-void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
+void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare)
 {
     if (!szPCTraceA || !*szPCTraceA || !szPCTraceB || !*szPCTraceB)
     {
@@ -3989,16 +3990,44 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
     const WORD kGreen = FOREGROUND_GREEN;
     const WORD kYellow = FOREGROUND_RED | FOREGROUND_GREEN;
 
+    std::ofstream outFile;
+    std::ostream* out = &std::cout;
+    const bool toFile = (szOutFileCompare && *szOutFileCompare);
+
+    if (toFile)
+    {
+        outFile.open(szOutFileCompare, std::ios::out | std::ios::trunc);
+        if (!outFile.is_open())
+        {
+            Log("[!] ComparePCTrace: cannot open output file: %s", szOutFileCompare);
+            return;
+        }
+        out = &outFile;
+    }
+
     auto setColor = [&](WORD c)
     {
-        if (haveConsole)
+        if (!toFile && haveConsole)
             SetConsoleTextAttribute(hConsole, c);
     };
 
     auto restoreColor = [&]()
     {
-        if (haveConsole)
+        if (!toFile && haveConsole)
             SetConsoleTextAttribute(hConsole, oldAttr);
+    };
+
+    auto writeLine = [&](WORD color, const std::string& s)
+    {
+        setColor(color);
+        (*out) << s << '\n';
+    };
+
+    auto toHex = [](uintptr_t v) -> std::string
+    {
+        std::ostringstream ss;
+        ss << "0x" << std::hex << std::uppercase << v;
+        return ss.str();
     };
 
     std::ifstream fa(szPCTraceA);
@@ -4020,13 +4049,15 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
     auto trim = [](std::string& s)
     {
         auto issp = [](unsigned char c) { return std::isspace(c) != 0; };
+
         s.erase(s.begin(), std::find_if(s.begin(), s.end(),
             [&](char c) { return !issp(static_cast<unsigned char>(c)); }));
+
         s.erase(std::find_if(s.rbegin(), s.rend(),
             [&](char c) { return !issp(static_cast<unsigned char>(c)); }).base(), s.end());
     };
 
-    auto parseLine = [&](const std::string& line, uintptr_t& out) -> bool
+    auto parseLine = [&](const std::string& line, uintptr_t& outPc) -> bool
     {
         std::string s = line;
         trim(s);
@@ -4043,19 +4074,19 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
         if (end == str)
             return false;
 
-        out = static_cast<uintptr_t>(v);
+        outPc = static_cast<uintptr_t>(v);
         return true;
     };
 
-    auto loadTrace = [&](std::ifstream& f, std::vector<uintptr_t>& out)
+    auto loadTrace = [&](std::ifstream& f, std::vector<uintptr_t>& outVec)
     {
-        out.clear();
+        outVec.clear();
         std::string line;
         while (std::getline(f, line))
         {
             uintptr_t pc = 0;
             if (parseLine(line, pc))
-                out.push_back(pc);
+                outVec.push_back(pc);
         }
     };
 
@@ -4065,15 +4096,23 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
 
     if (m_bLogRunner)
     {
-        Log("[*] ComparePCTrace");
-        Log("[*] A: %s (len=%zu)", szPCTraceA, static_cast<size_t>(a.size()));
-        Log("[*] B: %s (len=%zu)", szPCTraceB, static_cast<size_t>(b.size()));
+        writeLine(kWhite, "[*] ComparePCTrace");
+
+        {
+            std::ostringstream ss;
+            ss << "[*] A: " << szPCTraceA << " (len=" << a.size() << ")";
+            writeLine(kWhite, ss.str());
+        }
+        {
+            std::ostringstream ss;
+            ss << "[*] B: " << szPCTraceB << " (len=" << b.size() << ")";
+            writeLine(kWhite, ss.str());
+        }
     }
 
     if (a.empty() && b.empty())
     {
-        setColor(kGreen);
-        Log("[=] both traces are empty");
+        writeLine(kGreen, "[=] both traces are empty");
         restoreColor();
         return;
     }
@@ -4092,15 +4131,55 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
 
     if (firstDiff == minSz)
     {
-        setColor(kGreen);
-        Log("[=] traces match for first %zu instruction(s)", static_cast<size_t>(minSz));
+        writeLine(kGreen, "[=] traces match for first " + std::to_string(minSz) + " instruction(s)");
 
         if (a.size() == b.size())
-            Log("[=] eq, same length: %zu", static_cast<size_t>(a.size()));
+        {
+            writeLine(kGreen, "[=] eq, same length: " + std::to_string(a.size()));
+        }
         else if (a.size() < b.size())
-            Log("[=] eq by shorter file: A ended first, B is longer by %zu instruction(s)", static_cast<size_t>(b.size() - a.size()));
+        {
+            writeLine(kGreen, "[=] eq by shorter file: A ended first, B is longer by " +
+                std::to_string(b.size() - a.size()) + " instruction(s)");
+        }
         else
-            Log("[=] eq by shorter file: B ended first, A is longer by %zu instruction(s)", static_cast<size_t>(a.size() - b.size()));
+        {
+            writeLine(kGreen, "[=] eq by shorter file: B ended first, A is longer by " +
+                std::to_string(a.size() - b.size()) + " instruction(s)");
+        }
+
+        restoreColor();
+        return;
+    }
+
+    if (bAll)
+    {
+        for (size_t i = 0; i < max(a.size(), b.size()); ++i)
+        {
+            const bool hasA = i < a.size();
+            const bool hasB = i < b.size();
+            const bool diff = (!hasA || !hasB || a[i] != b[i]);
+
+            if (!diff)
+                continue;
+
+            std::ostringstream ss;
+            ss << "[" << i << "] ";
+
+            if (hasA)
+                ss << "A " << toHex(a[i]);
+            else
+                ss << "A <EOF>";
+
+            ss << " / ";
+
+            if (hasB)
+                ss << "B " << toHex(b[i]);
+            else
+                ss << "B <EOF>";
+
+            writeLine(kRed, ss.str());
+        }
 
         restoreColor();
         return;
@@ -4109,9 +4188,11 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
     const size_t begin = (firstDiff > 10) ? (firstDiff - 10) : 0;
     const size_t end = min(max(a.size(), b.size()), firstDiff + 11);
 
-    setColor(kYellow);
-    Log("[!] first diff at instruction #%zu", static_cast<size_t>(firstDiff));
-    setColor(kWhite);
+    {
+        std::ostringstream ss;
+        ss << "[!] first diff at instruction #" << firstDiff;
+        writeLine(kYellow, ss.str());
+    }
 
     for (size_t i = begin; i < end; ++i)
     {
@@ -4119,45 +4200,42 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB)
         const bool hasB = i < b.size();
         const bool eq = hasA && hasB && (a[i] == b[i]);
 
+        WORD color = eq ? kGreen : kRed;
         if (i == firstDiff)
-            setColor(kYellow);
-        else if (eq)
-            setColor(kGreen);
-        else
-            setColor(kRed);
+            color = kYellow;
+
+        std::ostringstream ss;
+        ss << "[" << i << "] ";
 
         if (hasA && hasB)
         {
-            Log("[%zu] A 0x%p / B 0x%p%s",
-                static_cast<size_t>(i),
-                (void*)a[i],
-                (void*)b[i],
-                (i == firstDiff) ? "  <== 1st diff" : "");
+            ss << "A " << toHex(a[i]) << " / B " << toHex(b[i]);
         }
         else if (hasA)
         {
-            Log("[%zu] A 0x%p / B <EOF>%s",
-                static_cast<size_t>(i),
-                (void*)a[i],
-                (i == firstDiff) ? "  <== 1st diff" : "");
+            ss << "A " << toHex(a[i]) << " / B <EOF>";
         }
         else
         {
-            Log("[%zu] A <EOF> / B 0x%p%s",
-                static_cast<size_t>(i),
-                (void*)b[i],
-                (i == firstDiff) ? "  <== 1st diff" : "");
+            ss << "A <EOF> / B " << toHex(b[i]);
         }
-    }
 
-    setColor(kWhite);
+        if (i == firstDiff)
+            ss << "  <== 1st diff";
+
+        writeLine(color, ss.str());
+    }
 
     if (a.size() != b.size())
     {
         if (a.size() < b.size())
-            Log("[!] A shorter by %zu instruction(s)", static_cast<size_t>(b.size() - a.size()));
+        {
+            writeLine(kYellow, "[!] A shorter by " + std::to_string(b.size() - a.size()) + " instruction(s)");
+        }
         else
-            Log("[!] B shorter by %zu instruction(s)", static_cast<size_t>(a.size() - b.size()));
+        {
+            writeLine(kYellow, "[!] B shorter by " + std::to_string(a.size() - b.size()) + " instruction(s)");
+        }
     }
 
     restoreColor();
@@ -4583,7 +4661,7 @@ void AsmRunner::DumpStack(intptr_t nCount, bool bValNotice)
     }
 }
 
-void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym)
+void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt)
 {
     if (m_RWHistory.empty())
     {
@@ -4682,61 +4760,89 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
         // h.value операнд истории, возможно указатель на стек или на память если читается
 
         std::ostringstream oss;
-        oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
-        if (bRVA)
+        if (bShortFmt)
         {
-            if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
-                oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
-            else if (m_bDisasmRVA)
-                oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
+            // 10 77777777 W 0x17854123 0x123   0x233564546 0x10 16 '.' 1  // N IC RW PC PCRVA DATAPTR DATA16 DATA10 DATAASCII SIZE10
+            // 12 93017871 R 0x629FA0B1 0x1AFA0B1 0x1EBE64  0x20000000 536870912 '... ' 4
+            oss << i << " " << h.ic << " " << (h.bRead ? 'R' : 'W') << " ";
+            if (bRVA)
+            {
+                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                    oss << "0x" << std::hex << std::uppercase << (h.pc - m_modStart) << " ";
+                else if (m_bDisasmRVA)
+                    oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " 0x" << (h.pc - m_modStart) << " ";
+                else
+                    oss << "0x" << std::hex << std::uppercase << h.pc << " ";
+            }
             else
-                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+                oss << "0x" << std::hex << std::uppercase << h.pc << " ";
+
+            oss << "0x" << std::hex << std::uppercase << h.addr << " ";
+            if (pVIatNode || isStackValueAddr || bIsMemPtr)
+                oss << PrintHexOnly(h.value) << " "; // don't print dec and ascii for pointers
+            else
+                oss << PrintPtrAsciiTag(h.value, PointerSize(), true, false) << " ";
+            oss << std::dec << h.size;
         }
         else
-            oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
-        oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
-        if(pVIatNode || isStackValueAddr || bIsMemPtr)
-            oss << " value " << PrintHexOnly(h.value);
-        else
-            oss << " value " << PrintPtrAsciiTag(h.value, PointerSize(), true);
-        oss << " size: " << std::dec << h.size;
-
-        if (bValNotice)
         {
-            // метка характеристики где лежали данные
-            if (isStackAddr) {
-                //if (readPtr(h.addr, adref))
-                //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
-                //else // when is it? error
-                oss << " <- haddr to stack"; // h.addr просто лежит в стеке
+            oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
+            if (bRVA)
+            {
+                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                    oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
+                else if (m_bDisasmRVA)
+                    oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
+                else
+                    oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
             }
-            else {
-                //oss << " <- haddr to mem"; // и так работаем с памятью в history
-            }
+            else
+                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
 
-            // метка характеристики самих данных которые читали
-            if (pVIatNode) { // can have dummy memory for hooks in uc
-                oss << " <- hvalptr iat " << pVIatNode->GetAbsoluteName();
-            }
-            else if (isStackValueAddr) {
-                //uintptr_t vdref = 0;
-                //if (readPtr(h.value, vdref))
-                //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
-                //else // when is it? error
-                oss << " <- hvalptr to stack";
-            }
-            else if (bIsMemPtr) { // не в диапазоне стека, возможно указатель на память
-                oss << " <- hvalptr to mem, now its" << valueTag(vdref, true);
-            }
-            else {
-                //oss << " <- data"; // и так лог памяти, по умолчанию data
-            }
+            oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
+            if (pVIatNode || isStackValueAddr || bIsMemPtr)
+                oss << " value " << PrintHexOnly(h.value); // don't print dec and ascii for pointers
+            else
+                oss << " value " << PrintPtrAsciiTag(h.value, PointerSize(), true);
+            oss << " size: " << std::dec << h.size;
 
-            // символ pc
-            if (bSym && IsSymMapInitialised()) {
-                std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
-                if(!sAddr.empty())
-                    oss << " (PC " << sAddr << ")";
+            if (bValNotice)
+            {
+                // метка характеристики где лежали данные
+                if (isStackAddr) {
+                    //if (readPtr(h.addr, adref))
+                    //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
+                    //else // when is it? error
+                    oss << " <- haddr to stack"; // h.addr просто лежит в стеке
+                }
+                else {
+                    //oss << " <- haddr to mem"; // и так работаем с памятью в history
+                }
+
+                // метка характеристики самих данных которые читали
+                if (pVIatNode) { // can have dummy memory for hooks in uc
+                    oss << " <- hvalptr iat " << pVIatNode->GetAbsoluteName();
+                }
+                else if (isStackValueAddr) {
+                    //uintptr_t vdref = 0;
+                    //if (readPtr(h.value, vdref))
+                    //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
+                    //else // when is it? error
+                    oss << " <- hvalptr to stack";
+                }
+                else if (bIsMemPtr) { // не в диапазоне стека, возможно указатель на память
+                    oss << " <- hvalptr to mem, now its" << valueTag(vdref, true);
+                }
+                else {
+                    //oss << " <- data"; // и так лог памяти, по умолчанию data
+                }
+
+                // символ pc
+                if (bSym && IsSymMapInitialised()) {
+                    std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
+                    if (!sAddr.empty())
+                        oss << " (PC " << sAddr << ")";
+                }
             }
         }
 
@@ -4762,7 +4868,7 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
     resetColor();
 }
 
-void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym)
+void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt)
 {
     if (m_RWHistory.empty())
     {
@@ -4851,61 +4957,89 @@ void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bS
         // h.value операнд истории, возможно указатель на стек или на память если читается
 
         std::ostringstream oss;
-        oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
-        if (bRVA)
+        if (bShortFmt)
         {
-            if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
-                oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
-            else if (m_bDisasmRVA)
-                oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
+            // 10 77777777 W 0x17854123 0x123   0x233564546 0x10 16 '.' 1  // N IC RW PC PCRVA DATAPTR DATA16 DATA10 DATAASCII SIZE10
+            // 12 93017871 R 0x629FA0B1 0x1AFA0B1 0x1EBE64  0x20000000 536870912 '... ' 4
+            oss << i << " " << h.ic << " " << (h.bRead ? 'R' : 'W') << " ";
+            if (bRVA)
+            {
+                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                    oss << "0x" << std::hex << std::uppercase << (h.pc - m_modStart) << " ";
+                else if (m_bDisasmRVA)
+                    oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " 0x" << (h.pc - m_modStart) << " ";
+                else
+                    oss << "0x" << std::hex << std::uppercase << h.pc << " ";
+            }
             else
-                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+                oss << "0x" << std::hex << std::uppercase << h.pc << " ";
+
+            oss << "0x" << std::hex << std::uppercase << h.addr << " ";
+            if (pVIatNode || isStackValueAddr || bIsMemPtr)
+                oss << PrintHexOnly(h.value) << " "; // don't print dec and ascii for pointers
+            else
+                oss << PrintPtrAsciiTag(h.value, PointerSize(), true, false) << " ";
+            oss << std::dec << h.size;
         }
         else
-            oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
-        oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
-        if (pVIatNode || isStackValueAddr || bIsMemPtr)
-            oss << " value " << PrintHexOnly(h.value);
-        else
-            oss << " value " << PrintPtrAsciiTag(h.value, PointerSize(), true);
-        oss << " size: " << std::dec << h.size;
-
-        if (bValNotice)
         {
-            // метка характеристики где лежали данные
-            if (isStackAddr) {
-                //if (readPtr(h.addr, adref))
-                //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
-                //else // when is it? error
-                oss << " <- haddr to stack"; // h.addr просто лежит в стеке
+            oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
+            if (bRVA)
+            {
+                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                    oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
+                else if (m_bDisasmRVA)
+                    oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
+                else
+                    oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
             }
-            else {
-                //oss << " <- haddr to mem"; // и так работаем с памятью в history
-            }
+            else
+                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
 
-            // метка характеристики самих данных которые читали
-            if (pVIatNode) { // can have dummy memory for hooks in uc
-                oss << " <- hvalptr iat " << pVIatNode->GetAbsoluteName();
-            }
-            else if (isStackValueAddr) {
-                //uintptr_t vdref = 0;
-                //if (readPtr(h.value, vdref))
-                //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
-                //else // when is it? error
-                oss << " <- hvalptr to stack";
-            }
-            else if (bIsMemPtr) { // не в диапазоне стека, возможно указатель на память
-                oss << " <- hvalptr to mem, now its" << valueTag(vdref, true);
-            }
-            else {
-                //oss << " <- data"; // и так лог памяти, по умолчанию data
-            }
+            oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
+            if (pVIatNode || isStackValueAddr || bIsMemPtr)
+                oss << " value " << PrintHexOnly(h.value); // don't print dec and ascii for pointers
+            else
+                oss << " value " << PrintPtrAsciiTag(h.value, PointerSize(), true);
+            oss << " size: " << std::dec << h.size;
 
-            // символ pc
-            if (bSym && IsSymMapInitialised()) {
-                std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
-                if (!sAddr.empty())
-                    oss << " (PC " << sAddr << ")";
+            if (bValNotice)
+            {
+                // метка характеристики где лежали данные
+                if (isStackAddr) {
+                    //if (readPtr(h.addr, adref))
+                    //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
+                    //else // when is it? error
+                    oss << " <- haddr to stack"; // h.addr просто лежит в стеке
+                }
+                else {
+                    //oss << " <- haddr to mem"; // и так работаем с памятью в history
+                }
+
+                // метка характеристики самих данных которые читали
+                if (pVIatNode) { // can have dummy memory for hooks in uc
+                    oss << " <- hvalptr iat " << pVIatNode->GetAbsoluteName();
+                }
+                else if (isStackValueAddr) {
+                    //uintptr_t vdref = 0;
+                    //if (readPtr(h.value, vdref))
+                    //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
+                    //else // when is it? error
+                    oss << " <- hvalptr to stack";
+                }
+                else if (bIsMemPtr) { // не в диапазоне стека, возможно указатель на память
+                    oss << " <- hvalptr to mem, now its" << valueTag(vdref, true);
+                }
+                else {
+                    //oss << " <- data"; // и так лог памяти, по умолчанию data
+                }
+
+                // символ pc
+                if (bSym && IsSymMapInitialised()) {
+                    std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
+                    if (!sAddr.empty())
+                        oss << " (PC " << sAddr << ")";
+                }
             }
         }
 
@@ -4930,7 +5064,7 @@ void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll, 
 }
 
 // TODO: others + log hook call
-void AsmRunner::InstallDefaultHooks()
+void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 {
     const bool bBefore = false;
 
@@ -4940,8 +5074,10 @@ void AsmRunner::InstallDefaultHooks()
 
     SetIAT(0, 0, false); // collect temp ENV
     SetAnyJmpHook(FindIATNode("VirtualAlloc", szModule)->GetAbsolute(),
-        [bBefore](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
+            cb(FindIATNode("VirtualAlloc", szModule));
+
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
                 return true;
@@ -5020,8 +5156,10 @@ void AsmRunner::InstallDefaultHooks()
         }, this, bBefore);
 
     SetAnyJmpHook(FindIATNode("VirtualFree", szModule)->GetAbsolute(),
-        [bBefore](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
+            cb(FindIATNode("VirtualFree", szModule));
+
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
                 return true;
@@ -5079,8 +5217,10 @@ void AsmRunner::InstallDefaultHooks()
         }, this, bBefore);
 
     SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsolute(),
-        [bBefore](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
+            cb(FindIATNode("GetSystemTimeAsFileTime", szModule));
+
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
                 return true;
@@ -5127,6 +5267,46 @@ void AsmRunner::InstallDefaultHooks()
             if (lpSystemTimeAsFileTime)
                 self->_CopyMemory(lpSystemTimeAsFileTime, (uintptr_t)&ft, sizeof(FILETIME));
 
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        }, this, bBefore);
+
+    SetAnyJmpHook(FindIATNode("Sleep", "kernel32.dll")->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            cb(FindIATNode("Sleep", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
+                (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+
+            // Получаем аргументы
+            uintptr_t dwMilliseconds = 0;
+            uintptr_t retaddr = 0;
+            if (bBefore) {
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            }
+            else if (!self->StackPop(retaddr)) {
+                return false;
+            }
+
+            if (self->IsX64())
+            {
+                dwMilliseconds = self->GetRegister(UC_X86_REG_RCX);
+            }
+            else
+            {
+                if (!self->StackPop(dwMilliseconds)) return false;
+            }
+
+            printf("[Sleep] dwMilliseconds=0x%X\n", dwMilliseconds);
+
+            // Устанавливаем возврат (функция void, ничего не возвращает)
             self->SetRegister(self->PcReg(), retaddr);
             self->SetUpdatedPC(true);
 
@@ -6275,51 +6455,6 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
     std::cout << std::flush;
 }
 
-template <typename T>
-bool AsmRunner::WriteMemory(uintptr_t pAddr, const T& val, bool bCreateRegion)
-{
-    static_assert(std::is_trivially_copyable_v<T>,
-        "WriteMemory<T> requires trivially copyable T");
-
-    if (!m_uc || !pAddr)
-        return false;
-
-    const auto tryWrite = [&]() -> bool
-    {
-        return uc_mem_write(m_uc, pAddr, &val, sizeof(T)) == UC_ERR_OK;
-    };
-
-    if (tryWrite())
-        return true;
-
-    if (!bCreateRegion)
-    {
-        if (m_bLogRunner)
-            Log("WriteMemory: write failed at 0x%p, size=%zu", (void*)pAddr, sizeof(T));
-        return false;
-    }
-
-    const uintptr_t pageSize = 0x1000;
-    const uintptr_t base = AlignDownPage(pAddr);
-    const uintptr_t end = AlignUp(pAddr + sizeof(T), pageSize);
-    const uintptr_t mapSize = end - base;
-
-    if (!AddMemoryTo(base, mapSize, UC_PROT_READ | UC_PROT_WRITE))
-    {
-        if (m_bLogRunner)
-            Log("WriteMemory: failed to map region at 0x%p, size=0x%zx", (void*)base, (size_t)mapSize);
-        return false;
-    }
-
-    if (tryWrite())
-        return true;
-
-    if (m_bLogRunner)
-        Log("WriteMemory: write still failed after mapping at 0x%p, size=%zu", (void*)pAddr, sizeof(T));
-
-    return false;
-}
-
 #if 0
 void IatTestUC()
 {
@@ -6464,7 +6599,7 @@ void TestStackArgs()
     MboxSTD("halt", "hold");
 }
 
-void __cdecl VMENTRY_UT_HK(void* lpParameter)
+void VMTEST(int a1)
 {
     //IatTestUC();
     //Test1();
@@ -6487,12 +6622,15 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     AsmRunner runner(false);
     const bool bCRC = true;
     const bool bBefore = false;
+    const bool bBrokeCRC = false;
 
     void* pEntry = bCRC ? addrCRC(0x60F2F0C0) : addr(0x60F2F0C0);
     void* pEntryArg = bCRC ? addrCRC(0x615CDB58) : addr(0x615CDB58);
 
     uintptr_t pThemidaStart = (uintptr_t)(bCRC ? addrCRC(0x629D5000) : addr(0x629D5000));
     uintptr_t pThemidaEnd = (uintptr_t)(bCRC ? addrCRC(0x630DD000) : addr(0x630DD000));
+    uintptr_t p4Ex = (uintptr_t)(bCRC ? addrCRC(0x62A35968) : addr(0x62A35968));
+    uintptr_t pCRC = (uintptr_t)(bCRC ? addrCRC(0x60F0101D) : addr(0x60F0101D));
 
     MboxSTD("VMENTRY_UT_HK", "hold");
 
@@ -6542,19 +6680,21 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             SetConsoleColor(1);
         }
 
-        if (self->GetInstructionCount() > /*5080*/(/*nCrcSumEnd*/ nCpyEnd * 0) + 93130827) {
-            self->SetLogDisasm(true);
+        //if (self->GetInstructionCount() > /*5080*/(/*nCrcSumEnd*/ 93130827)
+        if (self->GetInstructionCount() > /*5080*//*nCpyEnd*/ nCrcSumEnd)
+        {
+            //self->SetLogDisasm(true);
 
-            self->SetRWHistory(true);
-            self->DumpRWHistory();
-            //self->DumpRWHistory(0, false, true, true, true, true, true);
-            self->SetDisasmAfterCB(false);
+            //self->SetRWHistory(true);
+            //self->DumpRWHistory();
+            //self->DumpRWHistory(0, false, true, true, true, true, true, true);
+            /*self->SetDisasmAfterCB(false);
             self->SendIDAAddr(self->CalcWithCASLR(address));
             self->DumpRegisters();
             self->DumpFlags();
             self->DumpSegmentRegisters();
             self->DumpStack(7);
-            MboxSTD("apply this opcode", "disasm");
+            MboxSTD("apply this opcode", "disasm");*/
         }
         else {
             self->SetLogDisasm(false);
@@ -6578,12 +6718,18 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
         return true;
     };
 
-    auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto MemCb = [&](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
         //printf("MemCb 0x%p %d %d %d\n", (void*)address, type, size, value);
 
         if (!self || !uc || size == 0)
             return true;
+
+        if (address == p4Ex) // [93228455] 0x62D872AD
+        { // custom, tmp
+            self->DumpMemory(p4Ex, 20);
+            //MboxSTD("p4Ex", "MemCb");
+        }
 
         //////std::vector<uint8_t> bytes(size);
         //////if (uc_mem_read(uc, address, bytes.data(), size) != UC_ERR_OK) { // !! old and wrong
@@ -6660,14 +6806,18 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
         return true;
     };
 
-    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto JmpCb = [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
         //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         //if (!self->IsModuleAddr(to) && !self->IsRetHaltOrNull(to)) {
         if (!self->IsPCNormal(to)) {
-            printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
+            tIEFuncNode* pNode = nullptr;
+            if (self->FindIATNode(to))
+                pNode = self->FindIATNode(to);
+
+            printf("JmpCb 0x%p %d %s\n", (void*)to, mnemonic, pNode ? pNode->GetAbsoluteName().c_str() : "");
             MboxSTD("module escape", "asm runner");
             return false;
         }
@@ -6675,8 +6825,12 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
         return true;
     };
 
+    AsmRunner::HookNotifyCb hcb = [&](tIEFuncNode* pNode) {
+
+    };
+
     runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
-    //runner.SetAnyJmpHook(0x12345678, [bBefore](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+    //runner.SetAnyJmpHook(0x12345678, [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
     //	{
     //		auto* self = static_cast<AsmRunner*>(user_data);
     //		if (!self)
@@ -6729,6 +6883,8 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
                 return true;
+
+            hcb(self->FindIATNode("VirtualAlloc", "kernel32.dll"));
 
             printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
@@ -6815,6 +6971,8 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             if (!self)
                 return true;
 
+            hcb(self->FindIATNode("VirtualFree", "kernel32.dll"));
+
             //MboxSTD("custom wait", "VirtualFree");
 
             printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
@@ -6876,16 +7034,18 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
             return true;
         },
         &runner, bBefore);
-
     runner.SetAnyJmpHook(runner.FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
-            if (!self) return true;
+            if (!self)
+                return true;
 
-            self->DumpRegisters();
-            self->DumpStack(7);
-            MboxSTD("custom wait", "GetSystemTimeAsFileTime");
+            hcb(self->FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll"));
+
+            //self->DumpRegisters();
+            //self->DumpStack(7);
+            //MboxSTD("custom wait", "GetSystemTimeAsFileTime");
 
             printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
@@ -6942,6 +7102,47 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
             return true;
         }, &runner, bBefore);
+    runner.SetAnyJmpHook(runner.FindIATNode("Sleep", "kernel32.dll")->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            hcb(self->FindIATNode("Sleep", "kernel32.dll"));
+
+            printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
+                (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+
+            // Получаем аргументы
+            uintptr_t dwMilliseconds = 0;
+            uintptr_t retaddr = 0;
+            if (bBefore) {
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            }
+            else if (!self->StackPop(retaddr)) {
+                return false;
+            }
+
+            if (self->IsX64())
+            {
+                dwMilliseconds = self->GetRegister(UC_X86_REG_RCX);
+            }
+            else
+            {
+                if (!self->StackPop(dwMilliseconds)) return false;
+            }
+
+            printf("[Sleep] dwMilliseconds=0x%X\n", dwMilliseconds);
+
+            // Устанавливаем возврат (функция void, ничего не возвращает)
+            self->SetRegister(self->PcReg(), retaddr);
+            self->SetUpdatedPC(true);
+
+            return true;
+        }, &runner, bBefore);
+
+    //WSAStartup WS2_32.dll
 
     //runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
@@ -6955,7 +7156,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     runner.AddDeadzoneIC(nCpyStart, nCrcSumEnd);
     runner.InitIDAWS();
     //runner.WaitIDAWSConnection();
-    runner.ComparePCTrace("trace_crc3.txt", "trace_crc2.txt");
+    runner.ComparePCTrace("trace_crc3.txt", "trace_crc2.txt", true);
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
     if (!bCRC) {
         uintptr_t mod = runner.CopyModule(STEAM_LIB);
@@ -6976,7 +7177,8 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
     //	runner.Shutdown();
     //	return;
     //}
-
+    if (bBrokeCRC)
+        runner.WriteMemory<uint8_t>(pCRC, 0x0);
     runner.SetEntryPointStackArg(0, reinterpret_cast<uintptr_t>(pEntryArg));
     //runner.SetRegister(UC_X86_REG_ECX, reinterpret_cast<uintptr_t>(pEntryArg)); // if thiscall-style ctx is needed
 
@@ -7004,14 +7206,5 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
     MboxSTD("halt", "hold");
     SetConsoleColor(1);
-    return;
-
-    MboxSTD("HkPostSendVM (post thread start)", "mzhk");
-    printf("lpParameter 0x%p  LPPARAM_CRITICAL_SECTION_POST_ANSW\n", lpParameter);
-    auto PostSendVM = (void(__cdecl*)(void*))addr(0x60F2F0C0);
-    PostSendVM(lpParameter); // memset -> vmentry -> vmexit -> vmreturn
-    printf("lpParameter 0x%p\n", lpParameter);
-    //MboxSTD("HkPostSendVM", "mzhk");
-
 }
 #endif
