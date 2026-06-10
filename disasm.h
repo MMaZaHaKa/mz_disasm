@@ -56,6 +56,39 @@
 #define ALIGN4BYTES(s) ((((uint32_t)s) + 3) & 0xFFFFFFFC)
 #define MASK(p, s) (((1 << (s)) - 1) << (p))
 
+enum eFlags : uint32_t
+{
+	CARRY_FLAG                = BIT(0),  // CF - Carry Flag
+	BIT_1_RESERVED            = BIT(1),  // Reserved (always 1)
+	PARITY_FLAG               = BIT(2),  // PF - Parity Flag
+	BIT_3_RESERVED            = BIT(3),  // Reserved
+	AUXILIARY_FLAG            = BIT(4),  // AF - Auxiliary Carry Flag
+	BIT_5_RESERVED            = BIT(5),  // Reserved
+	ZERO_FLAG                 = BIT(6),  // ZF - Zero Flag
+	SIGN_FLAG                 = BIT(7),  // SF - Sign Flag
+	TRAP_FLAG                 = BIT(8),  // TF - Trap Flag
+	INTERRUPT_FLAG            = BIT(9),  // IF - Interrupt Enable Flag
+	DIRECTION_FLAG            = BIT(10), // DF - Direction Flag
+	OVERFLOW_FLAG             = BIT(11), // OF - Overflow Flag
+	// 12, 13 IOPL
+	NESTED_TASK               = BIT(14), // NT - Nested Task
+	BIT_15_RESERVED           = BIT(15), // Reserved
+	RESUME_FLAG               = BIT(16), // RF - Resume Flag
+	VIRTUAL_8086              = BIT(17), // VM - Virtual-8086 Mode
+	ALIGNMENT_CHECK           = BIT(18), // AC - Alignment Check
+	VIRTUAL_INTERRUPT         = BIT(19), // VIF - Virtual Interrupt Flag
+	VIRTUAL_INTERRUPT_PENDING = BIT(20), // VIP - Virtual Interrupt Pending
+	ID_FLAG                   = BIT(21), // ID - ID Flag
+};
+
+enum eIoplLevel : uint32_t
+{
+	LEVEL_0 = 0 << 12,
+	LEVEL_1 = 1 << 12,
+	LEVEL_2 = 2 << 12,
+	LEVEL_3 = 3 << 12,
+};
+
 struct tFuncNode //tmp, use tIEFuncNode
 {
 	uintptr_t rva = 0;
@@ -271,6 +304,8 @@ public:
 	void DumpRegisters(bool bFull = true); // and flags
 	void DumpSegmentRegisters();
 	void DumpFlags();
+	bool GetFlag(eFlags flag);
+	void SetFlag(eFlags flag, bool value);
 	void DumpStack(intptr_t nCount = -1, bool bValNotice = true);
 	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true);
 	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true);

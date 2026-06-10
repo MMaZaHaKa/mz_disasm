@@ -4406,24 +4406,6 @@ void AsmRunner::DumpFlags()
 
     uintptr_t eflags = GetRegister(FlagsReg());
 
-    // bits for x86/x64
-    const uintptr_t CF_MASK  = BIT(0);  // Carry Flag
-    const uintptr_t PF_MASK  = BIT(2);  // Parity Flag
-    const uintptr_t AF_MASK  = BIT(4);  // Auxiliary Carry Flag
-    const uintptr_t ZF_MASK  = BIT(6);  // Zero Flag
-    const uintptr_t SF_MASK  = BIT(7);  // Sign Flag
-    const uintptr_t TF_MASK  = BIT(8);  // Trap Flag
-    const uintptr_t IF_MASK  = BIT(9);  // Interrupt Enable Flag
-    const uintptr_t DF_MASK  = BIT(10); // Direction Flag
-    const uintptr_t OF_MASK  = BIT(11); // Overflow Flag
-    const uintptr_t NT_MASK  = BIT(14); // Nested Task
-    const uintptr_t RF_MASK  = BIT(16); // Resume Flag
-    const uintptr_t VM_MASK  = BIT(17); // Virtual-8086 Mode
-    const uintptr_t AC_MASK  = BIT(18); // Alignment Check
-    const uintptr_t VIF_MASK = BIT(19); // Virtual Interrupt Flag
-    const uintptr_t VIP_MASK = BIT(20); // Virtual Interrupt Pending
-    const uintptr_t ID_MASK  = BIT(21); // ID Flag
-
     auto flag_status = [&](uintptr_t mask) -> const char* {
         return (eflags & mask) ? "1" : "0";
     };
@@ -4442,44 +4424,60 @@ void AsmRunner::DumpFlags()
     printf("%-4s %-32s %s\n", "---", "----", "------");
 
     // base flags
-    flag_desc(CF_MASK, "CF (Carry Flag)", "Carry/Borrow occurred", "No carry/borrow");
-    flag_desc(PF_MASK, "PF (Parity Flag)", "Low byte has even parity", "Low byte has odd parity");
-    flag_desc(AF_MASK, "AF (Auxiliary Carry Flag)", "Auxiliary carry occurred (BCD)", "No auxiliary carry");
-    flag_desc(ZF_MASK, "ZF (Zero Flag)", "Result is zero", "Result is non-zero");
-    flag_desc(SF_MASK, "SF (Sign Flag)", "Result is negative", "Result is non-negative");
-    flag_desc(TF_MASK, "TF (Trap Flag)", "Single-step mode enabled", "Single-step mode disabled");
-    flag_desc(IF_MASK, "IF (Interrupt Flag)", "Interrupts enabled", "Interrupts disabled");
-    flag_desc(DF_MASK, "DF (Direction Flag)", "String operations decrement address", "String operations increment address");
-    flag_desc(OF_MASK, "OF (Overflow Flag)", "Signed overflow occurred", "No signed overflow");
+    flag_desc(eFlags::CARRY_FLAG, "CF (Carry Flag)", "Carry/Borrow occurred", "No carry/borrow");
+    flag_desc(eFlags::PARITY_FLAG, "PF (Parity Flag)", "Low byte has even parity", "Low byte has odd parity");
+    flag_desc(eFlags::AUXILIARY_FLAG, "AF (Auxiliary Carry Flag)", "Auxiliary carry occurred (BCD)", "No auxiliary carry");
+    flag_desc(eFlags::ZERO_FLAG, "ZF (Zero Flag)", "Result is zero", "Result is non-zero");
+    flag_desc(eFlags::SIGN_FLAG, "SF (Sign Flag)", "Result is negative", "Result is non-negative");
+    flag_desc(eFlags::TRAP_FLAG, "TF (Trap Flag)", "Single-step mode enabled", "Single-step mode disabled");
+    flag_desc(eFlags::INTERRUPT_FLAG, "IF (Interrupt Flag)", "Interrupts enabled", "Interrupts disabled");
+    flag_desc(eFlags::DIRECTION_FLAG, "DF (Direction Flag)", "String operations decrement address", "String operations increment address");
+    flag_desc(eFlags::OVERFLOW_FLAG, "OF (Overflow Flag)", "Signed overflow occurred", "No signed overflow");
 
     // extra
     printf("%-4s %-32s %s\n", "---", "----", "------");
-    flag_desc(NT_MASK,  "NT (Nested Task Flag)", "Nested task", "Not nested task");
-    flag_desc(RF_MASK,  "RF (Resume Flag)", "Debug exception resume", "No debug resume");
-    flag_desc(VM_MASK,  "VM (Virtual-8086 Mode)", "Virtual-8086 mode", "Not in Virtual-8086 mode");
-    flag_desc(AC_MASK,  "AC (Alignment Check)", "Alignment check enabled", "Alignment check disabled");
-    flag_desc(VIF_MASK, "VIF (Virtual Interrupt Flag)", "Virtual interrupt pending", "No virtual interrupt");
-    flag_desc(VIP_MASK, "VIP (Virtual Interrupt Pending)", "Virtual interrupt pending", "No virtual interrupt pending");
-    flag_desc(ID_MASK,  "ID (ID Flag)", "CPUID supported", "CPUID not supported");
+    flag_desc(eFlags::NESTED_TASK,  "NT (Nested Task Flag)", "Nested task", "Not nested task");
+    flag_desc(eFlags::RESUME_FLAG,  "RF (Resume Flag)", "Debug exception resume", "No debug resume");
+    flag_desc(eFlags::VIRTUAL_8086, "VM (Virtual-8086 Mode)", "Virtual-8086 mode", "Not in Virtual-8086 mode");
+    flag_desc(eFlags::ALIGNMENT_CHECK,  "AC (Alignment Check)", "Alignment check enabled", "Alignment check disabled");
+    flag_desc(eFlags::VIRTUAL_INTERRUPT, "VIF (Virtual Interrupt Flag)", "Virtual interrupt pending", "No virtual interrupt");
+    flag_desc(eFlags::VIRTUAL_INTERRUPT_PENDING, "VIP (Virtual Interrupt Pending)", "Virtual interrupt pending", "No virtual interrupt pending");
+    flag_desc(eFlags::ID_FLAG,  "ID (ID Flag)", "CPUID supported", "CPUID not supported");
 
     printf("[FLAGS] ");
-    printf("%c ", (eflags & CF_MASK) ? 'C' : '-');
-    printf("%c ", (eflags & PF_MASK) ? 'P' : '-');
-    printf("%c ", (eflags & AF_MASK) ? 'A' : '-');
-    printf("%c ", (eflags & ZF_MASK) ? 'Z' : '-');
-    printf("%c ", (eflags & SF_MASK) ? 'S' : '-');
-    printf("%c ", (eflags & TF_MASK) ? 'T' : '-');
-    printf("%c ", (eflags & IF_MASK) ? 'I' : '-');
-    printf("%c ", (eflags & DF_MASK) ? 'D' : '-');
-    printf("%c", (eflags & OF_MASK) ? 'O' : '-');
-    printf("  |  EXTRA: ");
-    printf("%c ", (eflags & NT_MASK) ? 'N' : '-');
-    printf("%c ", (eflags & RF_MASK) ? 'R' : '-');
-    printf("%c ", (eflags & VM_MASK) ? 'V' : '-');
-    printf("%c ", (eflags & AC_MASK) ? 'A' : '-');
-    printf("%c ", (eflags & VIF_MASK) ? 'i' : '-');
-    printf("%c ", (eflags & VIP_MASK) ? 'p' : '-');
-    printf("%c\n", (eflags & ID_MASK) ? 'I' : '-');
+    printf("%c ", (eflags & eFlags::CARRY_FLAG) ? 'C' : '-');
+    printf("%c ", (eflags & eFlags::PARITY_FLAG) ? 'P' : '-');
+    printf("%c ", (eflags & eFlags::AUXILIARY_FLAG) ? 'A' : '-');
+    printf("%c ", (eflags & eFlags::ZERO_FLAG) ? 'Z' : '-');
+    printf("%c ", (eflags & eFlags::SIGN_FLAG) ? 'S' : '-');
+    printf("%c ", (eflags & eFlags::TRAP_FLAG) ? 'T' : '-');
+    printf("%c ", (eflags & eFlags::INTERRUPT_FLAG) ? 'I' : '-');
+    printf("%c ", (eflags & eFlags::DIRECTION_FLAG) ? 'D' : '-');
+    printf("%c ", (eflags & eFlags::OVERFLOW_FLAG) ? 'O' : '-');
+    printf(" |  EXTRA: ");
+    printf("%c ", (eflags & eFlags::NESTED_TASK) ? 'N' : '-');
+    printf("%c ", (eflags & eFlags::RESUME_FLAG) ? 'R' : '-');
+    printf("%c ", (eflags & eFlags::VIRTUAL_8086) ? 'V' : '-');
+    printf("%c ", (eflags & eFlags::ALIGNMENT_CHECK) ? 'A' : '-');
+    printf("%c ", (eflags & eFlags::VIRTUAL_INTERRUPT) ? 'i' : '-');
+    printf("%c ", (eflags & eFlags::VIRTUAL_INTERRUPT_PENDING) ? 'p' : '-');
+    printf("%c\n", (eflags & eFlags::ID_FLAG) ? 'I' : '-');
+}
+
+bool AsmRunner::GetFlag(eFlags flag)
+{
+    uint32_t eflags = GetRegister(FlagsReg());
+    return (eflags & static_cast<uint32_t>(flag)) != 0;
+}
+
+void AsmRunner::SetFlag(eFlags flag, bool value)
+{
+    uint32_t eflags = GetRegister(FlagsReg());
+    if (value)
+        eflags |= static_cast<uint32_t>(flag);
+    else
+        eflags &= ~static_cast<uint32_t>(flag);
+    SetRegister(FlagsReg(), eflags);
 }
 
 void AsmRunner::DumpStack(intptr_t nCount, bool bValNotice)
