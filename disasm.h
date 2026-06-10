@@ -82,6 +82,8 @@ enum eBpType : uint32_t
 	BP_MEM_RW = 3   // чтение или запись
 };
 
+#define AR_SNAME ("AsmRunner")
+
 class AsmRunner // x86 x64 with macro
 {
 public:
@@ -270,8 +272,8 @@ public:
 	void DumpSegmentRegisters();
 	void DumpFlags();
 	void DumpStack(intptr_t nCount = -1, bool bValNotice = true);
-	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true);
-	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true);
+	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true);
+	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true);
 	void ClearRWHistory();
 	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
 	void InstallDefaultHooks();
@@ -556,7 +558,7 @@ private:
 	std::string RegName(uint32_t reg) const;
 	bool IsInModule(uintptr_t addr) const;
 	void TraceWriteLine(const std::string& s);
-	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisMnemonic& outMn);
+	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands, bool& bResOK);
 
 	// exports / PE helpers
 	static void TrimInPlace(std::string& s);

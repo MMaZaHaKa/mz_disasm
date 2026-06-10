@@ -501,7 +501,7 @@ bool AsmRunner::ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstr
                     if (m_bLogRunner)
                         Log("ResolveDirectBranchTarget: Failed to read %zu bytes from address 0x%p (ptrSize=%zu, op.size=%d)",
                             ptrSize, (void*)ea, ptrSize, op.size);
-                    MboxSTD("ResolveDirectBranchTarget: Error Read", "AsmRunner");
+                    MboxSTD("ResolveDirectBranchTarget: Error Read", AR_SNAME);
                 }
                 break;
             }
@@ -840,7 +840,7 @@ bool AsmRunner::ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstr
                         if (m_bLogRunner)
                             Log("ResolveDirectBranchTarget: Failed to read %zu bytes from address 0x%p (ptrSize=%zu, op.size=%d)",
                                 ptrSize, (void*)ea, ptrSize, op.size);
-                        MboxSTD("ResolveDirectBranchTarget: Error Read", "AsmRunner");
+                        MboxSTD("ResolveDirectBranchTarget: Error Read", AR_SNAME);
                     }
 
                     Log("[ResolveDirectBranchTarget] FAILED to read from memory at 0x%llx\n", (unsigned long long)ea);
@@ -1197,30 +1197,30 @@ bool AsmRunner::IsInModule(uintptr_t addr) const
     return (m_modStart != 0 && m_modEnd != 0 && addr >= m_modStart && addr < m_modEnd);
 }
 
-std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisMnemonic& outMn)
+std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands, bool& bResOK)
 {
 #ifdef ZYDIS
-    ZydisDecodedInstruction instr{};
-    //ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
-    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+    //ZydisDecodedInstruction instr{};
+    ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
+    //ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
 
-    outMn = ZYDIS_MNEMONIC_INVALID;
+    bResOK = false;
 
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
         bytes,
         static_cast<ZyanUSize>(size),
-        &instr,
+        instr,
         operands))) {
         return "???";
     }
 
-    outMn = instr.mnemonic;
+    bResOK = true;
 
     char buffer[256] = {};
     ZydisFormatterFormatInstruction(&m_formatter,
-        &instr,
+        instr,
         operands,
-        instr.operand_count_visible,
+        instr->operand_count_visible,
         buffer,
         sizeof(buffer),
         static_cast<ZyanU64>(runtimeAddress),
@@ -1229,18 +1229,18 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
     std::ostringstream oss;
     oss << buffer;
 
-    //if (instr.mnemonic == ZYDIS_MNEMONIC_CALL || instr.mnemonic == ZYDIS_MNEMONIC_JMP)
-    if (IsAnyIpTransfer(instr.mnemonic))
+    //if (instr->mnemonic == ZYDIS_MNEMONIC_CALL || instr->mnemonic == ZYDIS_MNEMONIC_JMP)
+    if (IsAnyIpTransfer(instr->mnemonic))
     {
         uintptr_t target = 0;
-        if (ResolveDirectBranchTarget(m_uc, instr, operands, runtimeAddress, target)) {
+        if (ResolveDirectBranchTarget(m_uc, *instr, operands, runtimeAddress, target)) {
             oss << " ; -> " << FormatRuntimeAddressWithSymbol(target);
         }
     }
 
     return oss.str();
 #else
-    outMn = 0;
+    bOK = false;
     (void)bytes;
     (void)size;
     (void)runtimeAddress;
@@ -1259,8 +1259,12 @@ void AsmRunner::DisassembleWithZydis()
         return;
     }
 
-    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
-    std::string s = MakeDisasmLine(bytes.data(), bytes.size(), pc, mnemonic);
+    ZydisDecodedInstruction instr{};
+    ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+    bool bDecodeOK = false;
+
+    std::string s = MakeDisasmLine(bytes.data(), bytes.size(), pc, &instr, operands, bDecodeOK);
     Log("[DISASM] 0x%p (%s): %s", (void*)(m_bDisasmRVA ? (pc - m_modStart + m_DisasmCustomASLR) : pc), FormatRuntimeAddressWithSymbol(pc).c_str(), s.c_str());
 }
 
@@ -1321,10 +1325,14 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
                 }
             }
 
-            ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+            ZydisDecodedInstruction instr{};
+            ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+            bool bDecodeOK = false;
+
             std::vector<uint8_t> bytes;
             bool readOk = ReadBytes(uc, address, size, bytes);
-            std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, mnemonic) : "[READ ERROR]";
+            std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, &instr, operands, bDecodeOK) : "[READ ERROR]";
             std::string curSym = FormatCurrentSymbolSuffix(curPc);
 
             std::ostringstream oss;
@@ -1332,7 +1340,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
                 oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
             else if (m_bDisasmRVA)
-                oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR) << " ( +0x" << (curPc - m_modStart) << ")";
+                oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(curPc) << " ( +0x" << (curPc - m_modStart) << ")";
             else
                 oss << "0x" << std::hex << std::uppercase << curPc;
             oss << ": " << disasm;
@@ -1394,12 +1402,19 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
-    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
-    std::vector<uint8_t> bytes;
-    bool readOk = ReadBytes(uc, address, size, bytes);
+    ZydisDecodedInstruction instr{};
+    ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+    bool bDecodeOK = false;
 
-    std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, mnemonic) : "[READ ERROR]";
+    std::vector<uint8_t> bytes;
+    bool bReadOk = ReadBytes(uc, address, size, bytes);
+
+    std::string disasm = bReadOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, &instr, operands, bDecodeOK) : "[READ ERROR]";
     std::string curSym = FormatCurrentSymbolSuffix(curPc);
+
+    if(!bReadOk || !bDecodeOK)
+        MboxSTD("Error 1 (OnInstructionStep)", AR_SNAME);
 
     if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
         uintptr_t outPc = curPc;
@@ -1431,7 +1446,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
             oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
         else if (m_bDisasmRVA)
-            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR) << " ( +0x" << (curPc - m_modStart) << ")";
+            oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(curPc) << " ( +0x" << (curPc - m_modStart) << ")";
         else
             oss << "0x" << std::hex << std::uppercase << curPc;
         oss << ": " << disasm;
@@ -1490,8 +1505,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     };
 
     // what about UC_HOOK_INTR?
-    if (m_cbSysCall && IsSysCallLike(mnemonic)) {
-        if (!m_cbSysCall(uc, curPc, size, mnemonic, m_cbSysCallData)) {
+    if (m_cbSysCall && IsSysCallLike(instr.mnemonic)) {
+        if (!m_cbSysCall(uc, curPc, size, instr.mnemonic, m_cbSysCallData)) {
             uc_emu_stop(uc);
             return;
         }
@@ -1505,7 +1520,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         if (n.nIC != m_instrCount || !n.cb)
             continue;
 
-        if (!n.cb(uc, curPc, size, mnemonic, n.data)) {
+        if (!n.cb(uc, curPc, size, instr.mnemonic, n.data)) {
             uc_emu_stop(uc);
             return;
         }
@@ -1516,7 +1531,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     }
 
     if (m_cbOpcode) {
-        if (!m_cbOpcode(uc, curPc, size, mnemonic, m_cbOpcodeData)) {
+        if (!m_cbOpcode(uc, curPc, size, instr.mnemonic, m_cbOpcodeData)) {
             uc_emu_stop(uc);
             return;
         }
@@ -1526,81 +1541,70 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
-#ifdef ZYDIS
-    if (readOk && bytes.size() >= 1) {
-        ZydisDecodedInstruction instr{};
-        //ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+//#if 1 // old, 3 jmp instr
+//        uintptr_t target = 0;
+//        bool hasTarget = false;
+//
+//        //if (instr.mnemonic == ZYDIS_MNEMONIC_CALL || instr.mnemonic == ZYDIS_MNEMONIC_JMP)
+//        if (IsAnyIpTransfer(instr.mnemonic))
+//        {
+//            hasTarget = ResolveDirectBranchTarget(instr, operands, curPc, target);
+//        }
+//        else if (instr.mnemonic == ZYDIS_MNEMONIC_RET) {
+//            uintptr_t sp = CurrentSp(uc);
+//            uintptr_t ret = 0;
+//            if (uc_mem_read(uc, sp, &ret, m_bX64 ? 8 : 4) == UC_ERR_OK) {
+//                if (!m_bX64)
+//                    ret = static_cast<uint32_t>(ret);
+//                target = ret;
+//                hasTarget = true;
+//            }
+//        }
+//
+//        if (hasTarget) {
+//            _OnAnyJmp(uc, curPc, target, size, instr.mnemonic);
+//            if (m_cbJmp) {
+//                if (!m_cbJmp(uc, curPc, target, size, instr.mnemonic, m_cbJmpData)) {
+//                    uc_emu_stop(uc);
+//                    return;
+//                }
+//            }
+//        }
+//#endif
 
-        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder, bytes.data(), static_cast<ZyanUSize>(bytes.size()), &instr, operands)))
-        {
-#if 0 // old, 3 jmp instr
-            uintptr_t target = 0;
-            bool hasTarget = false;
+    if (IsAnyIpTransfer(instr.mnemonic)) {
+        uintptr_t target = 0;
+        if (TryResolveIpTransfer(uc, instr, operands, curPc, target)) {
+            if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic))
+                return;
 
-            if (instr.mnemonic == ZYDIS_MNEMONIC_CALL || instr.mnemonic == ZYDIS_MNEMONIC_JMP) {
-                hasTarget = ResolveDirectBranchTarget(instr, operands, curPc, target);
+            if (m_bUpdatedPCInCB) {
+                m_bUpdatedPCInCB = false;
+                return; // prevent notice in cb with old pc opcode
             }
-            else if (instr.mnemonic == ZYDIS_MNEMONIC_RET) {
-                uintptr_t sp = CurrentSp(uc);
-                uintptr_t ret = 0;
-                if (uc_mem_read(uc, sp, &ret, m_bX64 ? 8 : 4) == UC_ERR_OK) {
-                    if (!m_bX64)
-                        ret = static_cast<uint32_t>(ret);
-                    target = ret;
-                    hasTarget = true;
-                }
-            }
-
-            if (hasTarget) {
-                _OnAnyJmp(uc, curPc, target, size, instr.mnemonic);
-                if (m_cbJmp) {
-                    if (!m_cbJmp(uc, curPc, target, size, instr.mnemonic, m_cbJmpData)) {
-                        uc_emu_stop(uc);
-                        return;
-                    }
-                }
-            }
-#endif
-
-            if (IsAnyIpTransfer(instr.mnemonic)) {
-                uintptr_t target = 0;
-                if (TryResolveIpTransfer(uc, instr, operands, curPc, target)) {
-                    if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic))
-                        return;
-
-                    if (m_bUpdatedPCInCB) {
-                        m_bUpdatedPCInCB = false;
-                        return; // prevent notice in cb with old pc opcode
-                    }
-                }
-                else {
-                    if (m_bLogRunner) {
-                        Log("[!] TryResolveIpTransfer failed: pc=0x%p mn=%u len=%u opcnt=%u",
-                            (void*)curPc, (unsigned)instr.mnemonic, (unsigned)instr.length,
-                            (unsigned)instr.operand_count_visible);
-                    }
-                    MboxSTD("Warn! transfer op TryResolveIpTransfer not resolved", "AsmRunner");
-                }
-            }         
-
-            //if (IsAnyIpTransfer(instr.mnemonic) && TryResolveIpTransfer(uc, instr, operands, curPc, target))
-            //{
-            //    _OnAnyJmp(uc, curPc, target, instr.mnemonic);
-
-            //    if (m_cbJmp) {
-            //        if (!m_cbJmp(uc, curPc, target, instr.mnemonic, m_cbJmpData)) {
-            //            uc_emu_stop(uc);
-            //            return;
-            //        }
-            //    }
-            //}
         }
         else {
-            Log("[Zydis] mn=%u len=%u opcnt=%u", instr.mnemonic, instr.length, instr.operand_count_visible);
+            if (m_bLogRunner) {
+                Log("[!] TryResolveIpTransfer failed: pc=0x%p mn=%u len=%u opcnt=%u",
+                    (void*)curPc, (unsigned)instr.mnemonic, (unsigned)instr.length,
+                    (unsigned)instr.operand_count_visible);
+            }
+            MboxSTD("Warn! transfer op TryResolveIpTransfer not resolved", AR_SNAME);
         }
     }
-#endif
+
+    //if (IsAnyIpTransfer(instr.mnemonic) && TryResolveIpTransfer(uc, instr, operands, curPc, target))
+    //{
+    //    _OnAnyJmp(uc, curPc, target, instr.mnemonic);
+
+    //    if (m_cbJmp) {
+    //        if (!m_cbJmp(uc, curPc, target, instr.mnemonic, m_cbJmpData)) {
+    //            uc_emu_stop(uc);
+    //            return;
+    //        }
+    //    }
+    //}
+
 
     if (m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
@@ -3334,7 +3338,7 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool call
         if (h.pAddr == pAddr) {
             if(m_bLogRunner)
                 Log("AnyJmpHook already exists for this address");
-            MboxSTD("AnyJmpHook already exists for this address", "AsmRunner");
+            MboxSTD("AnyJmpHook already exists for this address", AR_SNAME);
             return;
         }
     }
@@ -3344,7 +3348,7 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool call
     if (!callBefore) {
         if (!m_uc)
         {
-            MboxSTD("Error 1 SetAnyJmpHook (init uc)", "AsmRunner");
+            MboxSTD("Error 1 SetAnyJmpHook (init uc)", AR_SNAME);
             return;
         }
 
@@ -3356,7 +3360,7 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool call
 
         if (!ok)
         {
-            MboxSTD("Error 2 SetAnyJmpHook (map rwx page)", "AsmRunner");
+            MboxSTD("Error 2 SetAnyJmpHook (map rwx page)", AR_SNAME);
             return;
         }
 
@@ -3665,7 +3669,7 @@ void AsmRunner::SetICCallback(uintptr_t nIC, OnOpcodeCb opcode_cb, void* opcode_
         {
             if (m_bLogRunner)
                 Log("ICCallback already exists for this nIC");
-            MboxSTD("ICCallback already exists for this nIC", "AsmRunner");
+            MboxSTD("ICCallback already exists for this nIC", AR_SNAME);
             return;
         }
     }
@@ -4244,7 +4248,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             DumpRegisters();
             DumpFlags();
             DumpSegmentRegisters();
-            DumpStack(10);
+            DumpStack(50);
             SetConsoleColor(6);
         }
     }
@@ -4576,7 +4580,7 @@ void AsmRunner::DumpStack(intptr_t nCount, bool bValNotice)
     }
 }
 
-void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice)
+void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym)
 {
     if (m_RWHistory.empty())
     {
@@ -4675,9 +4679,19 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
         // h.value операнд истории, возможно указатель на стек или на память если читается
 
         std::ostringstream oss;
-        oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  "
-            << "PC 0x" << std::hex << std::uppercase << h.pc << ": "
-            << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
+        oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
+        if (bRVA)
+        {
+            if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
+            else if (m_bDisasmRVA)
+                oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
+            else
+                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+        }
+        else
+            oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+        oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
         if(pVIatNode || isStackValueAddr || bIsMemPtr)
             oss << " value " << PrintHexOnly(h.value);
         else
@@ -4714,6 +4728,13 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
             else {
                 //oss << " <- data"; // и так лог памяти, по умолчанию data
             }
+
+            // символ pc
+            if (bSym && IsSymMapInitialised()) {
+                std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
+                if(!sAddr.empty())
+                    oss << " (PC " << sAddr << ")";
+            }
         }
 
 #ifdef _WIN32
@@ -4738,7 +4759,7 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
     resetColor();
 }
 
-void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice)
+void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym)
 {
     if (m_RWHistory.empty())
     {
@@ -4827,9 +4848,19 @@ void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bS
         // h.value операнд истории, возможно указатель на стек или на память если читается
 
         std::ostringstream oss;
-        oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  "
-            << "PC 0x" << std::hex << std::uppercase << h.pc << ": "
-            << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
+        oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
+        if (bRVA)
+        {
+            if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
+            else if (m_bDisasmRVA)
+                oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
+            else
+                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+        }
+        else
+            oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+        oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
         if (pVIatNode || isStackValueAddr || bIsMemPtr)
             oss << " value " << PrintHexOnly(h.value);
         else
@@ -4865,6 +4896,13 @@ void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bS
             }
             else {
                 //oss << " <- data"; // и так лог памяти, по умолчанию data
+            }
+
+            // символ pc
+            if (bSym && IsSymMapInitialised()) {
+                std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
+                if (!sAddr.empty())
+                    oss << " (PC " << sAddr << ")";
             }
         }
 
@@ -6506,6 +6544,7 @@ void __cdecl VMENTRY_UT_HK(void* lpParameter)
 
             self->SetRWHistory(true);
             self->DumpRWHistory();
+            //self->DumpRWHistory(0, false, true, true, true, true, true);
             self->SetDisasmAfterCB(false);
             self->SendIDAAddr(self->CalcWithCASLR(address));
             self->DumpRegisters();
