@@ -4444,6 +4444,11 @@ void AsmRunner::DumpFlags()
     flag_desc(eFlags::VIRTUAL_INTERRUPT_PENDING, "VIP (Virtual Interrupt Pending)", "Virtual interrupt pending", "No virtual interrupt pending");
     flag_desc(eFlags::ID_FLAG,  "ID (ID Flag)", "CPUID supported", "CPUID not supported");
 
+    uint32_t iopl = ((eflags & eFlags::IOPL_FLAG) >> 12);
+    printf("%-4s %-32s %s\n", "---", "----", "------");
+    const char* iopl_desc[] = { "Level 0 (Ring 0)", "Level 1", "Level 2", "Level 3 (Ring 3)" };
+    printf("IOPL (I/O Privilege Level): %u - %s\n", iopl, iopl_desc[iopl]);
+
     printf("[FLAGS] ");
     printf("%c ", (eflags & eFlags::CARRY_FLAG) ? 'C' : '-');
     printf("%c ", (eflags & eFlags::PARITY_FLAG) ? 'P' : '-');

@@ -70,7 +70,7 @@ enum eFlags : uint32_t
 	INTERRUPT_FLAG            = BIT(9),  // IF - Interrupt Enable Flag
 	DIRECTION_FLAG            = BIT(10), // DF - Direction Flag
 	OVERFLOW_FLAG             = BIT(11), // OF - Overflow Flag
-	// 12, 13 IOPL
+	IOPL_FLAG                 = BIT(12) | BIT(13), // IOPL - I/O Privilege Level
 	NESTED_TASK               = BIT(14), // NT - Nested Task
 	BIT_15_RESERVED           = BIT(15), // Reserved
 	RESUME_FLAG               = BIT(16), // RF - Resume Flag
