@@ -1240,7 +1240,7 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
 
     return oss.str();
 #else
-    bOK = false;
+    bResOK = false;
     (void)bytes;
     (void)size;
     (void)runtimeAddress;
