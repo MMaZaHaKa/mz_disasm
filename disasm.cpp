@@ -1032,7 +1032,7 @@ void AsmRunner::Shutdown()
     m_iat.clear();
     exportsENV.clear();
     m_bInitIAT = false;
-    m_bUpdatedPCInCB = false;
+    m_bSkipCBCallsWithNewPC = false;
     m_iatStart = 0;
     m_iatEnd = 0;
     m_cbIATCall = nullptr;
@@ -1303,10 +1303,10 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if (!m_bX64)
         curPc = static_cast<uint32_t>(curPc);
 
-    // TODO: usage IsPCNormal?
     auto IsAllowedPc = [&](uintptr_t pc) -> bool
-    {
-        return IsModuleAddr(pc) || InExtraRegion(pc); // || IsRetHaltOrNull(pc); // if allow halt we exec 0x0
+    {   
+        return IsPCNormal(pc);
+        //return !IsHaltAddr(pc) && (IsModuleAddr(pc) || InExtraRegion(pc)); // if allow halt we exec 0x0
     };
 
     tDeadzoneIC* dz = GetCurrentDeadzoneIC();
@@ -1316,7 +1316,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         if (dz->checkPC && m_modStart != 0 && m_modEnd != 0) {
             uintptr_t pc = CurrentPc(uc);
             if (!IsAllowedPc(pc)) {
-                if (m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
+                if (m_bLogRunner && !IsHaltAddr(pc)) // no log halt as out of bounds
                     Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
                 uc_emu_stop(uc);
                 return;
@@ -1329,7 +1329,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             if (m_modStart != 0 && m_modEnd != 0) {
                 uintptr_t pc = CurrentPc(uc); // curPc и CurrentPc(uc) совпадают, пока колбэк не меняет PC
                 if (!IsAllowedPc(pc)) {
-                    if (m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
+                    if (m_bLogRunner && !IsHaltAddr(pc)) // no log halt as out of bounds
                         Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
                     uc_emu_stop(uc);
                     return;
@@ -1397,8 +1397,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             uc_emu_stop(uc);
             return;
         }
-        if (m_bUpdatedPCInCB) {
-            m_bUpdatedPCInCB = false;
+        if (ShouldStopCB(true)) {
             return; // prevent notice in cb with old pc opcode
         }
     }
@@ -1406,7 +1405,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if (m_modStart != 0 && m_modEnd != 0) {
         uintptr_t pc = CurrentPc(uc);
         if (!IsAllowedPc(pc)) {
-            if(m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
+            if(m_bLogRunner && !IsHaltAddr(pc)) // no log halt as out of bounds
                 Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
             uc_emu_stop(uc);
             return;
@@ -1454,6 +1453,10 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if (!m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
+        if(m_bDisasmAfterCB)
+            oss << "AFCB ";
+        else
+            oss << "BFCB "; // -
         if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
             oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
         else if (m_bDisasmRVA)
@@ -1521,8 +1524,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             uc_emu_stop(uc);
             return;
         }
-        if (m_bUpdatedPCInCB) {
-            m_bUpdatedPCInCB = false;
+        if (ShouldStopCB(true)) {
             return; // prevent notice in cb with old pc opcode
         }
     }
@@ -1535,8 +1537,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             uc_emu_stop(uc);
             return;
         }
-        if (m_bUpdatedPCInCB) {
-            m_bUpdatedPCInCB = false;
+        if (ShouldStopCB(true)) {
             return; // prevent notice in cb with old pc opcode
         }
     }
@@ -1546,8 +1547,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             uc_emu_stop(uc);
             return;
         }
-        if (m_bUpdatedPCInCB) {
-            m_bUpdatedPCInCB = false;
+        if (ShouldStopCB(true)) {
             return; // prevent notice in cb with old pc opcode
         }
     }
@@ -1585,12 +1585,26 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
     if (IsAnyIpTransfer(instr.mnemonic)) {
         uintptr_t target = 0;
-        if (TryResolveIpTransfer(uc, instr, operands, curPc, target)) {
+        if (TryResolveIpTransfer(uc, instr, operands, curPc, target))
+        {
+#ifndef AR_HALT_JMPCB
+            if (IsHaltAddr(target)) { // skip jmp cb to halt
+                uc_emu_stop(uc);
+                return;
+            }
+#endif
+
             if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic))
                 return;
 
-            if (m_bUpdatedPCInCB) {
-                m_bUpdatedPCInCB = false;
+#ifdef AR_HALT_JMPCB
+            if (IsHaltAddr(target)) { // skip jmp cb to halt
+                uc_emu_stop(uc);
+                return;
+            }
+#endif
+
+            if (ShouldStopCB(true)) {
                 return; // prevent notice in cb with old pc opcode
             }
         }
@@ -1604,22 +1618,13 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
-    //if (IsAnyIpTransfer(instr.mnemonic) && TryResolveIpTransfer(uc, instr, operands, curPc, target))
-    //{
-    //    _OnAnyJmp(uc, curPc, target, instr.mnemonic);
-
-    //    if (m_cbJmp) {
-    //        if (!m_cbJmp(uc, curPc, target, instr.mnemonic, m_cbJmpData)) {
-    //            uc_emu_stop(uc);
-    //            return;
-    //        }
-    //    }
-    //}
-
-
-    if (m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
+    if (m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
+        if (m_bDisasmAfterCB)
+            oss << "AFCB "; // -
+        else
+            oss << "BFCB ";
         if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
             oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
         else if (m_bDisasmRVA)
@@ -1646,7 +1651,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
     uintptr_t pcAfter = CurrentPc(uc);
     if (m_modStart != 0 && m_modEnd != 0 && !IsAllowedPc(pcAfter)) {
-        if (m_bLogRunner && !IsRetHaltOrNull(pcAfter))
+        if (m_bLogRunner && !IsHaltAddr(pcAfter))
             Log("[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pcAfter, (void*)m_modStart, (void*)m_modEnd);
         uc_emu_stop(uc);
     }
@@ -1727,8 +1732,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
                     uc_emu_stop(uc);
                     return false;
                 }
-                if (m_bUpdatedPCInCB) {
-                    m_bUpdatedPCInCB = false;
+                if (ShouldStopCB(true)) {
                     return true;
                 }
             }
@@ -1737,8 +1741,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
                     uc_emu_stop(uc);
                     return false;
                 }
-                if (m_bUpdatedPCInCB) {
-                    m_bUpdatedPCInCB = false;
+                if (ShouldStopCB(true)) {
                     return true;
                 }
             }
@@ -1795,8 +1798,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
             return false;
         }
 
-        if (m_bUpdatedPCInCB) {
-            m_bUpdatedPCInCB = false;
+        if (ShouldStopCB(true)) {
             return true;
         }
     }
@@ -1833,13 +1835,12 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
             }
             else
             {
-                if (!h.cb(uc, from, to, size, mnemonic, h.data))
-                {
+                if (!h.cb(uc, from, to, size, mnemonic, h.data)) {
                     uc_emu_stop(uc);
                     return false;
                 }
 
-                if (m_bUpdatedPCInCB) // clear in call side
+                if (ShouldStopCB(false)) // clear in call side
                     return true; // prevent notice in cb with old pc opcode
             }
         }
@@ -1851,13 +1852,12 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
         {
             if (n.moduleBase && n.funcRva && (n.moduleBase + n.funcRva) == to)
             {
-                if (!m_cbIATCall(uc, to, 0, mnemonic, m_cbIATCallData))
-                {
+                if (!m_cbIATCall(uc, to, 0, mnemonic, m_cbIATCallData)) {
                     uc_emu_stop(uc);
                     return false;
                 }
 
-                if (m_bUpdatedPCInCB) // clear in call side
+                if (ShouldStopCB(false)) // clear in call side
                     return true; // prevent notice in cb with old pc opcode
             }
         }
@@ -1865,13 +1865,12 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
 
     if (m_cbJmp)
     {
-        if (!m_cbJmp(uc, from, to, size, mnemonic, m_cbJmpData))
-        {
+        if (!m_cbJmp(uc, from, to, size, mnemonic, m_cbJmpData)) {
             uc_emu_stop(uc);
             return false;
         }
 
-        if (m_bUpdatedPCInCB) // clear in call side
+        if (ShouldStopCB(false)) // clear in call side
             return true; // prevent notice in cb with old pc opcode
     }
 
@@ -2696,7 +2695,7 @@ bool AsmRunner::AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSi
     return bRes;
 }
 
-void AsmRunner::_CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
+void AsmRunner::CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
 {
     if (!m_uc || !pVTo || !pFrom || !nSize) return;
     uc_mem_write(m_uc, pVTo, reinterpret_cast<void*>(pFrom), nSize);
@@ -2779,7 +2778,7 @@ bool AsmRunner::IsModuleAddr(uintptr_t pAddr)
     return IsInAddr(pAddr, m_modStart, m_modEnd);
 }
 
-bool AsmRunner::IsRetHaltOrNull(uintptr_t pAddr)
+bool AsmRunner::IsHaltAddr(uintptr_t pAddr)
 {
     return pAddr == m_halt;
 }
@@ -2794,9 +2793,9 @@ bool AsmRunner::InExtraRegion(uintptr_t pAddr)
     return false;
 }
 
-bool AsmRunner::IsPCNormal(uintptr_t pc)
+bool AsmRunner::IsPCNormal(uintptr_t pc, bool bSkipHalt)
 {
-    if (IsRetHaltOrNull(pc))
+    if (!bSkipHalt && IsHaltAddr(pc))
         return false;
 
     if (IsModuleAddr(pc) || InExtraRegion(pc))
@@ -2806,6 +2805,44 @@ bool AsmRunner::IsPCNormal(uintptr_t pc)
     {
         if (h.pAddr == pc)
             return true;
+    }
+
+    return false;
+}
+
+void AsmRunner::UpdatePC(uintptr_t pAddr, bool bSkipCBCallsWithNewPC)
+{
+    if (IsHaltAddr(pAddr)) {
+        if (m_bLogRunner)
+            Log("[!] UpdatePC Set HALT Addr 0x%p! Shutdown", (void*)pAddr);
+        Shutdown();
+        return;
+    }
+
+    SetRegister(PcReg(), pAddr);
+    SetSkipCBCallsWithNewPC(bSkipCBCallsWithNewPC);
+}
+
+void AsmRunner::CapturePC()
+{
+    m_lastPC = CurrentPc(m_uc);
+}
+
+bool AsmRunner::IsPCChanged()
+{
+    uintptr_t currentPC = CurrentPc(m_uc);
+    return (currentPC != m_lastPC);
+}
+
+bool AsmRunner::ShouldStopCB(bool bReset)
+{
+    //if (IsPCChanged())
+    //    return true;
+
+    if (m_bSkipCBCallsWithNewPC) {
+        if(bReset)
+            m_bSkipCBCallsWithNewPC = false;
+        return true; // prevent notice in cb with old pc opcode
     }
 
     return false;
@@ -3023,23 +3060,128 @@ uintptr_t AsmRunner::StackPeek(uint32_t nIdx)
     return v;
 }
 
-void AsmRunner::SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg)
+bool AsmRunner::StackPeekBP(uintptr_t& v, int32_t nIdx)
 {
-    if (!m_uc) return;
-    uintptr_t sp = CurrentSp(m_uc);
-    uintptr_t ptrSize = m_bX64 ? 8 : 4;
-    uintptr_t slot = sp + ptrSize * (static_cast<uintptr_t>(nArgIdx) + 1);
-    uc_mem_write(m_uc, slot, &arg, ptrSize);
+    if (!m_uc || !m_bInitedStack)
+        return false;
+
+    uintptr_t bp = GetRegister(FpReg());
+    const uintptr_t ptrSize = PointerSize();
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    intptr_t addr = static_cast<intptr_t>(bp) + static_cast<intptr_t>(nIdx) * static_cast<intptr_t>(ptrSize);
+    if (addr < 0)
+        return false;
+
+    uintptr_t uaddr = static_cast<uintptr_t>(addr);
+    if ((uaddr + ptrSize) > stackHigh)
+        return false;
+
+    v = 0;
+    if (uc_mem_read(m_uc, uaddr, &v, ptrSize) != UC_ERR_OK)
+        return false;
+
+    if (!m_bX64)
+        v = static_cast<uint32_t>(v);
+
+    return true;
 }
 
-void AsmRunner::SetStackArgEbpIndex(uint32_t nIdx, uintptr_t arg)
+uintptr_t AsmRunner::StackPeekBP(int32_t nIdx)
 {
-    if (!m_uc) return;
-    uintptr_t fp = 0;
-    uc_reg_read(m_uc, FpReg(), &fp);
-    uintptr_t ptrSize = m_bX64 ? 8 : 4;
-    uintptr_t slot = fp + ptrSize * (static_cast<uintptr_t>(nIdx) + 1);
-    uc_mem_write(m_uc, slot, &arg, ptrSize);
+    uintptr_t v = 0;
+    if (!StackPeekBP(v, nIdx))
+        return 0;
+    return v;
+}
+
+uintptr_t AsmRunner::StackAt(bool bEsp, int32_t nIdx)
+{
+    if (!m_uc || !m_bInitedStack)
+        return 0;
+
+    uintptr_t base = bEsp ? CurrentSp(m_uc) : GetRegister(FpReg());
+    uintptr_t ptrSize = PointerSize();
+    uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    intptr_t addr = static_cast<intptr_t>(base) + static_cast<intptr_t>(nIdx) * static_cast<intptr_t>(ptrSize);
+    if (addr < 0)
+        return 0;
+
+    uintptr_t uaddr = static_cast<uintptr_t>(addr);
+    if ((uaddr + ptrSize) > stackHigh)
+        return 0;
+
+    return uaddr;
+}
+
+bool AsmRunner::StackSetValue(uintptr_t v, bool bEsp, int32_t nIdx)
+{
+    if (!m_uc || !m_bInitedStack)
+        return false;
+
+    const uintptr_t addr = StackAt(bEsp, nIdx);
+    if (addr == 0)
+        return false;
+
+    const uintptr_t ptrSize = PointerSize();
+    if (!m_bX64)
+        v = static_cast<uint32_t>(v);
+
+    return uc_mem_write(m_uc, addr, &v, ptrSize) == UC_ERR_OK;
+}
+
+bool AsmRunner::StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl)
+{
+    v = 0;
+
+    if (!m_uc || !m_bInitedStack)
+        return false;
+
+    if (IsX64())
+    {
+        ///old// x64 calling convention (fastcall)
+        // x64 Windows calling convention:
+        // RCX, RDX, R8, R9, then stack arguments after shadow space.
+        switch (idx)
+        {
+            case 0: v = GetRegister(UC_X86_REG_RCX); return true;
+            case 1: v = GetRegister(UC_X86_REG_RDX); return true;
+            case 2: v = GetRegister(UC_X86_REG_R8);  return true;
+            case 3: v = GetRegister(UC_X86_REG_R9);  return true;
+            default:
+            {
+                uintptr_t sp = CurrentSp(m_uc);
+
+                // после pop retaddr: [rsp] = shadow space, стек-аргументы начинаются с [rsp + 0x20]
+                uintptr_t addr = sp + 0x20 + static_cast<uintptr_t>(idx - 4) * 8;
+
+                uint64_t v64 = 0;
+                if (uc_mem_read(m_uc, addr, &v64, 8) != UC_ERR_OK)
+                    return false;
+
+                v = static_cast<uintptr_t>(v64);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // x86 stdcall (args on stack) // LIFO
+    if (bShouldPopArgs_NoCdecl)
+        return StackPop(v); // stdcall, my func must clean args in ret 4(N arg stack bytes); // sp+=N
+
+    return StackPeek(v, idx); // cdecl, my func not clear args
+}
+
+void AsmRunner::SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg)
+{
+    StackSetValue(arg, true, static_cast<int32_t>(nArgIdx) + 1);
+}
+
+void AsmRunner::SetStackArgEbpIndex(uint32_t nArgIdx, uintptr_t arg)
+{
+    StackSetValue(arg, false, static_cast<int32_t>(nArgIdx) + 1);
 }
 
 #if 1 // temp hack avoid fakin skip write UC_X86_REG_FS_BASE in SetTebBase
@@ -3377,7 +3519,7 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool call
         }
 
         const uint8_t nop = 0x90;
-        _CopyMemory(pAddr, reinterpret_cast<uintptr_t>(&nop), 1);
+        CopyMemory(pAddr, reinterpret_cast<uintptr_t>(&nop), 1);
     }
 }
 
@@ -4286,7 +4428,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 
     m_bPaused = false;
     m_bStopped = false;
-    m_bUpdatedPCInCB = false;
+    m_bSkipCBCallsWithNewPC = false;
 
     if (m_bLogRunner) {
         Log("[*] Entry = 0x%p", (void*)pc);
@@ -5074,7 +5216,7 @@ void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, 
         Log("[*] DeadzoneIC added: %llu - %llu (skipAll=%d)", startIC, endIC, skipAll);
 }
 
-// TODO: others + log hook call
+// TODO: others ntdll, ws
 void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 {
     const bool bBefore = false;
@@ -5101,6 +5243,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             //   DWORD flAllocationType,   // x86: [ESP+12], x64: R8
             //   DWORD flProtect           // x86: [ESP+16], x64: R9
             // );
+            const bool bShouldPopArgs_NoCdecl = true; // true=stdcall pop like, false=cdecl peek
 
             uintptr_t lpAddress = 0;
             uintptr_t dwSize = 0;
@@ -5114,22 +5257,10 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
                 return false;
             }
 
-            if (self->IsX64())
-            {
-                // x64 calling convention (fastcall)
-                lpAddress = self->GetRegister(UC_X86_REG_RCX);
-                dwSize = self->GetRegister(UC_X86_REG_RDX);
-                flAllocationType = self->GetRegister(UC_X86_REG_R8);
-                flProtect = self->GetRegister(UC_X86_REG_R9);
-            }
-            else
-            {
-                // x86 stdcall (args on stack) // LIFO
-                if (!self->StackPop(lpAddress))			return false;
-                if (!self->StackPop(dwSize))			return false;
-                if (!self->StackPop(flAllocationType))  return false;
-                if (!self->StackPop(flProtect))			return false;
-            }
+            if (!self->StackGetArg(lpAddress, 0, bShouldPopArgs_NoCdecl))        return false;
+            if (!self->StackGetArg(dwSize, 1, bShouldPopArgs_NoCdecl))           return false;
+            if (!self->StackGetArg(flAllocationType, 2, bShouldPopArgs_NoCdecl)) return false;
+            if (!self->StackGetArg(flProtect, 3, bShouldPopArgs_NoCdecl))        return false;
 
             printf("[VirtualAlloc] lpAddress=0x%p dwSize=0x%p flAllocationType=0x%p flProtect=0x%p ret=0x%p\n",
                 (void*)lpAddress, (void*)dwSize, (void*)flAllocationType, (void*)flProtect, (void*)retaddr);
@@ -5145,8 +5276,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
                 {
                     printf("[VirtualAlloc] AddMemory failed for size 0x%p\n", (void*)dwSize);
                     self->SetRegister(self->AxReg(), 0);
-                    self->SetRegister(self->PcReg(), retaddr);
-                    self->SetUpdatedPC(true);
+                    self->UpdatePC(retaddr, true);
                     return true;
                 }
 
@@ -5160,8 +5290,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             }
 
             self->SetRegister(self->AxReg(), allocated);
-            self->SetRegister(self->PcReg(), retaddr);
-            self->SetUpdatedPC(true);
+            self->UpdatePC(retaddr, true);
 
             return true;
         }, this, bBefore);
@@ -5182,6 +5311,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             //   SIZE_T dwSize,      // x86: [ESP+8], x64: RDX  
             //   DWORD dwFreeType    // x86: [ESP+12], x64: R8
             // );
+            const bool bShouldPopArgs_NoCdecl = true; // true=stdcall pop like, false=cdecl peek
 
             uintptr_t lpAddress = 0;
             uintptr_t dwSize = 0;
@@ -5194,18 +5324,9 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
                 return false;
             }
 
-            if (self->IsX64())
-            {
-                lpAddress = self->GetRegister(UC_X86_REG_RCX);
-                dwSize = self->GetRegister(UC_X86_REG_RDX);
-                dwFreeType = self->GetRegister(UC_X86_REG_R8);
-            }
-            else
-            {
-                if (!self->StackPop(lpAddress)) return false;
-                if (!self->StackPop(dwSize)) return false;
-                if (!self->StackPop(dwFreeType)) return false;
-            }
+            if (!self->StackGetArg(lpAddress, 0, bShouldPopArgs_NoCdecl))     return false;
+            if (!self->StackGetArg(dwSize, 1, bShouldPopArgs_NoCdecl))        return false;
+            if (!self->StackGetArg(dwFreeType, 2, bShouldPopArgs_NoCdecl))    return false;
 
             printf("[VirtualFree] lpAddress=0x%p dwSize=0x%p dwFreeType=0x%p ret=0x%p\n", (void*)lpAddress, (void*)dwSize, (void*)dwFreeType, (void*)retaddr);
 
@@ -5221,8 +5342,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             }
 
             self->SetRegister(self->AxReg(), result);
-            self->SetRegister(self->PcReg(), retaddr);
-            self->SetUpdatedPC(true);
+            self->UpdatePC(retaddr, true);
 
             return true;
         }, this, bBefore);
@@ -5237,6 +5357,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
                 return true;
 
             //printf("[hook] GetSystemTimeAsFileTime hit: from=0x%p to=0x%p\n", (void*)from, (void*)to);
+            const bool bShouldPopArgs_NoCdecl = true; // true=stdcall pop like, false=cdecl peek
 
             uintptr_t lpSystemTimeAsFileTime = 0;
             uintptr_t retaddr = 0;
@@ -5247,10 +5368,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
                 return false;
             }
 
-            if (self->IsX64())
-                lpSystemTimeAsFileTime = self->GetRegister(UC_X86_REG_RCX);
-            else
-                if (!self->StackPop(lpSystemTimeAsFileTime)) return false;
+            if (!self->StackGetArg(lpSystemTimeAsFileTime, 0, bShouldPopArgs_NoCdecl)) return false;
 
             printf("[GetSystemTimeAsFileTime] lpSystemTimeAsFileTime=0x%p\n", (void*)lpSystemTimeAsFileTime);
 
@@ -5276,15 +5394,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             printf("[GetSystemTimeAsFileTime] result: 0x%08X%08X\n", ft.dwHighDateTime, ft.dwLowDateTime);
 
             if (lpSystemTimeAsFileTime)
-                self->_CopyMemory(lpSystemTimeAsFileTime, (uintptr_t)&ft, sizeof(FILETIME));
+                self->CopyMemory(lpSystemTimeAsFileTime, (uintptr_t)&ft, sizeof(FILETIME));
 
-            self->SetRegister(self->PcReg(), retaddr);
-            self->SetUpdatedPC(true);
+            self->UpdatePC(retaddr, true);
 
             return true;
         }, this, bBefore);
 
-    SetAnyJmpHook(FindIATNode("Sleep", "kernel32.dll")->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("Sleep", szModule)->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
             cb(FindIATNode("Sleep", szModule));
@@ -5296,6 +5413,8 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
 
+            const bool bShouldPopArgs_NoCdecl = true; // true=stdcall pop like, false=cdecl peek
+
             // Получаем аргументы
             uintptr_t dwMilliseconds = 0;
             uintptr_t retaddr = 0;
@@ -5306,20 +5425,44 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
                 return false;
             }
 
-            if (self->IsX64())
-            {
-                dwMilliseconds = self->GetRegister(UC_X86_REG_RCX);
-            }
-            else
-            {
-                if (!self->StackPop(dwMilliseconds)) return false;
-            }
+            if (!self->StackGetArg(dwMilliseconds, 0, bShouldPopArgs_NoCdecl)) return false;
 
             printf("[Sleep] dwMilliseconds=0x%X\n", dwMilliseconds);
 
-            // Устанавливаем возврат (функция void, ничего не возвращает)
-            self->SetRegister(self->PcReg(), retaddr);
-            self->SetUpdatedPC(true);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore);
+
+    SetAnyJmpHook(FindIATNode("GetCurrentThreadId", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            cb(FindIATNode("GetCurrentThreadId", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
+                (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+
+            // Получаем аргументы
+            uintptr_t retaddr = 0;
+            if (bBefore) {
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            }
+            else if (!self->StackPop(retaddr)) {
+                return false;
+            }
+
+#if 0
+            uintptr_t tid = 0;
+#else
+            uintptr_t tid = static_cast<uintptr_t>(GetCurrentThreadId());
+#endif
+
+            self->SetRegister(self->AxReg(), tid);
+            self->UpdatePC(retaddr, true);
 
             return true;
         }, this, bBefore);
@@ -6809,7 +6952,7 @@ void VMTEST(int a1)
             if (self->IsNTMemoryReadable(address, size))
             { // custom // themida read correct crc // 0x4F238ED8
                 //self->CompareRegionsSnapshots(regionsBF, regionsAF);
-                self->_CopyMemory(address, address, size); // maping equal in native proc // докопирую данные в которые оно лезет, где то зашит регион в vmctx
+                self->CopyMemory(address, address, size); // maping equal in native proc // докопирую данные в которые оно лезет, где то зашит регион в vmctx
                 self->DumpMemory(address, size); // uc copy result view
                 MboxSTD("custom wait", "MemCb");
             }
@@ -6899,7 +7042,7 @@ void VMTEST(int a1)
     //		printf("[memcpy] dst=0x%p src=0x%p n=0x%p ret=0x%p", (void*)dst, (void*)src, (void*)n, (void*)retaddr);
 
     //		if (n != 0)
-    //			self->_CopyMemory(dst, src, n);
+    //			self->CopyMemory(dst, src, n);
 
     //		self->SetRegister(self->AxReg(), dst);
     //		self->SetRegister(self->PcReg(), retaddr);
@@ -7127,7 +7270,7 @@ void VMTEST(int a1)
 
             // Записываем результат обратно в память эмулятора
             if (lpSystemTimeAsFileTime)
-                self->_CopyMemory(lpSystemTimeAsFileTime, (uintptr_t)&ft, sizeof(FILETIME));
+                self->CopyMemory(lpSystemTimeAsFileTime, (uintptr_t)&ft, sizeof(FILETIME));
 
             // Устанавливаем возврат (функция void, ничего не возвращает)
             self->SetRegister(self->PcReg(), retaddr);
@@ -7226,7 +7369,7 @@ void VMTEST(int a1)
     //	char* buf = (char*)runner.DumpMemoryNTAlloc((uintptr_t)pEntry, 0x1000);
     //	buf[0] = 0xCC;
     //	buf[100] = 0xCC;
-    //	runner._CopyMemory((uintptr_t)pEntry, (uintptr_t)buf, 0x1000);
+    //	runner.CopyMemory((uintptr_t)pEntry, (uintptr_t)buf, 0x1000);
     //	free(buf);
     //	auto s2 = runner.MakeSnapshotS((uintptr_t)pEntry, 0x1000);
     //	runner.CompareSnapshots(s1, s2);

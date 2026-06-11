@@ -15,11 +15,18 @@
 #include <Zydis/Zydis.h>
 #endif
 
+#define AR_SNAME ("AsmRunner")
 //#define AR_SYSCALL_JUMP_CB
 //#define AR_DEBUG
 #define AR_IDA_WS
+//#define AR_HALT_JMPCB // allow jmp cb notify jmp to halt
+
+#ifdef CopyMemory
+#undef CopyMemory
+#endif
 
 // TODO: normal seh, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb, cb UC_HOOK_INSN, UC_HOOK_INTR, cb on register change?, trace deadzone?
+// UC bugs: 1 can't set fs: but res ok, 2 update pc + emu_stop() can't stop emu
 
 #include <vector>
 #include <map>
@@ -115,7 +122,6 @@ enum eBpType : uint32_t
 	BP_MEM_RW = 3   // чтение или запись
 };
 
-#define AR_SNAME ("AsmRunner")
 
 class AsmRunner // x86 x64 with macro
 {
@@ -161,8 +167,8 @@ public:
 	bool IsLogRunner() const { return m_bLogRunner; }
 	void SetX64(bool isX64) { m_bX64 = isX64; }
 	bool IsX64() const { return m_bX64; }
-	void SetUpdatedPC(bool bUpdatedPCInCB) { m_bUpdatedPCInCB = bUpdatedPCInCB; }
-	bool IsUpdatedPC() const { return m_bUpdatedPCInCB; }
+	void SetSkipCBCallsWithNewPC(bool bSkipCBCallsWithNewPC) { m_bSkipCBCallsWithNewPC = bSkipCBCallsWithNewPC; }
+	bool IsSkipCBCallsWithNewPC() const { return m_bSkipCBCallsWithNewPC; }
 	void SetRWHistory(bool enabled) { m_bRWHistory = enabled; }
 	bool IsRWHistory() const { return m_bRWHistory; }
 	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
@@ -218,7 +224,7 @@ public:
 	uintptr_t AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/);
 	bool AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
 	bool AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
-	void _CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
+	void CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
 	bool FreeMemory(uintptr_t pVTo);
 	bool ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
@@ -227,9 +233,13 @@ public:
 	uintptr_t DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize);
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
 	bool IsModuleAddr(uintptr_t pAddr);
-	bool IsRetHaltOrNull(uintptr_t pAddr);
+	bool IsHaltAddr(uintptr_t pAddr);
 	bool InExtraRegion(uintptr_t pAddr);
-	bool IsPCNormal(uintptr_t pAddr);
+	bool IsPCNormal(uintptr_t pAddr, bool bSkipHalt = false);
+	void UpdatePC(uintptr_t pAddr, bool bSkipCBCallsWithNewPC = true); // false - вызвать все cb для hook уже с изменённым pc
+	void CapturePC();
+	bool IsPCChanged();
+	bool ShouldStopCB(bool bReset);
 	static bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
 
 	// asm / registers / stack
@@ -256,7 +266,7 @@ public:
 	uintptr_t CurrentSp(uc_engine* uc) const;
 
 	void SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg); // bLogRunner log st ptr // default // 0=ebp+4?
-	void SetStackArgEbpIndex(uint32_t nIdx, uintptr_t arg); // ebp+4 +8 +C ...  // bLogRunner log st ptr // custom stack arg // 4=ebpdefault 0arg?
+	void SetStackArgEbpIndex(uint32_t nArgIdx, uintptr_t arg); // ebp+4 +8 +C ...  // bLogRunner log st ptr // custom stack arg // 4=ebpdefault 0arg?
 	void SetRegister(uint32_t nRegister, uintptr_t arg); // todo unicorn types?
 	uintptr_t GetRegister(uint32_t nRegister);
 	void SetStack(uintptr_t pStack, uintptr_t nSize); // if bLogRunner log stack
@@ -268,6 +278,11 @@ public:
 	uintptr_t StackPop();
 	bool StackPeek(uintptr_t& v, uint32_t nIdx = 0);
 	uintptr_t StackPeek(uint32_t nIdx = 0);
+	bool StackPeekBP(uintptr_t& v, int32_t nIdx = 0); // warn!! before prologue ebp from prev frame!
+	uintptr_t StackPeekBP(int32_t nIdx = 0);
+	uintptr_t StackAt(bool bEsp = true, int32_t nIdx = 0);
+	bool StackSetValue(uintptr_t v, bool bEsp = true, int32_t nIdx = 0);
+	bool StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl); // true=stdcall pop like, false=cdecl peek
 	uintptr_t ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size);
 	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	void CopyNTSeh(uintptr_t pAddr = 0, uintptr_t nSize = 0);
@@ -279,7 +294,7 @@ public:
 	uint32_t GetTebLastError() const;
 
 	// callbacks / execution
-	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false);
+	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false); // !moduleHook for new dummy region
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
 	void SetSysCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
@@ -543,7 +558,7 @@ private:
 	uintptr_t m_DisasmCustomASLR = 0;
 	uintptr_t m_DisasmICNotice = 0;
 	bool m_bInitIAT = false;
-	bool m_bUpdatedPCInCB = false;
+	bool m_bSkipCBCallsWithNewPC = false;
 
 	std::vector<tFuncNode> m_sym;
 	std::vector<tAnyJmpHookNode> m_anyJmpHooks; // when any call smth from here
@@ -574,7 +589,8 @@ private:
 	uintptr_t m_allocCursor = 0x20000000;
 	uintptr_t m_fsBase = 0;
 	uintptr_t m_fsSize = 0;
-	uintptr_t m_halt = 0;
+	uintptr_t m_halt = 0x0; // 0x0 0x13371337 0xDEADBEEF
+	uintptr_t m_lastPC = 0;
 
 	uintptr_t m_instrCount = 0;
 	uc_hook m_hkCode = 0;
