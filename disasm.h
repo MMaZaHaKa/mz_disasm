@@ -312,7 +312,7 @@ public:
 	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
 	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
 	void ClearRWHistory();
-	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
+	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC = true, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true);
 	void InstallDefaultHooks(HookNotifyCb cb);
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
@@ -498,6 +498,7 @@ private:
 	{
 		uintptr_t startIC;     // Начальный счётчик инструкций
 		uintptr_t endIC;       // Конечный счётчик инструкций
+		bool checkPC;          // Проверять границы
 		bool skipJmps;         // Пропускать JMP колбэки
 		bool skipMem;          // Пропускать MEM колбэки
 		bool skipOpcode;       // Пропускать Opcode колбэки

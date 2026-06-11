@@ -1312,6 +1312,17 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     tDeadzoneIC* dz = GetCurrentDeadzoneIC();
     if (dz && (dz->skipAll || dz->skipOpcode))
     {
+        // pc
+        if (dz->checkPC && m_modStart != 0 && m_modEnd != 0) {
+            uintptr_t pc = CurrentPc(uc);
+            if (!IsAllowedPc(pc)) {
+                if (m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
+                    Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
+                uc_emu_stop(uc);
+                return;
+            }
+        }
+
         // notice
         if (m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0))
         {
@@ -1319,7 +1330,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
                 uintptr_t pc = CurrentPc(uc); // curPc и CurrentPc(uc) совпадают, пока колбэк не меняет PC
                 if (!IsAllowedPc(pc)) {
                     if (m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
-                        Log("\n[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
+                        Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
                     uc_emu_stop(uc);
                     return;
                 }
@@ -1396,7 +1407,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         uintptr_t pc = CurrentPc(uc);
         if (!IsAllowedPc(pc)) {
             if(m_bLogRunner && !IsRetHaltOrNull(pc)) // no log halt as out of bounds
-                Log("\n[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
+                Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
             uc_emu_stop(uc);
             return;
         }
@@ -5052,9 +5063,9 @@ void AsmRunner::ClearRWHistory()
     m_RWHistory.clear();
 }
 
-void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode)
+void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode)
 {
-    m_deadzonesIC.push_back({ startIC, endIC, skipJmps, skipMem, skipOpcode, skipAll, false });
+    m_deadzonesIC.push_back({ startIC, endIC, checkPC, skipJmps, skipMem, skipOpcode, skipAll, false });
 
     std::sort(m_deadzonesIC.begin(), m_deadzonesIC.end(),
         [](const tDeadzoneIC& a, const tDeadzoneIC& b) { return a.startIC < b.startIC; });
