@@ -368,6 +368,8 @@ public:
 	// "w+" - чтение и запись (создает новый или перезаписывает)
 	// "a+" - чтение и добавление (создает новый, если не существует)
 	FILE* FileOpen(const char* filename, const char* mode = "w");
+	size_t FileSize(FILE* file);
+	size_t FileRead(FILE* file, void* pb, size_t sz);
 	void FileAdd(FILE* file, const char* fmt, ...);
 	void FileClose(FILE* file);
 

@@ -6204,6 +6204,28 @@ FILE* AsmRunner::FileOpen(const char* filename, const char* mode)
     return err != 0 ? nullptr : file;
 }
 
+size_t AsmRunner::FileSize(FILE* file)
+{
+    if (!file) return 0;
+
+    long currentPos = ftell(file);
+    if (currentPos == -1) return 0;
+
+    if (fseek(file, 0, SEEK_END) != 0) return 0;
+    long size = ftell(file);
+    if (size == -1) return 0;
+
+    fseek(file, currentPos, SEEK_SET);
+    return static_cast<size_t>(size);
+}
+
+size_t AsmRunner::FileRead(FILE* file, void* pb, size_t sz)
+{
+    if (!file || !pb || sz == 0) return 0;
+
+    return fread(pb, 1, sz, file);
+}
+
 void AsmRunner::FileAdd(FILE* file, const char* fmt, ...)
 {
     if (!file) return;
