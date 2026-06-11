@@ -279,7 +279,7 @@ public:
 	uint32_t GetTebLastError() const;
 
 	// callbacks / execution
-	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false);
+	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false);
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
 	void SetSysCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);

@@ -3330,7 +3330,7 @@ uint32_t AsmRunner::GetTebLastError() const
     return static_cast<uint32_t>(ReadTebValue(offset));
 }
 
-void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool callBefore)
+void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool callBefore, bool moduleHook)
 {
     if (!pAddr)
         return;
@@ -3346,7 +3346,7 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool call
 
     m_anyJmpHooks.push_back({ pAddr, std::move(cb), data, callBefore, tAnyJmpHookNode::tJmpCBArgs() });
 
-    if (!callBefore) {
+    if (!callBefore && !moduleHook) {
         if (!m_uc)
         {
             MboxSTD("Error 1 SetAnyJmpHook (init uc)", AR_SNAME);
