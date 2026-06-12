@@ -656,6 +656,8 @@ private:
 	static void HookCodeTrampoline(uc_engine* uc, uint64_t address, uint32_t size, void* user_data);
 	static bool HookMemTrampoline(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
 	static bool IsAnyIpTransfer(ZydisMnemonic mn);
+	static bool IsSystem(ZydisMnemonic mn);
+	bool ResolveFlagsConditional(ZydisMnemonic mn, bool& bOutCondMn, bool& bOutInvMn);
 	bool TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t curPc, uintptr_t& outTarget);
 	bool ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const;
 	bool ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const;

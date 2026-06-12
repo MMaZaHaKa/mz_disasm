@@ -134,6 +134,152 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
     }
 }
 
+bool AsmRunner::IsSystem(ZydisMnemonic mn)
+{
+    switch (mn)
+    {
+        // Прерывания / системные переходы
+        case ZYDIS_MNEMONIC_INT:
+        case ZYDIS_MNEMONIC_INT1:
+        case ZYDIS_MNEMONIC_INT3:
+        case ZYDIS_MNEMONIC_INTO:
+        case ZYDIS_MNEMONIC_SYSCALL:
+        case ZYDIS_MNEMONIC_SYSENTER:
+        case ZYDIS_MNEMONIC_SYSEXIT:
+        case ZYDIS_MNEMONIC_SYSRET:
+
+        case ZYDIS_MNEMONIC_UD2:
+        case ZYDIS_MNEMONIC_UD1:
+        case ZYDIS_MNEMONIC_UD0:
+        case ZYDIS_MNEMONIC_HLT:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+bool AsmRunner::ResolveFlagsConditional(ZydisMnemonic mn, bool& bOutCondMn, bool& bOutInvMn)
+{
+    bOutCondMn = false;
+    bOutInvMn = false;
+
+    if (!m_uc)
+        return false;
+
+    const bool cf = GetFlag(CARRY_FLAG);
+    const bool pf = GetFlag(PARITY_FLAG);
+    const bool zf = GetFlag(ZERO_FLAG);
+    const bool sf = GetFlag(SIGN_FLAG);
+    const bool of = GetFlag(OVERFLOW_FLAG);
+
+    auto readCounter = [&]() -> uintptr_t
+    {
+        uintptr_t v = 0;
+        if (uc_reg_read(m_uc, CxReg(), &v) != UC_ERR_OK)
+            return 0;
+
+        if (!m_bX64)
+            v = static_cast<uint32_t>(v);
+
+        return v;
+    };
+
+    switch (mn)
+    {
+        // CF
+        case ZYDIS_MNEMONIC_JB:
+        case ZYDIS_MNEMONIC_JNB:
+        case ZYDIS_MNEMONIC_JBE:
+        case ZYDIS_MNEMONIC_JNBE:
+            bOutCondMn = true;
+            bOutInvMn = (mn == ZYDIS_MNEMONIC_JNB || mn == ZYDIS_MNEMONIC_JNBE);
+            if (mn == ZYDIS_MNEMONIC_JB)   return cf;
+            if (mn == ZYDIS_MNEMONIC_JNB)  return !cf;
+            if (mn == ZYDIS_MNEMONIC_JBE)  return cf || zf;
+            return !cf && !zf; // JNBE
+
+        // ZF
+        case ZYDIS_MNEMONIC_JZ:
+        case ZYDIS_MNEMONIC_JNZ:
+            bOutCondMn = true;
+            bOutInvMn = (mn == ZYDIS_MNEMONIC_JNZ);
+            return (mn == ZYDIS_MNEMONIC_JZ) ? zf : !zf;
+
+        // SF
+        case ZYDIS_MNEMONIC_JS:
+        case ZYDIS_MNEMONIC_JNS:
+            bOutCondMn = true;
+            bOutInvMn = (mn == ZYDIS_MNEMONIC_JNS);
+            return (mn == ZYDIS_MNEMONIC_JS) ? sf : !sf;
+
+        // PF
+        case ZYDIS_MNEMONIC_JP:
+        case ZYDIS_MNEMONIC_JNP:
+            bOutCondMn = true;
+            bOutInvMn = (mn == ZYDIS_MNEMONIC_JNP);
+            return (mn == ZYDIS_MNEMONIC_JP) ? pf : !pf;
+
+        // OF
+        case ZYDIS_MNEMONIC_JO:
+        case ZYDIS_MNEMONIC_JNO:
+            bOutCondMn = true;
+            bOutInvMn = (mn == ZYDIS_MNEMONIC_JNO);
+            return (mn == ZYDIS_MNEMONIC_JO) ? of : !of;
+
+        // signed compare
+        case ZYDIS_MNEMONIC_JL:
+        case ZYDIS_MNEMONIC_JNL:
+        case ZYDIS_MNEMONIC_JLE:
+        case ZYDIS_MNEMONIC_JNLE:
+            bOutCondMn = true;
+            bOutInvMn = (mn == ZYDIS_MNEMONIC_JNL || mn == ZYDIS_MNEMONIC_JNLE);
+            if (mn == ZYDIS_MNEMONIC_JL)   return sf != of;
+            if (mn == ZYDIS_MNEMONIC_JNL)  return sf == of;
+            if (mn == ZYDIS_MNEMONIC_JLE)  return zf || (sf != of);
+            return !zf && (sf == of); // JNLE
+
+        // counter-based branches
+        case ZYDIS_MNEMONIC_JCXZ:
+        case ZYDIS_MNEMONIC_JECXZ:
+        case ZYDIS_MNEMONIC_JRCXZ:
+        case ZYDIS_MNEMONIC_LOOP:
+        case ZYDIS_MNEMONIC_LOOPE:
+        case ZYDIS_MNEMONIC_LOOPNE:
+        {
+            bOutCondMn = true;
+            bOutInvMn = false;
+
+            const uintptr_t cx = readCounter();
+
+            switch (mn)
+            {
+                case ZYDIS_MNEMONIC_JCXZ:
+                case ZYDIS_MNEMONIC_JECXZ:
+                case ZYDIS_MNEMONIC_JRCXZ:
+                    return cx == 0;
+
+                case ZYDIS_MNEMONIC_LOOP:
+                    // LOOP: dec counter; jnz
+                    return cx != 1;
+
+                case ZYDIS_MNEMONIC_LOOPE:
+                    return (cx != 1) && zf;
+
+                case ZYDIS_MNEMONIC_LOOPNE:
+                    bOutInvMn = true;
+                    return (cx != 1) && !zf;
+
+                default:
+                    return false;
+            }
+        }
+
+        default:
+            return false;
+    }
+}
+
 uintptr_t AsmRunner::ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size) // from - curr transfer op
 {
     const uintptr_t fallback = (from + size);
@@ -1370,9 +1516,23 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             bool bDecodeOK = false;
 
             std::vector<uint8_t> bytes;
-            bool readOk = ReadBytes(uc, address, size, bytes);
-            std::string disasm = readOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, &instr, operands, bDecodeOK) : "[READ ERROR]";
+            bool bReadOk = ReadBytes(uc, address, size, bytes);
+            std::string disasm = bReadOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, &instr, operands, bDecodeOK) : "[READ ERROR]";
             std::string curSym = FormatCurrentSymbolSuffix(curPc);
+
+            if (!bReadOk || !bDecodeOK)
+                MboxSTD("Error 1 (OnInstructionStep)", AR_SNAME);
+
+            bool bOutCondMn = false; // is cond mn
+            bool bOutInvMn = false; // is inversed mn
+            const bool bCond = ResolveFlagsConditional(instr.mnemonic, bOutCondMn, bOutInvMn);
+
+            if (bOutCondMn) {
+                if (bOutInvMn)
+                    disasm += std::string(" (inv cond=") + (bCond ? "true" : "false") + ")";
+                else
+                    disasm += std::string(" (cond=") + (bCond ? "true" : "false") + ")";
+            }
 
             std::ostringstream oss;
             oss << "[" << m_instrCount << "] [IN DEAD ZONE " << m_currentDeadzoneICIndex << "] ";
@@ -1450,6 +1610,17 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     if(!bReadOk || !bDecodeOK)
         MboxSTD("Error 1 (OnInstructionStep)", AR_SNAME);
 
+    bool bOutCondMn = false; // is cond mn
+    bool bOutInvMn = false; // is inversed mn
+    const bool bCond = ResolveFlagsConditional(instr.mnemonic, bOutCondMn, bOutInvMn);
+
+    if (bOutCondMn) {
+        if (bOutInvMn)
+            disasm += std::string(" (inv cond=") + (bCond ? "true" : "false") + ")";
+        else
+            disasm += std::string(" (cond=") + (bCond ? "true" : "false") + ")";
+    }
+
     if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
         uintptr_t outPc = curPc;
         if (m_rttrace.rva)
@@ -1505,30 +1676,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
-    auto IsSysCallLike = [](ZydisMnemonic mn) -> bool
-    {
-        switch (mn)
-        {
-            case ZYDIS_MNEMONIC_INT:
-            case ZYDIS_MNEMONIC_INT1:
-            case ZYDIS_MNEMONIC_INT3:
-            case ZYDIS_MNEMONIC_INTO:
-            case ZYDIS_MNEMONIC_SYSCALL:
-            case ZYDIS_MNEMONIC_SYSENTER:
-            case ZYDIS_MNEMONIC_SYSEXIT:
-            case ZYDIS_MNEMONIC_SYSRET:
-            case ZYDIS_MNEMONIC_UD2:
-            case ZYDIS_MNEMONIC_UD1:
-            case ZYDIS_MNEMONIC_UD0:
-            case ZYDIS_MNEMONIC_HLT:
-                return true;
-            default:
-                return false;
-        }
-    };
-
     // what about UC_HOOK_INTR?
-    if (m_cbSysCall && IsSysCallLike(instr.mnemonic)) {
+    if (m_cbSysCall && IsSystem(instr.mnemonic)) {
         if (!m_cbSysCall(uc, curPc, size, instr.mnemonic, m_cbSysCallData)) {
             ShutdownByCallback(uc);
             return;
