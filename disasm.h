@@ -20,6 +20,7 @@
 //#define AR_DEBUG
 #define AR_IDA_WS
 //#define AR_HALT_JMPCB // allow jmp cb notify jmp to halt
+#define AR_HALT_ADDR_ONLY // fast + correct halt shutdown log, the rest is neat (unmapped execute)
 
 #ifdef CopyMemory
 #undef CopyMemory
@@ -178,6 +179,8 @@ public:
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
 	void Shutdown();
+	void ShutdownByCallback(uc_engine* uc);
+	void ShutdownByHalt(uc_engine* uc);
 	uc_engine* GetCTX();
 	uintptr_t GetInstructionCount() const { return m_instrCount; }
 
@@ -641,7 +644,7 @@ private:
 
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
-	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
+	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uint32_t size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
 	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic);        // jmp/call/ret детектируется в _OnInstructionStep
 	void _OnBreakpoint(uc_engine* uc, uintptr_t address);             // срабатывание точки останова
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл

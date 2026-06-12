@@ -1055,6 +1055,40 @@ void AsmRunner::Shutdown()
     m_bRWHistory = false;
 }
 
+void AsmRunner::ShutdownByCallback(uc_engine* uc)
+{
+    m_bStopped = true;
+
+    uc_engine* ctx = uc ? uc : m_uc;
+    if (!ctx)
+        return;
+
+    if (m_bLogRunner)
+    {
+        uintptr_t pc = CurrentPc(ctx);
+        Log("[!] Shutdown by Callback at 0x%p", (void*)pc);
+    }
+
+    uc_emu_stop(ctx);
+}
+
+void AsmRunner::ShutdownByHalt(uc_engine* uc)
+{
+    m_bStopped = true;
+
+    uc_engine* ctx = uc ? uc : m_uc;
+    if (!ctx)
+        return;
+
+    if (m_bLogRunner)
+    {
+        uintptr_t pc = CurrentPc(ctx);
+        Log("[!] HALT reached at 0x%p", (void*)pc);
+    }
+
+    uc_emu_stop(ctx);
+}
+
 uc_engine* AsmRunner::GetCTX()
 {
     assert(m_uc != nullptr);
@@ -1304,36 +1338,29 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         curPc = static_cast<uint32_t>(curPc);
 
     auto IsAllowedPc = [&](uintptr_t pc) -> bool
-    {   
+    {
+#ifdef AR_HALT_ADDR_ONLY
+        return !IsHaltAddr(pc); // fast
+#else
         return IsPCNormal(pc);
-        //return !IsHaltAddr(pc) && (IsModuleAddr(pc) || InExtraRegion(pc)); // if allow halt we exec 0x0
+#endif
     };
 
     tDeadzoneIC* dz = GetCurrentDeadzoneIC();
     if (dz && (dz->skipAll || dz->skipOpcode))
     {
         // pc
-        if (dz->checkPC && m_modStart != 0 && m_modEnd != 0) {
-            uintptr_t pc = CurrentPc(uc);
-            if (!IsAllowedPc(pc)) {
-                if (m_bLogRunner && !IsHaltAddr(pc)) // no log halt as out of bounds
-                    Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
-                uc_emu_stop(uc);
-                return;
-            }
+        if (dz->checkPC && !IsAllowedPc(CurrentPc(uc))) { // dz halt in rwx allocated halt region
+            ShutdownByHalt(uc);
+            return;
         }
 
         // notice
         if (m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0))
         {
-            if (m_modStart != 0 && m_modEnd != 0) {
-                uintptr_t pc = CurrentPc(uc); // curPc и CurrentPc(uc) совпадают, пока колбэк не меняет PC
-                if (!IsAllowedPc(pc)) {
-                    if (m_bLogRunner && !IsHaltAddr(pc)) // no log halt as out of bounds
-                        Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
-                    uc_emu_stop(uc);
-                    return;
-                }
+            if (dz->checkPC && !IsAllowedPc(CurrentPc(uc))) { // dz halt in rwx allocated halt region // if !checkPC, but notice, seems fine
+                ShutdownByHalt(uc);
+                return;
             }
 
             ZydisDecodedInstruction instr{};
@@ -1384,8 +1411,14 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         return;
     }
 
+    // IsAllowedPc checks m_anyJmpHooks
+    if (!IsAllowedPc(CurrentPc(uc))) { // halt in rwx allocated halt region
+        ShutdownByHalt(uc);
+        return;
+    }
+
     // !before m_anyJmpHooks calls
-    for (auto& h : m_anyJmpHooks)
+    for (auto& h : m_anyJmpHooks) // can be outside module (import dependencies dummy)
     {
         if (!h.cb || h.before || !h.bfArgs.valid || h.pAddr != curPc)
             continue;
@@ -1394,21 +1427,11 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         h.bfArgs.valid = false;
 
         if (!h.cb(uc, args.from, args.to, args.size, args.mnemonic, h.data)) {
-            uc_emu_stop(uc);
+            ShutdownByCallback(uc);
             return;
         }
         if (ShouldStopCB(true)) {
             return; // prevent notice in cb with old pc opcode
-        }
-    }
-
-    if (m_modStart != 0 && m_modEnd != 0) {
-        uintptr_t pc = CurrentPc(uc);
-        if (!IsAllowedPc(pc)) {
-            if(m_bLogRunner && !IsHaltAddr(pc)) // no log halt as out of bounds
-                Log("\n[!] [%d] %s (0x%p) out of bounds [0x%p - 0x%p]", m_instrCount, m_bX64 ? "RIP" : "EIP", (void*)pc, (void*)m_modStart, (void*)m_modEnd);
-            uc_emu_stop(uc);
-            return;
         }
     }
 
@@ -1435,22 +1458,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
     }
 
-    //if (m_bLogDisasm /*|| m_bLogRunner*/) {
-    //    std::ostringstream oss;
-    //    oss << "[" << m_instrCount << "] ";
-    //    oss << "0x" << std::hex << std::uppercase << curPc;
-    //    oss << ": " << disasm;
-    //    //if (!curSym.empty())
-    //    //    oss << " ; " << curSym;
-    //    if (!curSym.empty()) {
-    //        constexpr size_t kSymFieldWidth = 70;
-    //        oss << " ; " << std::setw(static_cast<int>(kSymFieldWidth))
-    //            << std::right << curSym;
-    //    }
-    //    Log("%s", oss.str().c_str());
-    //}
-
-    if (!m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm /*|| m_bLogRunner*/)) {
+    if (!m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm)) {
         std::ostringstream oss;
         oss << "[" << m_instrCount << "] ";
         if(m_bDisasmAfterCB)
@@ -1490,7 +1498,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
         if (m_trace.cbStop) {
             if (!m_trace.cbStop(uc, curPc, m_trace.count, nullptr)) {
-                uc_emu_stop(uc);
+                ShutdownByCallback(uc);
                 return;
             }
         }
@@ -1521,7 +1529,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     // what about UC_HOOK_INTR?
     if (m_cbSysCall && IsSysCallLike(instr.mnemonic)) {
         if (!m_cbSysCall(uc, curPc, size, instr.mnemonic, m_cbSysCallData)) {
-            uc_emu_stop(uc);
+            ShutdownByCallback(uc);
             return;
         }
         if (ShouldStopCB(true)) {
@@ -1534,7 +1542,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             continue;
 
         if (!n.cb(uc, curPc, size, instr.mnemonic, n.data)) {
-            uc_emu_stop(uc);
+            ShutdownByCallback(uc);
             return;
         }
         if (ShouldStopCB(true)) {
@@ -1544,7 +1552,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
     if (m_cbOpcode) {
         if (!m_cbOpcode(uc, curPc, size, instr.mnemonic, m_cbOpcodeData)) {
-            uc_emu_stop(uc);
+            ShutdownByCallback(uc);
             return;
         }
         if (ShouldStopCB(true)) {
@@ -1552,44 +1560,14 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
-//#if 1 // old, 3 jmp instr
-//        uintptr_t target = 0;
-//        bool hasTarget = false;
-//
-//        //if (instr.mnemonic == ZYDIS_MNEMONIC_CALL || instr.mnemonic == ZYDIS_MNEMONIC_JMP)
-//        if (IsAnyIpTransfer(instr.mnemonic))
-//        {
-//            hasTarget = ResolveDirectBranchTarget(instr, operands, curPc, target);
-//        }
-//        else if (instr.mnemonic == ZYDIS_MNEMONIC_RET) {
-//            uintptr_t sp = CurrentSp(uc);
-//            uintptr_t ret = 0;
-//            if (uc_mem_read(uc, sp, &ret, m_bX64 ? 8 : 4) == UC_ERR_OK) {
-//                if (!m_bX64)
-//                    ret = static_cast<uint32_t>(ret);
-//                target = ret;
-//                hasTarget = true;
-//            }
-//        }
-//
-//        if (hasTarget) {
-//            _OnAnyJmp(uc, curPc, target, size, instr.mnemonic);
-//            if (m_cbJmp) {
-//                if (!m_cbJmp(uc, curPc, target, size, instr.mnemonic, m_cbJmpData)) {
-//                    uc_emu_stop(uc);
-//                    return;
-//                }
-//            }
-//        }
-//#endif
-
     if (IsAnyIpTransfer(instr.mnemonic)) {
         uintptr_t target = 0;
         if (TryResolveIpTransfer(uc, instr, operands, curPc, target))
         {
+            // AR_HALT_JMPCB узнать заранее прыжок в halt
 #ifndef AR_HALT_JMPCB
-            if (IsHaltAddr(target)) { // skip jmp cb to halt
-                uc_emu_stop(uc);
+            if (!IsAllowedPc(target)) { // skip jmp cb to halt, pc on last instruction
+                ShutdownByHalt(uc);
                 return;
             }
 #endif
@@ -1598,8 +1576,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
                 return;
 
 #ifdef AR_HALT_JMPCB
-            if (IsHaltAddr(target)) { // skip jmp cb to halt
-                uc_emu_stop(uc);
+            if (!IsAllowedPc(target)) { // skip jmp cb to halt, pc on last instruction
+                ShutdownByHalt(uc);
                 return;
             }
 #endif
@@ -1649,21 +1627,43 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         Log("%s", line.c_str());
     }
 
-    uintptr_t pcAfter = CurrentPc(uc);
-    if (m_modStart != 0 && m_modEnd != 0 && !IsAllowedPc(pcAfter)) {
-        if (m_bLogRunner && !IsHaltAddr(pcAfter))
-            Log("[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pcAfter, (void*)m_modStart, (void*)m_modEnd);
-        uc_emu_stop(uc);
-    }
+    //uintptr_t pcAfter = CurrentPc(uc);
+    //if (m_modStart != 0 && m_modEnd != 0 && !IsAllowedPc(pcAfter)) {
+    //    if (m_bLogRunner && !IsHaltAddr(pcAfter))
+    //        Log("[!] %s (0x%p) out of bounds [0x%p - 0x%p]", m_bX64 ? "RIP" : "EIP", (void*)pcAfter, (void*)m_modStart, (void*)m_modEnd);
+    //    uc_emu_stop(uc);
+    //}
 }
 
-bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data)
+// note: halt shutdown in memcb leaves an (unalloc) memerror // UC_HOOK_MEM_*_UNMAPPED UC_ERR_FETCH_PROT, reset "halt" error only fix + retun true;
+// address == CurrentPc(uc) mostly UC_ERR_FETCH_PROT
+bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uint32_t size, int64_t value, void* user_data)
 {
     (void)user_data;
 
     const tDeadzoneIC* dz = GetCurrentDeadzoneIC();
     if (dz && (dz->skipAll || dz->skipMem))
-        return true;
+    {
+#ifdef AR_HALT_ADDR_ONLY
+        if (dz->checkPC && address == CurrentPc(uc) && IsHaltAddr(address)) { // err dz prot/unalloc exec
+#else
+        if (dz->checkPC && address == CurrentPc(uc) && !IsPCNormal(address)) { // err dz prot/unalloc exec
+#endif
+            ShutdownByHalt(uc);
+            return false;
+        }
+
+        return true; // dz
+    }
+
+#ifdef AR_HALT_ADDR_ONLY
+    if (address == CurrentPc(uc) && IsHaltAddr(address)) { // err prot/unalloc exec
+#else
+    if (address == CurrentPc(uc) && !IsPCNormal(address)) { // err prot/unalloc exec
+#endif
+        ShutdownByHalt(uc);
+        return false;
+    }
 
     uintptr_t addr = static_cast<uintptr_t>(address);
     uintptr_t sz = static_cast<uintptr_t>(size);
@@ -1729,7 +1729,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
             _OnBreakpoint(uc, addr);
             if (bp.cb) {
                 if (!bp.cb(uc, addr, bp.data)) {
-                    uc_emu_stop(uc);
+                    ShutdownByCallback(uc);
                     return false;
                 }
                 if (ShouldStopCB(true)) {
@@ -1738,7 +1738,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
             }
             else if (m_cbBreak) {
                 if (!m_cbBreak(uc, addr, m_cbBreakData)) {
-                    uc_emu_stop(uc);
+                    ShutdownByCallback(uc);
                     return false;
                 }
                 if (ShouldStopCB(true)) {
@@ -1749,7 +1749,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
         }
     }
 
-    if (m_bLogMemRW /*|| m_bLogRunner*/) {
+    if (m_bLogMemRW) {
         const char* typeStr =
             type == UC_MEM_READ ? "READ" :
             type == UC_MEM_WRITE ? "WRITE" :
@@ -1794,7 +1794,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, int
 
     if (m_cbMem) {
         if (!m_cbMem(uc, static_cast<int32_t>(type), addr, sz, static_cast<uintptr_t>(value), mnemonic, m_cbMemData)) {
-            uc_emu_stop(uc);
+            ShutdownByCallback(uc);
             return false;
         }
 
@@ -1836,7 +1836,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
             else
             {
                 if (!h.cb(uc, from, to, size, mnemonic, h.data)) {
-                    uc_emu_stop(uc);
+                    ShutdownByCallback(uc);
                     return false;
                 }
 
@@ -1853,7 +1853,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
             if (n.moduleBase && n.funcRva && (n.moduleBase + n.funcRva) == to)
             {
                 if (!m_cbIATCall(uc, to, 0, mnemonic, m_cbIATCallData)) {
-                    uc_emu_stop(uc);
+                    ShutdownByCallback(uc);
                     return false;
                 }
 
@@ -1866,7 +1866,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
     if (m_cbJmp)
     {
         if (!m_cbJmp(uc, from, to, size, mnemonic, m_cbJmpData)) {
-            uc_emu_stop(uc);
+            ShutdownByCallback(uc);
             return false;
         }
 
@@ -4396,7 +4396,7 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, b
 
 void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 {
-    if (!m_uc) return;
+    if (!m_uc || m_modStart == 0 || m_modEnd == 0) return;
 
     uintptr_t pc = pEntry;
     if (!m_bX64) pc = static_cast<uint32_t>(pc);
