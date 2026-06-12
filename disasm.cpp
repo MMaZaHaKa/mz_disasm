@@ -1558,7 +1558,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
 
         // trace
-        if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
+        if (!dz->skipTrace && m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
         {
             uintptr_t outPc = curPc;
             if (m_rttrace.rva)
@@ -5357,9 +5357,9 @@ void AsmRunner::ClearRWHistory()
     m_RWHistory.clear();
 }
 
-void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode)
+void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode, bool skipTrace)
 {
-    m_deadzonesIC.push_back({ startIC, endIC, checkPC, skipJmps, skipMem, skipOpcode, skipAll, false });
+    m_deadzonesIC.push_back({ startIC, endIC, checkPC, skipJmps, skipMem, skipOpcode, skipAll, skipTrace, false });
 
     std::sort(m_deadzonesIC.begin(), m_deadzonesIC.end(),
         [](const tDeadzoneIC& a, const tDeadzoneIC& b) { return a.startIC < b.startIC; });
