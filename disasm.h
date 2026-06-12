@@ -285,6 +285,7 @@ public:
 	uintptr_t StackPeekBP(int32_t nIdx = 0);
 	uintptr_t StackAt(bool bEsp = true, int32_t nIdx = 0);
 	bool StackSetValue(uintptr_t v, bool bEsp = true, int32_t nIdx = 0);
+	// вызывать StackGetArg после call перед эпилогом, после stackpop return address
 	bool StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl); // true=stdcall pop like, false=cdecl peek
 	uintptr_t ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size);
 	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
@@ -401,6 +402,27 @@ public:
 	tMemSnapshot MakeSnapshot(uintptr_t pStart, uintptr_t pEnd);
 	tMemSnapshot MakeSnapshotS(uintptr_t pStart, uintptr_t nSize);
 	void CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly = true);
+
+	template <typename T>
+	T ReadMemory(uintptr_t pAddr)
+	{
+		static_assert(std::is_trivially_copyable_v<T>,
+			"ReadMemory<T> requires trivially copyable T");
+
+		T result{};
+
+		if (!m_uc || !pAddr)
+			return result;
+
+		if (uc_mem_read(m_uc, pAddr, &result, sizeof(T)) != UC_ERR_OK)
+		{
+			if (m_bLogRunner)
+				Log("ReadMemory: read failed at 0x%p, size=%zu", (void*)pAddr, sizeof(T));
+			return result;
+		}
+
+		return result;
+	}
 
 	template <typename T>
 	bool WriteMemory(uintptr_t pAddr, const T& val, bool bCreateRegion = false)
