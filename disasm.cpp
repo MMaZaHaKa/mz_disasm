@@ -5365,7 +5365,7 @@ void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, 
         [](const tDeadzoneIC& a, const tDeadzoneIC& b) { return a.startIC < b.startIC; });
 
     if (m_bLogRunner)
-        Log("[*] DeadzoneIC added: %llu - %llu (skipAll=%d)", startIC, endIC, skipAll);
+        Log("[*] DeadzoneIC added: 0x%p - 0x%p (skipAll=%d)", startIC, endIC, skipAll);
 }
 
 // TODO: others ntdll, ws
