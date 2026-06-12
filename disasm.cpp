@@ -2494,14 +2494,14 @@ uintptr_t AsmRunner::CalculateOffset(uintptr_t op_addr, uintptr_t dst)
     return dst - (op_addr + 1 + sizeof(uintptr_t));
 }
 
-void* AsmRunner::SearchPointerByPattern(void* ptrStart, int block_size, std::string pattern)
+uintptr_t AsmRunner::SearchPointerByPattern(uintptr_t ptrStart, uint32_t block_size, std::string pattern)
 {
 #define INRANGE(x, a, b) (x >= a && x <= b)
 #define getBits(x) (INRANGE((x & (~0x20)), 'A', 'F') ? ((x & (~0x20)) - 'A' + 0xa) : (INRANGE(x, '0', '9') ? x - '0' : 0))
 #define getByte(x) (getBits(x[0]) << 4 | getBits(x[1]))
     const char* buffptr_pattern = pattern.c_str();
     uintptr_t pMatch = 0;
-    for (uintptr_t MemPtr = (uintptr_t)ptrStart; MemPtr < ((uintptr_t)ptrStart + block_size); MemPtr++)
+    for (uintptr_t MemPtr = ptrStart; MemPtr < (ptrStart + block_size); MemPtr++)
     {
         if (!*buffptr_pattern) { break; }
         if (*(PBYTE)buffptr_pattern == '\?' || *(BYTE*)MemPtr == getByte(buffptr_pattern))
@@ -2519,10 +2519,47 @@ void* AsmRunner::SearchPointerByPattern(void* ptrStart, int block_size, std::str
         }
     }
     if (!pMatch) { return NULL; }
-    return (void*)pMatch;
+    return pMatch;
 #undef getByte;
 #undef getBits;
 #undef INRANGE;
+}
+
+std::vector<uintptr_t> AsmRunner::ScanPattern(uintptr_t pStart, uintptr_t pEnd, std::string pattern)
+{
+    std::vector<uintptr_t> scanRes;
+    if (pStart == 0 || pEnd == 0 || pStart == pEnd || pattern.empty()) // !0 native memory
+        return scanRes;
+
+    uintptr_t current = pStart;
+    while (current < pEnd) {
+        uintptr_t found = (uintptr_t)SearchPointerByPattern(current, pEnd - current, pattern);
+        if (found == 0) break;
+        scanRes.push_back(found);
+        current = (found + 1);
+    }
+
+    return scanRes;
+}
+
+std::vector<uintptr_t> AsmRunner::ScanBytes(uintptr_t pStart, uintptr_t pEnd, const std::vector<uint8_t>& bytes)
+{
+    std::vector<uintptr_t> scanRes;
+    if(pStart == 0 || pEnd == 0 || pStart == pEnd || bytes.size() == 0) // !0 native memory
+        return scanRes;
+
+    size_t bytesLen = bytes.size();
+
+    if ((pEnd - pStart) < bytesLen)
+        return scanRes;
+
+    for (uintptr_t MemPtr = pStart; MemPtr <= pEnd - bytesLen; MemPtr++) {
+        if (memcmp((void*)MemPtr, bytes.data(), bytesLen) == 0) {
+            scanRes.push_back(MemPtr);
+        }
+    }
+
+    return scanRes;
 }
 
 std::vector<AsmRunner::tMemoryRegion> AsmRunner::FindRegions(SIZE_T targetSize, DWORD targetType, DWORD targetProtect, DWORD targetState)
@@ -6783,6 +6820,373 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
     std::cout << std::flush;
 }
 
+void AsmRunner::TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
+{
+    using namespace ArAsmCode;
+
+    // Themida jcc >>11 >>7
+    std::vector<ZydisRegister> anyRegs = {
+        ZYDIS_REGISTER_EAX,
+        ZYDIS_REGISTER_ECX,
+        ZYDIS_REGISTER_EDX,
+        ZYDIS_REGISTER_EBX,
+        ZYDIS_REGISTER_ESP,
+        ZYDIS_REGISTER_EBP,
+        ZYDIS_REGISTER_ESI,
+        ZYDIS_REGISTER_EDI,
+        //ZYDIS_REGISTER_R8D,
+        //ZYDIS_REGISTER_R9D,
+        //ZYDIS_REGISTER_R10D,
+        //ZYDIS_REGISTER_R11D,
+        //ZYDIS_REGISTER_R12D,
+        //ZYDIS_REGISTER_R13D,
+        //ZYDIS_REGISTER_R14D,
+        //ZYDIS_REGISTER_R15D,
+    };
+
+    // Scan // зависимости: 1.размер окна 2.один регистр на пару and+shr // результат ~/4 в одном jcc 4 пары shr 11 и 4 пары shr 7 total: 4 окна (1 окно 11 и 7)
+    // themida: на 1 jcc 2 рандомных регистра (1 для >>11, 1 для >>7), в 1 jcc 4 >>11 и 4 >>7
+    uintptr_t nWindowSize = 250;
+
+    struct RegHits
+    {
+        std::vector<uintptr_t> and11;
+        std::vector<uintptr_t> shr11;
+        std::vector<uintptr_t> and7;
+        std::vector<uintptr_t> shr7;
+    };
+
+    std::map<ZydisRegister, RegHits> hits;
+
+    auto ScanPattern = [&](const std::vector<uint8_t>& pat) -> std::vector<uintptr_t>
+    {
+        return ScanBytes(pStart, pEnd, pat);
+    };
+
+    // Собираем все совпадения по каждому регистру отдельно
+    for (size_t i = 0; i < anyRegs.size(); ++i)
+    {
+        ZydisRegister reg = anyRegs[i];
+
+        // >>11 // v1 & 0x800) >> 11;
+        {
+            std::vector<uint8_t> buf;
+            BuildAsm86Op2(buf, ZYDIS_MNEMONIC_AND, Operand::Reg(reg), Operand::Imm(0x800));
+            hits[reg].and11 = ScanPattern(buf);
+        }
+        {
+            std::vector<uint8_t> buf;
+            BuildAsm86Op2(buf, ZYDIS_MNEMONIC_SHR, Operand::Reg(reg), Operand::Imm(0x0B));
+            hits[reg].shr11 = ScanPattern(buf);
+        }
+        // >>7 // v1 & 0x80) >> 7;
+        {
+            std::vector<uint8_t> buf;
+            BuildAsm86Op2(buf, ZYDIS_MNEMONIC_AND, Operand::Reg(reg), Operand::Imm(0x80));
+            hits[reg].and7 = ScanPattern(buf);
+        }
+        {
+            std::vector<uint8_t> buf;
+            BuildAsm86Op2(buf, ZYDIS_MNEMONIC_SHR, Operand::Reg(reg), Operand::Imm(0x07));
+            hits[reg].shr7 = ScanPattern(buf);
+        }
+    }
+
+    auto InWindow = [&](const std::vector<uintptr_t>& v, uintptr_t begin, uintptr_t end) -> bool
+    {
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            uintptr_t a = v[i];
+            if (a >= begin && a < end)
+                return true;
+        }
+        return false;
+    };
+
+    auto FirstInWindow = [&](const std::vector<uintptr_t>& v, uintptr_t begin, uintptr_t end) -> uintptr_t
+    {
+        uintptr_t best = 0;
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            uintptr_t a = v[i];
+            if (a >= begin && a < end)
+            {
+                if (best == 0 || a < best)
+                    best = a;
+            }
+        }
+        return best;
+    };
+
+    std::vector<uintptr_t> anchors;
+    anchors.reserve(4096);
+
+    for (std::map<ZydisRegister, RegHits>::iterator it = hits.begin(); it != hits.end(); ++it)
+    {
+        RegHits& h = it->second;
+        anchors.insert(anchors.end(), h.and11.begin(), h.and11.end());
+        anchors.insert(anchors.end(), h.shr11.begin(), h.shr11.end());
+        anchors.insert(anchors.end(), h.and7.begin(), h.and7.end());
+        anchors.insert(anchors.end(), h.shr7.begin(), h.shr7.end());
+    }
+
+    std::sort(anchors.begin(), anchors.end());
+    anchors.erase(std::unique(anchors.begin(), anchors.end()), anchors.end());
+
+    for (size_t ai = 0; ai < anchors.size(); ++ai)
+    {
+        uintptr_t windowStart = anchors[ai];
+        uintptr_t windowEnd = windowStart + nWindowSize;
+
+        for (size_t r1 = 0; r1 < anyRegs.size(); ++r1)
+        {
+            ZydisRegister reg11 = anyRegs[r1];
+            RegHits& h11 = hits[reg11];
+
+            if (!InWindow(h11.and11, windowStart, windowEnd))
+                continue;
+            if (!InWindow(h11.shr11, windowStart, windowEnd))
+                continue;
+
+            uintptr_t and11Addr = FirstInWindow(h11.and11, windowStart, windowEnd);
+            uintptr_t shr11Addr = FirstInWindow(h11.shr11, windowStart, windowEnd);
+
+            for (size_t r2 = 0; r2 < anyRegs.size(); ++r2)
+            {
+                ZydisRegister reg7 = anyRegs[r2];
+                RegHits& h7 = hits[reg7];
+
+                if (!InWindow(h7.and7, windowStart, windowEnd))
+                    continue;
+                if (!InWindow(h7.shr7, windowStart, windowEnd))
+                    continue;
+
+                uintptr_t and7Addr = FirstInWindow(h7.and7, windowStart, windowEnd);
+                uintptr_t shr7Addr = FirstInWindow(h7.shr7, windowStart, windowEnd);
+
+                printf("Window found at: 0x%p\n", (void*)(windowStart - pOffset));
+#if 0
+                printf("  reg11 = %u\n", (unsigned)reg11);
+                printf("    AND11 at: 0x%p\n", (void*)(and11Addr - pOffset));
+                printf("    SHR11 at: 0x%p\n", (void*)(shr11Addr - pOffset));
+
+                printf("  reg7  = %u\n", (unsigned)reg7);
+                printf("    AND7  at: 0x%p\n", (void*)(and7Addr - pOffset));
+                printf("    SHR7  at: 0x%p\n", (void*)(shr7Addr - pOffset));
+                //printf("\n");
+#endif
+            }
+        }
+    }
+}
+
+namespace ArAsmCode
+{
+    Operand Operand::Reg(ZydisRegister r)
+    {
+        Operand o;
+        o.kind = Kind::Reg;
+        o.reg = r;
+        return o;
+    }
+
+    Operand Operand::Mem(ZydisRegister base, ZydisRegister index, ZyanU8 scale, ZyanI64 displacement, ZyanU16 size)
+    {
+        Operand o;
+        o.kind = Kind::Mem;
+        o.mem.base = base;
+        o.mem.index = index;
+        o.mem.scale = scale;
+        o.mem.displacement = displacement;
+        o.mem.size = size;
+        return o;
+    }
+
+    Operand Operand::Ptr(ZyanU16 segment, ZyanU32 offset)
+    {
+        Operand o;
+        o.kind = Kind::Ptr;
+        o.ptr.segment = segment;
+        o.ptr.offset = offset;
+        return o;
+    }
+
+#ifdef ZYDIS
+    static void FillOperand(ZydisEncoderOperand& dst, const Operand& src)
+    {
+        dst = {};
+
+        switch (src.kind)
+        {
+        case Operand::Kind::Reg:
+            dst.type = ZYDIS_OPERAND_TYPE_REGISTER;
+            dst.reg.value = src.reg;
+            break;
+
+        case Operand::Kind::Imm:
+            dst.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+            if (src.immSigned)
+                dst.imm.s = src.immS;
+            else
+                dst.imm.u = src.immU;
+            break;
+
+        case Operand::Kind::Mem:
+            dst.type = ZYDIS_OPERAND_TYPE_MEMORY;
+            dst.mem.base = src.mem.base;
+            dst.mem.index = src.mem.index;
+            dst.mem.scale = src.mem.scale;
+            dst.mem.displacement = src.mem.displacement;
+            dst.mem.size = src.mem.size;
+            break;
+
+        case Operand::Kind::Ptr:
+            dst.type = ZYDIS_OPERAND_TYPE_POINTER;
+            dst.ptr.segment = src.ptr.segment;
+            dst.ptr.offset = src.ptr.offset;
+            break;
+        }
+    }
+
+    bool BuildAsm(std::vector<uint8_t>& bytes,
+        ZydisMachineMode mode,
+        ZydisMnemonic mnemonic,
+        std::initializer_list<Operand> ops,
+        const BuildOptions& options,
+        ZyanU64 runtimeAddress)
+    {
+        bytes.clear();
+
+        ZydisEncoderRequest req{};
+        req.machine_mode = mode;
+        req.mnemonic = mnemonic;
+        req.allowed_encodings = options.allowed_encodings;
+        req.prefixes = options.prefixes;
+        req.branch_type = options.branch_type;
+        req.branch_width = options.branch_width;
+        req.address_size_hint = options.address_size_hint;
+        req.operand_size_hint = options.operand_size_hint;
+        req.operand_count = static_cast<ZyanU8>(ops.size());
+
+        if (ops.size() > ZYDIS_ENCODER_MAX_OPERANDS)
+            return false;
+
+        size_t i = 0;
+        for (const auto& op : ops)
+        {
+            FillOperand(req.operands[i++], op);
+        }
+
+        std::array<ZyanU8, ZYDIS_MAX_INSTRUCTION_LENGTH> buffer{};
+        ZyanUSize length = buffer.size();
+        ZyanStatus st = ZYAN_STATUS_SUCCESS;
+
+        if (runtimeAddress != 0)
+            st = ZydisEncoderEncodeInstructionAbsolute(&req, buffer.data(), &length, runtimeAddress);
+        else
+            st = ZydisEncoderEncodeInstruction(&req, buffer.data(), &length);
+
+        if (!ZYAN_SUCCESS(st))
+            return false;
+
+        bytes.assign(buffer.begin(), buffer.begin() + static_cast<size_t>(length));
+        return true;
+    }
+#else
+    bool BuildAsm(std::vector<uint8_t>&,
+        ZydisMachineMode,
+        ZydisMnemonic,
+        std::initializer_list<Operand>,
+        const BuildOptions&,
+        ZyanU64)
+    {
+        return false;
+    }
+#endif
+}
+
+#if 0
+void TestArBuilder()
+{
+    std::vector<uint8_t> bytes1;
+    ArAsmCode::BuildAsm86(
+        bytes1,
+        ZYDIS_MNEMONIC_SHR,
+        {
+            ArAsmCode::Operand::Reg(ZYDIS_REGISTER_ECX),
+            ArAsmCode::Operand::Imm(7)
+        }
+    );
+
+    // shr ecx, ecx -> в x86 shift-by-register нужен CL
+    std::vector<uint8_t> bytes2;
+    ArAsmCode::BuildAsm86(
+        bytes2,
+        ZYDIS_MNEMONIC_SHR,
+        {
+            ArAsmCode::Operand::Reg(ZYDIS_REGISTER_ECX),
+            ArAsmCode::Operand::Reg(ZYDIS_REGISTER_CL)
+        }
+    );
+
+    {
+        using namespace ArAsmCode;
+        std::vector<uint8_t> bytes;
+
+        // ==============================================
+        // shr ecx, 7
+        // ==============================================
+        if (BuildAsm86Op2(bytes, ZYDIS_MNEMONIC_SHR, Operand::Reg(ZYDIS_REGISTER_ECX), Operand::Imm(7)))
+        {
+            printf("SHR ECX, 7: ");
+            for (uint8_t b : bytes)
+                printf("%02X ", b);
+            printf(" (%zu байт)\n", bytes.size());
+        }
+
+        // ==============================================
+        // shr ecx, cl
+        // ==============================================
+        if (BuildAsm86Op2(bytes, ZYDIS_MNEMONIC_SHR, Operand::Reg(ZYDIS_REGISTER_ECX), Operand::Reg(ZYDIS_REGISTER_CL)))
+        {
+            printf("SHR ECX, CL: ");
+            for (uint8_t b : bytes)
+                printf("%02X ", b);
+            printf(" (%zu байт)\n", bytes.size());
+        }
+
+        // ==============================================
+        // mov [eax + ecx*4 + 8], 0x1234
+        // ==============================================
+        if (BuildAsm86Op2(bytes, ZYDIS_MNEMONIC_MOV,
+            Operand::Mem(ZYDIS_REGISTER_EAX,   // base
+                ZYDIS_REGISTER_ECX,   // index
+                4,                    // scale
+                8,                    // displacement
+                4),                   // size (DWORD)
+            Operand::Imm(0x1234)))
+        {
+            printf("MOV DWORD [EAX+ECX*4+8], 0x1234: ");
+            for (uint8_t b : bytes) printf("%02X ", b);
+            printf("\n");
+        }
+
+        // ==============================================
+        // call 0x12345678 (32-битный режим)
+        // ==============================================
+        if (BuildAsm86At(bytes, ZYDIS_MNEMONIC_CALL,
+            { Operand::Imm(0x12345678) },  // Абсолютный адрес
+            0x13371337))                   // Текущий адрес инструкции
+        {
+            printf("CALL 0x12345678: ");
+            for (uint8_t b : bytes)
+                printf("%02X ", b);
+            printf(" (%zu байт)\n", bytes.size());
+        }
+    }
+}
+#endif
+
 #if 0
 void IatTestUC()
 {
@@ -6947,23 +7351,26 @@ void VMTEST(int a1)
     //void* pACPISSDT = regions.size() ? regions[0].baseAddress : null;
     //printf("[*] pACPISSDT=0x%p\n", pACPISSDT);
 
+
     AsmRunner runner(false);
     const bool bCRC = true;
     const bool bBefore = false;
     const bool bBrokeCRC = false;
+#define _ADDR(_p) (bCRC ? addrCRC(_p) : addr(_p))
 
-    void* pEntry = bCRC ? addrCRC(0x60F2F0C0) : addr(0x60F2F0C0);
-    void* pEntryArg = bCRC ? addrCRC(0x615CDB58) : addr(0x615CDB58);
+    void* pEntry = _ADDR(0x60F2F0C0);
+    void* pEntryArg = _ADDR(0x615CDB58);
 
-    uintptr_t pThemidaStart = (uintptr_t)(bCRC ? addrCRC(0x629D5000) : addr(0x629D5000));
-    uintptr_t pThemidaEnd = (uintptr_t)(bCRC ? addrCRC(0x630DD000) : addr(0x630DD000));
-    uintptr_t p4Ex = (uintptr_t)(bCRC ? addrCRC(0x62A35968) : addr(0x62A35968));
-    uintptr_t pCRC = (uintptr_t)(bCRC ? addrCRC(0x60F0101D) : addr(0x60F0101D));
-    uintptr_t pPostSend = (uintptr_t)(bCRC ? addrCRC(0x60F2D910) : addr(0x60F2D910));
-    uintptr_t pMalloc = (uintptr_t)(bCRC ? addrCRC(0x610AE29B) : addr(0x610AE29B));
-    uintptr_t pB64 = (uintptr_t)(bCRC ? addrCRC(0x60F303A0) : addr(0x60F303A0));
-    uintptr_t pMd5 = (uintptr_t)(bCRC ? addrCRC(0x61020220) : addr(0x61020220));
+    uintptr_t pThemidaStart = (uintptr_t)(_ADDR(0x629D5000));
+    uintptr_t pThemidaEnd = (uintptr_t)(_ADDR(0x630DD000));
+    uintptr_t p4Ex = (uintptr_t)(_ADDR(0x62A35968));
+    uintptr_t pCRC = (uintptr_t)(_ADDR(0x60F0101D));
+    uintptr_t pPostSend = (uintptr_t)(_ADDR(0x60F2D910));
+    uintptr_t pMalloc = (uintptr_t)(_ADDR(0x610AE29B));
+    uintptr_t pB64 = (uintptr_t)(_ADDR(0x60F303A0));
+    uintptr_t pMd5 = (uintptr_t)(_ADDR(0x61020220));
 
+    AsmRunner::TestScanA(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000);
     MboxSTD("VMENTRY_UT_HK", "hold");
 
     //crc start 0x60F01000,  size 0x47A000
@@ -7621,12 +8028,18 @@ void VMTEST(int a1)
             return true;
         }, &runner, bBefore, true);
 
+    // Themida: читает из какой то памяти вне модуля crc посчитанную в boot
+    // MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch_  
+    // v6 = (unsigned __int16)(v1 & 0x800) >> 11
+    // v1 = (unsigned __int8)(v1 & 0x80) >> 7;
+
     //runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
     runner.SetDisasmAfterCB(true);
     //runner.SetRWHistory(true);
     runner.SetDisasmRVA(true, 0x60F00000);
-    //runner.SetPCTrace("trace_crc.txt", true, 0, 9'500'000);
+    //runner.SetPCTrace("TR1.txt", true, 0, /*9'500'000*/nCrcSumEnd);
+    //runner.SetPCTrace("TR2.txt", true, 0, /*9'500'000*/nCrcSumEnd);
     runner.SetLogDisasmICNotice(500'000 * 20);
     //runner.AddDeadzoneIC(nCpyStart, nCpyEnd); // skip rep movsd
     //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd); // skip crc eax sum
@@ -7635,7 +8048,7 @@ void VMTEST(int a1)
     runner.AddDeadzoneIC(nA1, nA2, false);
     runner.InitIDAWS();
     //runner.WaitIDAWSConnection();
-    runner.ComparePCTrace("trace_crc3.txt", "trace_crc2.txt", true);
+    runner.ComparePCTrace("TR1.txt", "TR2.txt", true, "TR_cmp.txt");
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
     if (!bCRC) {
         uintptr_t mod = runner.CopyModule(STEAM_LIB);

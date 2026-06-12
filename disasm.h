@@ -37,6 +37,7 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <initializer_list>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -211,7 +212,9 @@ public:
 	static void EXIT_S();
 	static uintptr_t RestorePointer(uintptr_t op_addr, uintptr_t offset);
 	static uintptr_t CalculateOffset(uintptr_t op_addr, uintptr_t dst);
-	static void* SearchPointerByPattern(void* ptrStart, int block_size, std::string pattern);
+	static uintptr_t SearchPointerByPattern(uintptr_t ptrStart, uint32_t block_size, std::string pattern);
+	static std::vector<uintptr_t> ScanPattern(uintptr_t pStart, uintptr_t pEnd, std::string pattern);
+	static std::vector<uintptr_t> ScanBytes(uintptr_t pStart, uintptr_t pEnd, const std::vector<uint8_t>& bytes);
 	struct tMemoryRegion
 	{
 		void* baseAddress;
@@ -316,7 +319,7 @@ public:
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
 	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0);
-	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr);
+	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep);
 	void Pause();
 	void Resume();
@@ -402,6 +405,9 @@ public:
 	tMemSnapshot MakeSnapshot(uintptr_t pStart, uintptr_t pEnd);
 	tMemSnapshot MakeSnapshotS(uintptr_t pStart, uintptr_t nSize);
 	void CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly = true);
+
+	// Others
+	static void TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
 
 	template <typename T>
 	T ReadMemory(uintptr_t pAddr)
@@ -692,6 +698,162 @@ private:
 	bool LoadExportsFromBase(uintptr_t base, std::vector<tFuncNode>& out) const;
 };
 
+// TODO: RAII-обёртку для сегментов кода, Добавить поддержку относительных меток, 
+namespace ArAsmCode
+{
+	struct Operand
+	{
+		enum class Kind : uint8_t
+		{
+			Reg,
+			Imm,
+			Mem,
+			Ptr
+		};
+
+		Kind kind = Kind::Reg;
+
+		ZydisRegister reg = ZYDIS_REGISTER_NONE;
+
+		bool immSigned = false;
+		ZyanU64 immU = 0;
+		ZyanI64 immS = 0;
+
+		struct MemOp
+		{
+			ZydisRegister base = ZYDIS_REGISTER_NONE;
+			ZydisRegister index = ZYDIS_REGISTER_NONE;
+			ZyanU8 scale = 1;
+			ZyanI64 displacement = 0;
+			ZyanU16 size = 0; // bytes
+		} mem;
+
+		struct PtrOp
+		{
+			ZyanU16 segment = 0;
+			ZyanU32 offset = 0;
+		} ptr;
+
+		static Operand Reg(ZydisRegister r);
+		template<typename T, typename std::enable_if_t<std::is_integral_v<T>, int> = 0>
+		static Operand Imm(T v)
+		{
+			Operand o;
+			o.kind = Kind::Imm;
+			if constexpr (std::is_signed_v<T>)
+			{
+				o.immSigned = true;
+				o.immS = static_cast<ZyanI64>(v);
+			}
+			else
+			{
+				o.immSigned = false;
+				o.immU = static_cast<ZyanU64>(v);
+			}
+			return o;
+		}
+
+		static Operand Mem(ZydisRegister base = ZYDIS_REGISTER_NONE,
+			ZydisRegister index = ZYDIS_REGISTER_NONE,
+			ZyanU8 scale = 1,
+			ZyanI64 displacement = 0,
+			ZyanU16 size = 0);
+
+		static Operand Ptr(ZyanU16 segment, ZyanU32 offset);
+	};
+
+	struct BuildOptions
+	{
+		ZydisAddressSizeHint address_size_hint = ZYDIS_ADDRESS_SIZE_HINT_NONE;
+		ZydisOperandSizeHint operand_size_hint = ZYDIS_OPERAND_SIZE_HINT_NONE;
+		ZydisBranchType branch_type = ZYDIS_BRANCH_TYPE_NONE;
+		ZydisBranchWidth branch_width = ZYDIS_BRANCH_WIDTH_NONE;
+		ZydisInstructionAttributes prefixes = 0;
+		ZydisEncodableEncoding allowed_encodings = ZYDIS_ENCODABLE_ENCODING_DEFAULT;
+	};
+
+	bool BuildAsm(std::vector<uint8_t>& bytes,
+		ZydisMachineMode mode,
+		ZydisMnemonic mnemonic,
+		std::initializer_list<Operand> ops,
+		const BuildOptions& options = BuildOptions{},
+		ZyanU64 runtimeAddress = 0);
+
+	inline bool BuildAsm86(std::vector<uint8_t>& bytes,
+		ZydisMnemonic mnemonic,
+		std::initializer_list<Operand> ops,
+		const BuildOptions& options = BuildOptions{})
+	{
+		return BuildAsm(bytes, ZYDIS_MACHINE_MODE_LEGACY_32, mnemonic, ops, options, 0);
+	}
+
+	inline bool BuildAsm86At(std::vector<uint8_t>& bytes,
+		ZydisMnemonic mnemonic,
+		std::initializer_list<Operand> ops,
+		ZyanU64 runtimeAddress,
+		const BuildOptions& options = BuildOptions{})
+	{
+		return BuildAsm(bytes, ZYDIS_MACHINE_MODE_LEGACY_32, mnemonic, ops, options, runtimeAddress);
+	}
+
+	inline bool BuildAsm64(std::vector<uint8_t>& bytes,
+		ZydisMnemonic mnemonic,
+		std::initializer_list<Operand> ops,
+		const BuildOptions& options = BuildOptions{})
+	{
+		return BuildAsm(bytes, ZYDIS_MACHINE_MODE_LONG_64, mnemonic, ops, options, 0);
+	}
+
+	inline bool BuildAsm64At(std::vector<uint8_t>& bytes,
+		ZydisMnemonic mnemonic,
+		std::initializer_list<Operand> ops,
+		ZyanU64 runtimeAddress,
+		const BuildOptions& options = BuildOptions{})
+	{
+		return BuildAsm(bytes, ZYDIS_MACHINE_MODE_LONG_64, mnemonic, ops, options, runtimeAddress);
+	}
+
+	inline bool BuildAsm86Op0(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic)
+	{
+		return BuildAsm86(bytes, mnemonic, {});
+	}
+
+	inline bool BuildAsm64Op0(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic)
+	{
+		return BuildAsm64(bytes, mnemonic, {});
+	}
+
+	inline bool BuildAsm86Op1(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a)
+	{
+		return BuildAsm86(bytes, mnemonic, { a });
+	}
+
+	inline bool BuildAsm64Op1(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a)
+	{
+		return BuildAsm64(bytes, mnemonic, { a });
+	}
+
+	inline bool BuildAsm86Op2(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b)
+	{
+		return BuildAsm86(bytes, mnemonic, { a, b });
+	}
+
+	inline bool BuildAsm64Op2(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b)
+	{
+		return BuildAsm64(bytes, mnemonic, { a, b });
+	}
+
+	inline bool BuildAsm86Op3(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, Operand c)
+	{
+		return BuildAsm86(bytes, mnemonic, { a, b, c });
+	}
+
+	inline bool BuildAsm64Op3(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, Operand c)
+	{
+		return BuildAsm64(bytes, mnemonic, { a, b, c });
+	}
+}
+
 class MemoryPatcher
 {
 public:
@@ -805,10 +967,20 @@ public:
 
 //0x7FFDF000 fs TEB Thread Environment Block FS:[0]
 
+// Themida Research Notes
+//https://github.com/stuxnet147/Themida-Research
+// читает в vmentry байты из кучи вне модуля правильной crc
+// нет dispatcher, flow exec последовательный, в каждом handler в конце идёт декодер + джам на следующий handler (dispatch loop unroll)
+// crc проверяет так: читает правильный crc из boot, virtualalloc(ctrlsectionsz) rep movsb секции, считает checksum, virtualfree kernel32
+// MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch количество их в билде неограниченное // https://back.engineering/blog/09/05/2026/
+// jcc(.themida) (разные константы && (v1 & 0x40) == 0) всегда v5 = (unsigned __int16)(v1 & 0x800) >> 11; v1 = (unsigned __int8)(v1 & 0x80) >> 7;
+
 // links
-//https://github.com/colby57/VMP-Imports-Deobfuscator/tree/3d9817024ea58d806a52a2bd85dde5b1c697dc75
+//https://github.com/colby57/VMP-Imports-Deobfuscator
 //https://github.com/KuNgia09/vmp3-import-fix
 //https://github.com/pulpgit/Themida-Imports-Deobfuscator-main/tree/84e8edf96a2b8a9134bf40c97ad94e8cb558ff16
+//https://github.com/stuxnet147/Themida-Research
+//https://back.engineering/blog/09/05/2026/
 //https://github.com/MMaZaHaKa/awesome_anti_virus_engine
 //https://github.com/gmh5225/awesome-game-security/tree/1f857416ca85858759eb44da277bf070046498b0
 //https://github.com/samshine/VoyagerWithEPT
