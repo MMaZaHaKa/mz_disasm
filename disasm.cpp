@@ -1073,6 +1073,25 @@ AsmRunner::tDeadzoneIC* AsmRunner::GetCurrentDeadzoneIC()
     return &m_deadzonesIC[idx];
 }
 
+AsmRunner::tBpInfo* AsmRunner::FindBreakpoint(uintptr_t pAddr, bool bCheckRange)
+{
+    if (!m_bUsingBp)
+        return nullptr;
+
+    if (bCheckRange) {
+        auto it = m_breakpoints.upper_bound(pAddr); // первый > pAddr
+        if (it != m_breakpoints.begin()) {
+            --it;
+            if (pAddr >= it->first && pAddr - it->first < it->second.size)
+                return &it->second;
+        }
+        return nullptr;
+    }
+
+    auto it = m_breakpoints.find(pAddr);
+    return it != m_breakpoints.end() ? &it->second : nullptr;
+}
+
 void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC)
 {
     m_bLogDisasm = bLogDisasm;
@@ -1130,6 +1149,10 @@ void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, boo
 
 void AsmRunner::Shutdown()
 {
+    if (m_bLogRunner) {
+        Log("[!] Shutdown!");
+    }
+
     if (m_uc) {
         if (m_hkCode) {
             uc_hook_del(m_uc, m_hkCode);
@@ -1139,14 +1162,6 @@ void AsmRunner::Shutdown()
             uc_hook_del(m_uc, m_hkMem);
             m_hkMem = 0;
         }
-        for (auto it = m_breakpoints.begin(); it != m_breakpoints.end(); ++it) {
-            if (it->second.hook) {
-                uc_hook_del(m_uc, it->second.hook);
-                it->second.hook = 0;
-            }
-        }
-        m_breakpoints.clear();
-
         uc_close(m_uc);
         m_uc = nullptr;
     }
@@ -1168,6 +1183,9 @@ void AsmRunner::Shutdown()
     m_bInitialised = false;
     m_bPaused = false;
     m_bStopped = false;
+    m_breakpoints.clear();
+    m_bUsingBp = false;
+    m_bUsingBpCodeSizeRange = false;
     m_bInitedStack = false;
     m_bInitedSehFS = false;
     m_bDisasmAfterCB = false;
@@ -1379,12 +1397,14 @@ bool AsmRunner::IsInModule(uintptr_t addr) const
 
 std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands, bool& bResOK)
 {
-#ifdef ZYDIS
     //ZydisDecodedInstruction instr{};
     ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
     //ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
 
     bResOK = false;
+
+    if (!instr || !operands)
+        return "???";
 
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
         bytes,
@@ -1419,13 +1439,31 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
     }
 
     return oss.str();
-#else
-    bResOK = false;
-    (void)bytes;
-    (void)size;
-    (void)runtimeAddress;
-    return "???";
-#endif
+}
+
+bool AsmRunner::DecodeOpcode(uc_engine* uc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
+{
+    if (!uc || !instr || !operands)
+        return false;
+
+    //ZydisDecodedInstruction instr{};
+    ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
+    //ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+
+    uintptr_t pc = CurrentPc(uc);
+    std::array<uint8_t, 16> bytes{};
+    if (uc_mem_read(uc, pc, bytes.data(), bytes.size()) == UC_ERR_OK) {
+        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
+            bytes.data(),
+            static_cast<ZyanUSize>(bytes.size()),
+            instr,
+            operands)))
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void AsmRunner::DisassembleWithZydis()
@@ -1492,6 +1530,22 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         return IsPCNormal(pc);
 #endif
     };
+
+#ifndef AR_BP_AFTER_DZ
+    if (m_bUsingBp) // fast, is any bp added
+    {
+        tBpInfo* bp = FindBreakpoint(curPc, m_bUsingBpCodeSizeRange);
+        if (bp && bp->type == BP_CODE && bp->opcodeCb)
+        {
+            if (!_OnBreakpoint(*bp, uc, address, size, user_data, false, (uc_mem_type)0, 0)) {
+                return;
+            }
+            if (ShouldStopCB(true)) {
+                return; // prevent notice in cb with old pc opcode
+            }
+        }
+    }
+#endif
 
     tDeadzoneIC* dz = GetCurrentDeadzoneIC();
     if (dz && (dz->skipAll || dz->skipOpcode))
@@ -1571,6 +1625,22 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
         return;
     }
+
+#ifdef AR_BP_AFTER_DZ
+    if (m_bUsingBp) // fast, is any bp added
+    {
+        tBpInfo* bp = FindBreakpoint(curPc, m_bUsingBpCodeSizeRange);
+        if (bp && bp->type == BP_CODE && bp->opcodeCb)
+        {
+            if (!_OnBreakpoint(*bp, uc, address, size, user_data, false, (uc_mem_type)0, 0)) {
+                return;
+            }
+            if (ShouldStopCB(true)) {
+                return; // prevent notice in cb with old pc opcode
+            }
+        }
+    }
+#endif
 
     // IsAllowedPc checks m_anyJmpHooks
     if (!IsAllowedPc(CurrentPc(uc))) { // halt in rwx allocated halt region
@@ -1791,10 +1861,26 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 {
     (void)user_data;
 
+#ifndef AR_BP_AFTER_DZ
+    if (m_bUsingBp) // fast, is any bp added
+    {
+        tBpInfo* bp = FindBreakpoint(address, true);
+        if (bp && bp->type != BP_CODE && bp->memCb)
+        {
+            if (!_OnBreakpoint(*bp, uc, address, size, user_data, true, type, value)) {
+                return false;
+            }
+            if (ShouldStopCB(true)) {
+                return true; // prevent notice in cb with old pc opcode
+            }
+        }
+    }
+#endif
+
     const tDeadzoneIC* dz = GetCurrentDeadzoneIC();
     if (dz && (dz->skipAll || dz->skipMem))
     {
-        //UC_ERR_FETCH_UNMAPPED/UC_ERR_FETCH_PROT
+        // pc UC_ERR_FETCH_UNMAPPED/UC_ERR_FETCH_PROT
 #ifdef AR_HALT_ADDR_ONLY
         if (dz->checkPC && address == CurrentPc(uc) && IsHaltAddr(address)) { // err dz prot/unalloc exec
 #else
@@ -1804,8 +1890,53 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
             return false;
         }
 
+        // history
+        if (!dz->skipHistory && m_bRWHistory)
+        {
+            uintptr_t addr = static_cast<uintptr_t>(address);
+            uintptr_t sz = static_cast<uintptr_t>(size);
+            bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
+            bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT);
+
+            uintptr_t pc = CurrentPc(uc);
+            uintptr_t histVal = 0;
+
+            if (isWrite)
+            {
+                histVal = static_cast<uintptr_t>(value);
+                if (!m_bX64)
+                    histVal = static_cast<uint32_t>(histVal);
+            }
+            else if (isRead)
+            {
+                // пробуем зафиксировать фактически прочитанное значение
+                // (если память доступна; если нет — останется 0)
+                (void)uc_mem_read(uc, addr, &histVal, static_cast<size_t>(sz));
+                if (!m_bX64)
+                    histVal = static_cast<uint32_t>(histVal);
+            }
+
+            m_RWHistory.push_back({ pc, addr, histVal, sz, m_instrCount, isRead });
+        }
+
         return true; // dz
     }
+
+#ifdef AR_BP_AFTER_DZ
+    if (m_bUsingBp) // fast, is any bp added
+    {
+        tBpInfo* bp = FindBreakpoint(address, true); // or fast false
+        if (bp && bp->type != BP_CODE && bp->memCb)
+        {
+            if (!_OnBreakpoint(*bp, uc, address, size, user_data, true, type, value)) {
+                return false;
+            }
+            if (ShouldStopCB(true)) {
+                return true; // prevent notice in cb with old pc opcode
+            }
+        }
+    }
+#endif
 
     //UC_ERR_FETCH_UNMAPPED/UC_ERR_FETCH_PROT
 #ifdef AR_HALT_ADDR_ONLY
@@ -1844,61 +1975,6 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
         }
 
         m_RWHistory.push_back({pc, addr, histVal, sz, m_instrCount, isRead });
-    }
-
-    ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
-
-#ifdef ZYDIS
-    {
-        uintptr_t pc = CurrentPc(uc);
-        std::array<uint8_t, 16> bytes{};
-        if (uc_mem_read(uc, pc, bytes.data(), bytes.size()) == UC_ERR_OK) {
-            ZydisDecodedInstruction instr{};
-            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
-
-            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
-                bytes.data(),
-                static_cast<ZyanUSize>(bytes.size()),
-                &instr,
-                operands)))
-            {
-                mnemonic = instr.mnemonic;
-            }
-        }
-    }
-#endif
-
-    for (auto it = m_breakpoints.begin(); it != m_breakpoints.end(); ++it) {
-        tBpInfo& bp = it->second;
-        if (bp.type == BP_CODE) continue;
-
-        bool hit = false;
-        if (bp.type == BP_MEM_READ && isRead) hit = (addr >= it->first && addr < it->first + bp.size);
-        if (bp.type == BP_MEM_WRITE && isWrite) hit = (addr >= it->first && addr < it->first + bp.size);
-        if (bp.type == BP_MEM_RW && (isRead || isWrite)) hit = (addr >= it->first && addr < it->first + bp.size);
-
-        if (hit) {
-            _OnBreakpoint(uc, addr);
-            if (bp.cb) {
-                if (!bp.cb(uc, addr, bp.data)) {
-                    ShutdownByCallback(uc);
-                    return false;
-                }
-                if (ShouldStopCB(true)) {
-                    return true;
-                }
-            }
-            else if (m_cbBreak) {
-                if (!m_cbBreak(uc, addr, m_cbBreakData)) {
-                    ShutdownByCallback(uc);
-                    return false;
-                }
-                if (ShouldStopCB(true)) {
-                    return true;
-                }
-            }
-            break;
-        }
     }
 
     if (m_bLogMemRW) {
@@ -1944,7 +2020,15 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
         m_trace.file << oss.str() << "\n";
     }
 
-    if (m_cbMem) {
+    if (m_cbMem)
+    {
+        // unshure: is need mnemonic for memory cb? mb delete or default ZYDIS_MNEMONIC_INVALID
+        ZydisDecodedInstruction instr{};
+        ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+        bool bDecodeOK = DecodeOpcode(uc, &instr, operands);
+        ZydisMnemonic mnemonic = bDecodeOK ? instr.mnemonic : ZYDIS_MNEMONIC_INVALID;
+
         if (!m_cbMem(uc, static_cast<int32_t>(type), addr, sz, static_cast<uintptr_t>(value), mnemonic, m_cbMemData)) {
             ShutdownByCallback(uc);
             return false;
@@ -2004,7 +2088,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
         {
             if (n.moduleBase && n.funcRva && (n.moduleBase + n.funcRva) == to)
             {
-                if (!m_cbIATCall(uc, to, 0, mnemonic, m_cbIATCallData)) {
+                if (!m_cbIATCall(uc, from, to, size, mnemonic, m_cbIATCallData)) {
                     ShutdownByCallback(uc);
                     return false;
                 }
@@ -2029,11 +2113,49 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
     return true;
 }
 
-void AsmRunner::_OnBreakpoint(uc_engine* uc, uintptr_t address)
+bool AsmRunner::_OnBreakpoint(const tBpInfo& bp, uc_engine* uc, uint64_t address, uint32_t size, void* user_data, bool bMemory, uc_mem_type type, int64_t value)
 {
     (void)uc;
     if (m_bLogRunner) {
-        Log("[BP] hit at 0x%p (%s)", (void*)address, FormatRuntimeAddressWithSymbol(address).c_str());
+        Log("[BP %s] hit at 0x%p", bMemory ? "MEM" : "CODE", (void*)address);
+    }
+
+    ZydisDecodedInstruction instr{};
+    ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+    if (!DecodeOpcode(uc, &instr, operands)) {
+        if (m_bLogRunner)
+            Log("OnBreakpoint Error Decode!");
+        return false;
+    }
+
+    if (!bMemory) // code
+    {
+        uintptr_t curPc = static_cast<uintptr_t>(address);
+        if (!m_bX64)
+            curPc = static_cast<uint32_t>(curPc);
+
+        if (!bp.opcodeCb(uc, curPc, size, instr.mnemonic, bp.data)) {
+            ShutdownByCallback(uc);
+            return false;
+        }
+        if (ShouldStopCB(false)) {
+            return true; // prevent notice in cb with old pc opcode
+        }
+    }
+    else // memory
+    {
+        // unshure: is need mnemonic for memory cb? mb delete or default ZYDIS_MNEMONIC_INVALID
+        uintptr_t addr = static_cast<uintptr_t>(address);
+        uintptr_t sz = static_cast<uintptr_t>(size);
+        if (!bp.memCb(uc, static_cast<int32_t>(type), addr, sz, static_cast<uintptr_t>(value), instr.mnemonic, bp.data)) {
+            ShutdownByCallback(uc);
+            return false;
+        }
+
+        if (ShouldStopCB(false)) {
+            return true;
+        }
     }
 }
 
@@ -2528,7 +2650,7 @@ uintptr_t AsmRunner::SearchPointerByPattern(uintptr_t ptrStart, uint32_t block_s
 std::vector<uintptr_t> AsmRunner::ScanPattern(uintptr_t pStart, uintptr_t pEnd, std::string pattern)
 {
     std::vector<uintptr_t> scanRes;
-    if (pStart == 0 || pEnd == 0 || pStart == pEnd || pattern.empty()) // !0 native memory
+    if (pStart == 0 || pEnd == 0 || pEnd <= pStart || pattern.empty()) // !0 native memory
         return scanRes;
 
     uintptr_t current = pStart;
@@ -2545,7 +2667,7 @@ std::vector<uintptr_t> AsmRunner::ScanPattern(uintptr_t pStart, uintptr_t pEnd, 
 std::vector<uintptr_t> AsmRunner::ScanBytes(uintptr_t pStart, uintptr_t pEnd, const std::vector<uint8_t>& bytes)
 {
     std::vector<uintptr_t> scanRes;
-    if(pStart == 0 || pEnd == 0 || pStart == pEnd || bytes.size() == 0) // !0 native memory
+    if(pStart == 0 || pEnd == 0 || pEnd <= pStart || bytes.size() == 0) // !0 native memory
         return scanRes;
 
     size_t bytesLen = bytes.size();
@@ -2560,6 +2682,35 @@ std::vector<uintptr_t> AsmRunner::ScanBytes(uintptr_t pStart, uintptr_t pEnd, co
     }
 
     return scanRes;
+}
+
+uintptr_t AsmRunner::ScanBytesBlock(uintptr_t pStart, uintptr_t pEnd, const std::vector<std::vector<uint8_t>>& bytes, bool bStartAlignPat)
+{
+    if (pStart == 0 || pEnd == 0 || pEnd <= pStart || bytes.empty())
+        return 0;
+
+    uintptr_t minFirst = pEnd;
+    bool allFound = true;
+
+    for (const auto& pat : bytes) {
+        if (pat.empty()) continue;
+        uintptr_t found = 0;
+        for (uintptr_t p = pStart; p <= pEnd - pat.size(); p++) {
+            if (memcmp((void*)p, pat.data(), pat.size()) == 0) {
+                found = p;
+                break;
+            }
+        }
+        if (!found) {
+            allFound = false;
+            break;
+        }
+        if (found < minFirst) minFirst = found;
+    }
+
+    if (!allFound) return 0;
+
+    return bStartAlignPat ? minFirst : pStart;
 }
 
 std::vector<AsmRunner::tMemoryRegion> AsmRunner::FindRegions(SIZE_T targetSize, DWORD targetType, DWORD targetProtect, DWORD targetState)
@@ -3893,8 +4044,12 @@ void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModul
             }
             else
             {
-                if (m_bLogRunner)
-                    Log("[IAT] wrapper 0x%p unresolved", (void*)funcPtr);
+                if (m_bLogRunner) {
+                    if(bTryResolveInModule)
+                        Log("[IAT] wrapper 0x%p unresolved", (void*)funcPtr);
+                    else
+                        Log("[IAT] module wrapper 0x%p skip resolve", (void*)funcPtr);
+                }
 
                 if (rim)
                     FileAdd(rim, "%zu", iatIndex);
@@ -3923,7 +4078,7 @@ void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModul
     }
 }
 
-void AsmRunner::SetIATCallCB(OnOpcodeCb cb, void* data)
+void AsmRunner::SetIATCallCB(OnJmpCb cb, void* data)
 {
     m_cbIATCall = std::move(cb);
     m_cbIATCallData = data;
@@ -5394,9 +5549,9 @@ void AsmRunner::ClearRWHistory()
     m_RWHistory.clear();
 }
 
-void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode, bool skipTrace)
+void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode, bool skipTrace, bool skipHistory)
 {
-    m_deadzonesIC.push_back({ startIC, endIC, checkPC, skipJmps, skipMem, skipOpcode, skipAll, skipTrace, false });
+    m_deadzonesIC.push_back({ startIC, endIC, checkPC, skipJmps, skipMem, skipOpcode, skipAll, skipTrace, skipHistory, false });
 
     std::sort(m_deadzonesIC.begin(), m_deadzonesIC.end(),
         [](const tDeadzoneIC& a, const tDeadzoneIC& b) { return a.startIC < b.startIC; });
@@ -5733,23 +5888,102 @@ tFuncNode AsmRunner::GetSymByAddr(uintptr_t pAddr)
     return s ? *s : tFuncNode{};
 }
 
-void AsmRunner::SetBreakpoint(uintptr_t pAddr, eBpType type, uint32_t size, OnBreakpointCb cb, void* data)
+void AsmRunner::SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data, uint32_t size)
 {
+    if (!cb)
+        return;
+
+    if (size != 1 && !m_bUsingBpCodeSizeRange) {
+        SetUsingBpCodeSizeRange(true);
+        if (m_bLogRunner)
+            Log("[*] SetBreakpointCode with wider range, toggle on code bp range check");
+    }
+
     tBpInfo& bp = m_breakpoints[pAddr];
     bp.size = size ? size : 1;
-    bp.type = type;
-    bp.cb = std::move(cb);
+    bp.type = BP_CODE;
+    bp.opcodeCb = std::move(cb);
+    bp.memCb = nullptr;
     bp.data = data;
+    m_bUsingBp = true;
+}
+
+void AsmRunner::SetBreakpointRangeCode(uintptr_t pStart, uintptr_t pEnd, OnOpcodeCb cb, void* data/*, uint32_t size*/)
+{
+    if (/*pStart == 0 ||*/ pEnd == 0 || pEnd <= pStart || !cb)
+        return;
+
+    //for (uintptr_t addr = pStart; addr <= pEnd; addr += (size ? size : 1))
+    for (uintptr_t addr = pStart; addr < pEnd; ++addr)
+        SetBreakpointCode(addr, cb, data/*, size*/);
+}
+
+void AsmRunner::SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, OnMemCb cb, void* data)
+{
+    if (size == 0 || !cb)
+        return;
+
+    if (type != BP_MEM_READ && type != BP_MEM_WRITE && type != BP_MEM_RW)
+        return;
+
+    tBpInfo& bp = m_breakpoints[pAddr];
+    bp.size = size;
+    bp.type = type;
+    bp.opcodeCb = nullptr;
+    bp.memCb = std::move(cb);
+    bp.data = data;
+    m_bUsingBp = true;
+}
+
+void AsmRunner::SetBreakpointRangeMem(uintptr_t pStart, uintptr_t pEnd, uint32_t size, eBpType type, OnMemCb cb, void* data)
+{
+    if (/*pStart == 0 ||*/ pEnd == 0 || pEnd <= pStart || size == 0 || !cb)
+        return;
+
+    const uintptr_t step = size ? size : 1;
+    for (uintptr_t addr = pStart; addr < pEnd; addr += step)
+        SetBreakpointMem(addr, size, type, cb, data);
 }
 
 void AsmRunner::RemoveBreakpoint(uintptr_t pAddr)
 {
-    std::map<uintptr_t, tBpInfo>::iterator it = m_breakpoints.find(pAddr);
-    if (it != m_breakpoints.end()) {
-        if (m_uc && it->second.hook) {
-            uc_hook_del(m_uc, it->second.hook);
+    m_breakpoints.erase(pAddr);
+    if (m_breakpoints.size() == 0)
+        m_bUsingBp = false;
+}
+
+void AsmRunner::DumpAllBreakpoints(void)
+{
+    printf("=== Breakpoints Dump ===\n");
+    printf("Total breakpoints: %d\n", m_breakpoints.size());
+    printf("m_bUsingBp: %s\n", m_bUsingBp ? "true" : "false");
+    printf("m_bUsingBpCodeSizeRange: %s\n", m_bUsingBpCodeSizeRange ? "true" : "false");
+    printf("\n");
+
+    for (const auto& pair : m_breakpoints)
+    {
+        uintptr_t addr = pair.first;
+        const tBpInfo& bp = pair.second;
+
+        const char* typeStr = "UNKNOWN";
+        switch (bp.type)
+        {
+            case BP_CODE: typeStr = "CODE"; break;
+            case BP_MEM_READ: typeStr = "MEM_READ"; break;
+            case BP_MEM_WRITE: typeStr = "MEM_WRITE"; break;
+            case BP_MEM_RW: typeStr = "MEM_RW"; break;
         }
-        m_breakpoints.erase(it);
+
+        printf("Addr: 0x%p | Type: %s | Size: %u | Data: 0x%p | ", (void*)addr, typeStr, bp.size, bp.data);
+
+        if (bp.opcodeCb)
+            printf("OpcodeCb: 0x%p", (void*)(uintptr_t)bp.opcodeCb.target<void(*)()>());
+        else if (bp.memCb)
+            printf("MemCb: 0x%p", (void*)(uintptr_t)bp.memCb.target<void(*)()>());
+        else
+            printf("Cb: nullptr");
+
+        printf("\n");
     }
 }
 
@@ -6820,6 +7054,8 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
     std::cout << std::flush;
 }
 
+#if 0
+// Any pair
 void AsmRunner::TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
 {
     using namespace ArAsmCode;
@@ -6980,130 +7216,1236 @@ void AsmRunner::TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
     }
 }
 
-namespace ArAsmCode
+// Linear asm
+void AsmRunner::TestScanB(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
 {
-    Operand Operand::Reg(ZydisRegister r)
+    using namespace ArAsmCode;
+
+    // Themida jcc >>11 >>7
+    std::vector<std::pair<ZydisRegister, std::string>> anyRegs = {
+        { ZYDIS_REGISTER_EAX, "EAX" },
+        { ZYDIS_REGISTER_ECX, "ECX" },
+        { ZYDIS_REGISTER_EDX, "EDX" },
+        { ZYDIS_REGISTER_EBX, "EBX" },
+        { ZYDIS_REGISTER_ESP, "ESP" },
+        { ZYDIS_REGISTER_EBP, "EBP" },
+        { ZYDIS_REGISTER_ESI, "ESI" },
+        { ZYDIS_REGISTER_EDI, "EDI" },
+
+        //{ ZYDIS_REGISTER_R8D, "R8D" },
+        //{ ZYDIS_REGISTER_R9D, "R9D" },
+        //{ ZYDIS_REGISTER_R10D, "R10D" },
+        //{ ZYDIS_REGISTER_R11D, "R11D" },
+        //{ ZYDIS_REGISTER_R12D, "R12D" },
+        //{ ZYDIS_REGISTER_R13D, "R13D" },
+        //{ ZYDIS_REGISTER_R14D, "R14D" },
+        //{ ZYDIS_REGISTER_R15D, "R15D" },
+    };
+
+    enum eOpType
     {
-        Operand o;
-        o.kind = Kind::Reg;
-        o.reg = r;
-        return o;
+        AND = 0, // 0x40 R1
+        AND_11, // 0x800 R1
+        SHR_11, // 0xB R1
+        AND_7, // 0x80 R2
+        SHR_7, // 0x7 R2
+    };
+
+    struct tDecodeNode {
+        uintptr_t addr;
+        eOpType type;
+        std::string str;
+        std::string reg;
+        ZydisRegister r;
+    };
+    std::vector<tDecodeNode> scanres;
+
+    struct tPatternNode {
+        std::vector<uint8_t> bytesAsm;
+        eOpType type;
+        std::string str;
+        std::string reg;
+        ZydisRegister r;
+    };
+    std::vector<tPatternNode> patterns;
+
+    auto AddPattern = [&](ZydisMnemonic mnemonic,
+        const Operand& dst,
+        const Operand& src,
+        eOpType type,
+        const std::string& desc,
+        const std::string& regName,
+        ZydisRegister r,
+        const BuildOptions& opts = BuildOptions{}) {
+            std::vector<uint8_t> buffer;
+            if (BuildAsm86Op2(buffer, mnemonic, dst, src, opts)) {
+                patterns.push_back({ buffer, type, desc, regName, r });
+            }
+    };
+
+    for (auto reg : anyRegs)
+    {
+        BuildOptions opts8, opts16, opts32;
+        opts8.force_imm_width = ImmWidth::I8;
+        opts16.force_imm_width = ImmWidth::I16;
+        opts32.force_imm_width = ImmWidth::I32;
+
+        //// ========== AND 0x40 (64) ==========
+        //// Вариант 1: 83 /0 ib (signed 8-bit)
+        //AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm8(0x40),
+        //    AND, "v2 & 0x40 [83/s8]", reg.second, reg.first, opts8);
+
+        //// Вариант 2: 81 /0 id (32-bit)
+        //AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x40),
+        //    AND, "v2 & 0x40 [81/s32]", reg.second, reg.first, opts32);
+
+        //// Вариант 3: Unsigned 8-bit (для полноты)
+        //AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm8(0x40),
+        //    AND, "v2 & 0x40 [83/u8]", reg.second, reg.first, opts8);
+
+
+        // ========== AND 0x800 (2048) ==========
+        // Только 32-бит (не влезает в 8/16)
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x800),
+            AND_11, "v1 & 0x800) >> 11 [81]", reg.second, reg.first, opts32);
+
+        // Unsigned 32-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm32(0x800),
+            AND_11, "v1 & 0x800) >> 11 [81/u]", reg.second, reg.first, opts32);
+
+
+        // ========== SHR 0x0B (11) ==========
+        // SHR всегда использует 8-битный immediate
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm8(0x0B),
+            SHR_11, ">> v1 & 0x800) >> 11 [C1]", reg.second, reg.first, opts8);
+
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::UImm8(0x0B),
+            SHR_11, ">> v1 & 0x800) >> 11 [C1/u]", reg.second, reg.first, opts8);
+
+
+        // ========== AND 0x80 (128) ==========
+        BuildOptions opts8signed;
+        opts8signed.force_imm_width = ImmWidth::I8;
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm8(0x80),
+            AND_7, "v1 & 0x80) >> 7 [83/s8-fail]", reg.second, reg.first, opts8signed);
+
+        // Unsigned 8-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm8(0x80),
+            AND_7, "v1 & 0x80) >> 7 [83/u8]", reg.second, reg.first, opts8);
+
+        // 32-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x80),
+            AND_7, "v1 & 0x80) >> 7 [81/s32]", reg.second, reg.first, opts32);
+
+        // 16-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm16(0x80),
+            AND_7, "v1 & 0x80) >> 7 [81/s16]", reg.second, reg.first, opts16);
+
+
+        // ========== SHR 0x07 (7) ==========
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm8(0x07),
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/s8]", reg.second, reg.first, opts8);
+
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::UImm8(0x07),
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/u8]", reg.second, reg.first, opts8);
+
+        // SHR с 32-бит imm (редко, но бывает)
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm32(0x07),
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/s32]", reg.second, reg.first, opts32);
     }
+    //{
+    //    std::vector<uint8_t> buffer;
 
-    Operand Operand::Mem(ZydisRegister base, ZydisRegister index, ZyanU8 scale, ZyanI64 displacement, ZyanU16 size)
-    {
-        Operand o;
-        o.kind = Kind::Mem;
-        o.mem.base = base;
-        o.mem.index = index;
-        o.mem.scale = scale;
-        o.mem.displacement = displacement;
-        o.mem.size = size;
-        return o;
+    //    BuildAsm86Op2(buffer, ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm(0x40));
+    //    patterns.push_back({ buffer, AND, "v2 & 0x40", reg.second });
+    //    buffer.clear();
+
+    //    BuildAsm86Op2(buffer, ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm(0x800));
+    //    patterns.push_back({ buffer, AND_11, "& v1 & 0x800) >> 11", reg.second });
+    //    buffer.clear();
+
+    //    BuildAsm86Op2(buffer, ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm(0x0B));
+    //    patterns.push_back({ buffer, SHR_11, ">> v1 & 0x800) >> 11", reg.second });
+    //    buffer.clear();
+
+    //    BuildAsm86Op2(buffer, ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm(0x80));
+    //    patterns.push_back({ buffer, AND_7, "& v1 & 0x80) >> 7", reg.second });
+    //    buffer.clear();
+
+    //    BuildAsm86Op2(buffer, ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm(0x07));
+    //    patterns.push_back({ buffer, SHR_7, ">> v1 & 0x80) >> 7", reg.second });
+    //    buffer.clear();
+    //}
+
+    // Сортируем для уникализации
+    std::sort(patterns.begin(), patterns.end(),
+        [](const tPatternNode& a, const tPatternNode& b) {
+            return a.bytesAsm < b.bytesAsm;
+        });
+
+    // Удаляем дубликаты
+    auto last = std::unique(patterns.begin(), patterns.end(),
+        [](const tPatternNode& a, const tPatternNode& b) {
+            return a.bytesAsm == b.bytesAsm;
+        });
+    patterns.erase(last, patterns.end());
+
+//#define TEST_SCAN_LOG
+#ifdef TEST_SCAN_LOG
+    printf("=== Patterns ===\n");
+    for (const auto& pattern : patterns) {
+        printf("Pattern: %-20s Reg: %-5s Bytes: ", pattern.str.c_str(), pattern.reg.c_str());
+
+        for (size_t i = 0; i < pattern.bytesAsm.size(); i++) {
+            printf("%02X ", pattern.bytesAsm[i]);
+        }
+
+        printf(" [");
+        for (size_t i = 0; i < pattern.bytesAsm.size(); i++) {
+            if (isprint(pattern.bytesAsm[i])) {
+                printf("%c", pattern.bytesAsm[i]);
+            }
+            else {
+                printf(".");
+            }
+        }
+        printf("]\n");
     }
+    printf("========================\n\n");
+#endif
 
-    Operand Operand::Ptr(ZyanU16 segment, ZyanU32 offset)
-    {
-        Operand o;
-        o.kind = Kind::Ptr;
-        o.ptr.segment = segment;
-        o.ptr.offset = offset;
-        return o;
-    }
+    //for (const auto& pattern : patterns) {
+    //    printf("%s %s\n", pattern.str.c_str(), pattern.reg.c_str());
+    //}
 
-#ifdef ZYDIS
-    static void FillOperand(ZydisEncoderOperand& dst, const Operand& src)
-    {
-        dst = {};
+    // Сканируем все паттерны и заполняем scanres
+    for (const auto& pattern : patterns) {
+        std::vector<uintptr_t> found = ScanBytes(pStart, pEnd, pattern.bytesAsm);
 
-        switch (src.kind)
-        {
-        case Operand::Kind::Reg:
-            dst.type = ZYDIS_OPERAND_TYPE_REGISTER;
-            dst.reg.value = src.reg;
-            break;
-
-        case Operand::Kind::Imm:
-            dst.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
-            if (src.immSigned)
-                dst.imm.s = src.immS;
-            else
-                dst.imm.u = src.immU;
-            break;
-
-        case Operand::Kind::Mem:
-            dst.type = ZYDIS_OPERAND_TYPE_MEMORY;
-            dst.mem.base = src.mem.base;
-            dst.mem.index = src.mem.index;
-            dst.mem.scale = src.mem.scale;
-            dst.mem.displacement = src.mem.displacement;
-            dst.mem.size = src.mem.size;
-            break;
-
-        case Operand::Kind::Ptr:
-            dst.type = ZYDIS_OPERAND_TYPE_POINTER;
-            dst.ptr.segment = src.ptr.segment;
-            dst.ptr.offset = src.ptr.offset;
-            break;
+        for (auto addr : found) {
+            scanres.push_back({ addr, pattern.type, pattern.str, pattern.reg, pattern.r });
         }
     }
 
-    bool BuildAsm(std::vector<uint8_t>& bytes,
-        ZydisMachineMode mode,
-        ZydisMnemonic mnemonic,
-        std::initializer_list<Operand> ops,
-        const BuildOptions& options,
-        ZyanU64 runtimeAddress)
+    // Сортируем scanres по адресу
+    std::sort(scanres.begin(), scanres.end(),
+        [](const tDecodeNode& a, const tDecodeNode& b) {
+            return a.addr < b.addr;
+        });
+
+    //// Инициализация/обработка результатов
+    //for (const auto& node : scanres) {
+    //    printf("Addr: 0x%p -> Final: 0x%p | %s\n", (void*)node.addr, (void*)(node.addr - pOffset), node.str.c_str());
+    //}
+
+    //printf("Total found nodes: %zu\n", scanres.size()); // 8372
+
+    // Строгая 16-инструкционная цепочка:
+    // AND_11, SHR_11, AND_7, SHR_7  x4
+    static constexpr eOpType kNeedle[] = {
+        AND_11, SHR_11, AND_7, SHR_7,
+        AND_11, SHR_11, AND_7, SHR_7,
+        AND_11, SHR_11, AND_7, SHR_7,
+        AND_11, SHR_11, AND_7, SHR_7
+    };
+    constexpr size_t kNeedleLen = sizeof(kNeedle) / sizeof(kNeedle[0]);
+
+    // Лямбда-компаратор: проверяет потенциальный блок по позиции pos
+    auto IsPotentialBlock = [&](size_t pos) -> bool
     {
-        bytes.clear();
-
-        ZydisEncoderRequest req{};
-        req.machine_mode = mode;
-        req.mnemonic = mnemonic;
-        req.allowed_encodings = options.allowed_encodings;
-        req.prefixes = options.prefixes;
-        req.branch_type = options.branch_type;
-        req.branch_width = options.branch_width;
-        req.address_size_hint = options.address_size_hint;
-        req.operand_size_hint = options.operand_size_hint;
-        req.operand_count = static_cast<ZyanU8>(ops.size());
-
-        if (ops.size() > ZYDIS_ENCODER_MAX_OPERANDS)
+        if (pos + kNeedleLen > scanres.size())
             return false;
 
-        size_t i = 0;
-        for (const auto& op : ops)
+        for (size_t i = 0; i < kNeedleLen; ++i)
         {
-            FillOperand(req.operands[i++], op);
+            const auto& cur = scanres[pos + i];
+
+            // Проверяем тип в строгом порядке
+            if (cur.type != kNeedle[i])
+                return false;
+
+            // Проверяем, что адреса идут линейно
+            if (i > 0 && cur.addr <= scanres[pos + i - 1].addr)
+                return false;
         }
 
-        std::array<ZyanU8, ZYDIS_MAX_INSTRUCTION_LENGTH> buffer{};
-        ZyanUSize length = buffer.size();
-        ZyanStatus st = ZYAN_STATUS_SUCCESS;
+        // Если нужно жестко требовать, чтобы каждая пара работала на одном регистре:
+        for (size_t i = 0; i < kNeedleLen; i += 4)
+        {
+            if (scanres[pos + i + 0].r != scanres[pos + i + 1].r)
+                return false; // AND_11 / SHR_11 на одном регистре
 
-        if (runtimeAddress != 0)
-            st = ZydisEncoderEncodeInstructionAbsolute(&req, buffer.data(), &length, runtimeAddress);
-        else
-            st = ZydisEncoderEncodeInstruction(&req, buffer.data(), &length);
+            if (scanres[pos + i + 2].r != scanres[pos + i + 3].r)
+                return false; // AND_7 / SHR_7 на одном регистре
+        }
 
-        if (!ZYAN_SUCCESS(st))
-            return false;
+        // Если хочешь еще жестче:
+        // return scanres[pos + 0].r == scanres[pos + 1].r &&
+        //        scanres[pos + 0].r == scanres[pos + 2].r &&
+        //        scanres[pos + 0].r == scanres[pos + 3].r &&
+        //        ... и т.д.
 
-        bytes.assign(buffer.begin(), buffer.begin() + static_cast<size_t>(length));
         return true;
+    };
+
+    // Ищем блоки
+    std::vector<size_t> blocks;
+    for (size_t i = 0; i + kNeedleLen <= scanres.size(); )
+    {
+        if (IsPotentialBlock(i))
+        {
+            blocks.push_back(i);
+            i += kNeedleLen; // не пересекать найденный блок
+        }
+        else
+        {
+            ++i;
+        }
+    }
+
+    // Вывод всех найденных блоков
+    printf("=== Blocks ===\n");
+    for (size_t b : blocks)
+    {
+        const auto& first = scanres[b];
+        const auto& last = scanres[b + kNeedleLen - 1];
+
+        printf("BLOCK: start=0x%p end=0x%p | firstReg=%s | lastReg=%s\n",
+            (void*)(first.addr - pOffset),
+            (void*)(last.addr - pOffset),
+            first.reg.c_str(),
+            last.reg.c_str());
+
+#ifdef TEST_SCAN_LOG
+        for (size_t i = 0; i < kNeedleLen; ++i)
+        {
+            const auto& n = scanres[b + i];
+            printf("  [%02zu] Addr=0x%p | Type=%d | Reg=%-5s | %s\n",
+                i,
+                (void*)n.addr,
+                (int)n.type,
+                n.reg.c_str(),
+                n.str.c_str());
+        }
+#endif
+    }
+    printf("Total blocks found: %zu\n", blocks.size());
+}
+#endif
+
+// By Window (the best)
+void AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
+{
+#undef max
+    using namespace ArAsmCode;
+
+    // Themida jcc >>11 >>7
+    std::vector<std::pair<ZydisRegister, std::string>> anyRegs = {
+        { ZYDIS_REGISTER_EAX, "EAX" },
+        { ZYDIS_REGISTER_ECX, "ECX" },
+        { ZYDIS_REGISTER_EDX, "EDX" },
+        { ZYDIS_REGISTER_EBX, "EBX" },
+        { ZYDIS_REGISTER_ESP, "ESP" },
+        { ZYDIS_REGISTER_EBP, "EBP" },
+        { ZYDIS_REGISTER_ESI, "ESI" },
+        { ZYDIS_REGISTER_EDI, "EDI" },
+
+        //{ ZYDIS_REGISTER_R8D, "R8D" },
+        //{ ZYDIS_REGISTER_R9D, "R9D" },
+        //{ ZYDIS_REGISTER_R10D, "R10D" },
+        //{ ZYDIS_REGISTER_R11D, "R11D" },
+        //{ ZYDIS_REGISTER_R12D, "R12D" },
+        //{ ZYDIS_REGISTER_R13D, "R13D" },
+        //{ ZYDIS_REGISTER_R14D, "R14D" },
+        //{ ZYDIS_REGISTER_R15D, "R15D" },
+    };
+
+    enum eOpType
+    {
+        AND = 0, // 0x40 R1
+        AND_11, // 0x800 R1
+        SHR_11, // 0xB R1
+        AND_7, // 0x80 R2
+        SHR_7, // 0x7 R2
+    };
+
+    struct tPatternNode {
+        std::vector<uint8_t> bytesAsm;
+        eOpType type;
+        std::string str;
+        std::string reg;
+        ZydisRegister r;
+    };
+
+    std::vector<tPatternNode> patterns;
+
+    auto AddPattern = [&](ZydisMnemonic mnemonic,
+        const Operand& dst,
+        const Operand& src,
+        eOpType type,
+        const std::string& desc,
+        const std::string& regName,
+        ZydisRegister r,
+        const BuildOptions& opts = BuildOptions{})
+    {
+        std::vector<uint8_t> buffer;
+        if (BuildAsm86Op2(buffer, mnemonic, dst, src, opts)) {
+            patterns.push_back({ buffer, type, desc, regName, r });
+            {
+                printf("[%s] %s: ", regName.c_str(), desc.c_str());
+                for (uint8_t b : buffer) printf("%02X ", b);
+                printf("\n");
+            }
+        }
+    };
+
+    for (auto reg : anyRegs)
+    {
+        BuildOptions opts8, opts16, opts32;
+        opts8.force_imm_width = ImmWidth::I8;
+        opts16.force_imm_width = ImmWidth::I16;
+        opts32.force_imm_width = ImmWidth::I32;
+
+        // ========== AND 0x40 (64) ==========
+        // Вариант 1: 83 /0 ib (signed 8-bit)
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm8(0x40),
+            AND, "v2 & 0x40 [83/s8]", reg.second, reg.first, opts8);
+
+        // Вариант 2: 81 /0 id (32-bit)
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x40),
+            AND, "v2 & 0x40 [81/s32]", reg.second, reg.first, opts32);
+
+        // Вариант 3: Unsigned 8-bit (для полноты)
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm8(0x40),
+            AND, "v2 & 0x40 [83/u8]", reg.second, reg.first, opts8);
+
+
+        // ========== AND 0x800 (2048) ==========
+        // Только 32-бит (не влезает в 8/16)
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x800),
+            AND_11, "v1 & 0x800) >> 11 [81]", reg.second, reg.first, opts32);
+
+        // Unsigned 32-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm32(0x800),
+            AND_11, "v1 & 0x800) >> 11 [81/u]", reg.second, reg.first, opts32);
+
+
+        // ========== SHR 0x0B (11) ==========
+        // SHR всегда использует 8-битный immediate
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm8(0x0B),
+            SHR_11, ">> v1 & 0x800) >> 11 [C1]", reg.second, reg.first, opts8);
+
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::UImm8(0x0B),
+            SHR_11, ">> v1 & 0x800) >> 11 [C1/u]", reg.second, reg.first, opts8);
+
+
+        // ========== AND 0x80 (128) ==========
+        BuildOptions opts8signed;
+        opts8signed.force_imm_width = ImmWidth::I8;
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm8(0x80),
+            AND_7, "v1 & 0x80) >> 7 [83/s8-fail]", reg.second, reg.first, opts8signed);
+
+        // Unsigned 8-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm8(0x80),
+            AND_7, "v1 & 0x80) >> 7 [83/u8]", reg.second, reg.first, opts8);
+
+        // 32-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x80),
+            AND_7, "v1 & 0x80) >> 7 [81/s32]", reg.second, reg.first, opts32);
+
+        // 16-bit
+        AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm16(0x80),
+            AND_7, "v1 & 0x80) >> 7 [81/s16]", reg.second, reg.first, opts16);
+
+
+        // ========== SHR 0x07 (7) ==========
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm8(0x07),
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/s8]", reg.second, reg.first, opts8);
+
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::UImm8(0x07),
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/u8]", reg.second, reg.first, opts8);
+
+        // SHR с 32-бит imm (редко, но бывает)
+        AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm32(0x07),
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/s32]", reg.second, reg.first, opts32);
+    }
+
+    std::sort(patterns.begin(), patterns.end(),
+        [](const tPatternNode& a, const tPatternNode& b) {
+            return a.bytesAsm < b.bytesAsm;
+        });
+
+    auto last = std::unique(patterns.begin(), patterns.end(),
+        [](const tPatternNode& a, const tPatternNode& b) {
+            return a.bytesAsm == b.bytesAsm;
+        });
+    patterns.erase(last, patterns.end());
+
+    struct tWindowResult {
+        uintptr_t address;
+        std::array<size_t, 5> counts;
+    };
+    std::vector<tWindowResult> result;
+
+    struct tNeed {
+        eOpType type;
+        size_t count;
+    };
+
+    // Settings
+    const std::vector<tNeed> need = {
+        { AND,    1 },
+        { AND_11, 3 }, // 4 default // с 3 окно может высоко и поймать только нужные 3, при 4 окно base будет ниже, 3 на всякий из за оптимизаций jmp reuse?
+        { SHR_11, 3 }, // 4 default
+        { AND_7,  3 }, // 4 default
+        { SHR_7,  3 }, // 4 default
+    };
+
+    uintptr_t nWindowSize = 800; // окно, максимум что встречал 597 от 11 до 7
+    bool bStartAlignPat = true;   // true -> добавлять первый матч в окне, false -> добавлять winStart
+
+
+    std::array<std::vector<const tPatternNode*>, 5> byType;
+    for (const auto& p : patterns) {
+        byType[p.type].push_back(&p);
+    }
+
+    auto ValidateWindow = [&](uintptr_t ws, uintptr_t we, uintptr_t& firstHit, std::array<size_t, 5>& foundCounts) -> bool
+    {
+        std::array<size_t, 5> found{};
+        firstHit = 0;
+        uintptr_t minPos = std::numeric_limits<uintptr_t>::max();
+
+        for (const auto& req : need)
+        {
+            for (const auto* pat : byType[req.type])
+            {
+                auto hits = ScanBytes(ws, we, pat->bytesAsm);
+                if (hits.empty())
+                    continue;
+
+                found[req.type] += hits.size();
+
+                for (uintptr_t h : hits) {
+                    if (h < minPos)
+                        minPos = h;
+                }
+            }
+        }
+
+        foundCounts = found;
+
+        for (const auto& req : need) {
+            if (found[req.type] < req.count)
+                return false;
+        }
+
+        firstHit = (minPos == std::numeric_limits<uintptr_t>::max()) ? ws : minPos;
+        return true;
+    };
+
+    // pEnd здесь считается inclusive
+#if 0
+    if (pStart != 0 && pEnd != 0 && pStart < pEnd && nWindowSize > 0 && (pEnd - pStart + 1) >= nWindowSize)
+    {
+        const uintptr_t lastStart = pEnd - nWindowSize + 1;
+
+        for (uintptr_t winStart = pStart; winStart <= lastStart; )
+        {
+            const uintptr_t winEnd = winStart + nWindowSize - 1;
+
+            uintptr_t firstHit = 0;
+            std::array<size_t, 5> foundCounts{};
+            if (ValidateWindow(winStart, winEnd, firstHit, foundCounts))
+            {
+                result.push_back({ bStartAlignPat ? firstHit : winStart, foundCounts });
+                winStart += nWindowSize;
+            }
+            else
+            {
+                ++winStart;
+            }
+        }
     }
 #else
-    bool BuildAsm(std::vector<uint8_t>&,
-        ZydisMachineMode,
-        ZydisMnemonic,
-        std::initializer_list<Operand>,
-        const BuildOptions&,
-        ZyanU64)
+    auto UpdateProgress = [](uintptr_t scanned, uintptr_t total, uintptr_t found, bool force = false) {
+        static uintptr_t lastUpdate = 0;
+
+        if (!force && (scanned - lastUpdate) < 1000 && scanned < total)
+            return;
+
+        lastUpdate = scanned;
+        int percent = (int)((scanned * 100) / total);
+        int barWidth = 50;
+        int pos = (barWidth * percent) / 100;
+
+        printf("\r[");
+        for (int i = 0; i < barWidth; ++i) {
+            if (i < pos) printf("=");
+            else if (i == pos && percent < 100) printf(">");
+            else printf(" ");
+        }
+        printf("] %d%% (%d / %d windows, found: %d)", percent, scanned, total, found);
+        fflush(stdout);
+    };
+
+    uintptr_t totalWindows = 0;
+    uintptr_t scannedWindows = 0;
+    uintptr_t foundWindows = 0;
+
+    // pEnd здесь считается inclusive
+    if (pStart != 0 && pEnd != 0 && pStart < pEnd && nWindowSize > 0 && (pEnd - pStart + 1) >= nWindowSize)
     {
-        return false;
+        const uintptr_t lastStart = pEnd - nWindowSize + 1;
+        totalWindows = (lastStart - pStart + 1);
+
+        for (uintptr_t winStart = pStart; winStart <= lastStart; )
+        {
+            const uintptr_t winEnd = winStart + nWindowSize - 1;
+
+            uintptr_t firstHit = 0;
+            std::array<size_t, 5> foundCounts{};
+            if (ValidateWindow(winStart, winEnd, firstHit, foundCounts))
+            {
+                foundWindows++;
+                uintptr_t blockAddr = bStartAlignPat ? firstHit : winStart;
+                result.push_back({ blockAddr, foundCounts });
+                winStart += nWindowSize;
+            }
+            else
+            {
+                winStart++;
+            }
+
+            scannedWindows++;
+
+            // Update progress on each iteration
+            UpdateProgress(scannedWindows, totalWindows, foundWindows);
+        }
+
+        // Force 100% after loop
+        UpdateProgress(totalWindows, totalWindows, foundWindows, true);
+        printf("\n");
     }
 #endif
+
+    for (uint32_t i = 0; i < result.size(); ++i) {
+        //printf("Window %d: start=0x%p\n", (i + 1), (void*)(result[i].address - pOffset));
+        printf("Window %d: start=0x%p | entries: AND=%d, AND_11=%d, SHR_11=%d, AND_7=%d, SHR_7=%d\n",
+            (i + 1),
+            (void*)(result[i].address - pOffset),
+            result[i].counts[AND],
+            result[i].counts[AND_11],
+            result[i].counts[SHR_11],
+            result[i].counts[AND_7],
+            result[i].counts[SHR_7]);
+    }
+
+    FILE* f = FileOpen("scan_results.txt", "w");
+    if (f) {
+        for (auto& r : result)
+            FileAdd(f, "0x%p 0x%p", (void*)r.address, (void*)(r.address - pOffset));
+
+        FileClose(f);
+        printf("Saved: %zu blocks to scan_results.txt\n", result.size());
+    }
 }
+
+namespace ArAsmCode
+{
+	namespace detail
+	{
+		static void EmitU8(std::vector<uint8_t>& out, uint8_t v) { out.push_back(v); }
+		static void EmitU16(std::vector<uint8_t>& out, uint16_t v)
+		{
+			out.push_back(static_cast<uint8_t>(v & 0xFF));
+			out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+		}
+		static void EmitU32(std::vector<uint8_t>& out, uint32_t v)
+		{
+			out.push_back(static_cast<uint8_t>(v & 0xFF));
+			out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+			out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+			out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+		}
+
+		static bool FitsSigned8(ZyanI64 v)  { return v >= -128 && v <= 127; }
+		static bool FitsSigned16(ZyanI64 v) { return v >= -32768 && v <= 32767; }
+		static bool FitsSigned32(ZyanI64 v) { return v >= INT32_MIN && v <= INT32_MAX; }
+		static bool FitsUnsigned8(ZyanU64 v)  { return v <= 0xFFull; }
+		static bool FitsUnsigned16(ZyanU64 v) { return v <= 0xFFFFull; }
+		static bool FitsUnsigned32(ZyanU64 v) { return v <= 0xFFFFFFFFull; }
+
+		static bool CanEmitImmWidth(const Operand::ImmOp& imm, ImmWidth w)
+		{
+			switch (w)
+			{
+			    case ImmWidth::I8:
+				    return imm.signedValue ? FitsSigned8(imm.s) : FitsUnsigned8(imm.u);
+			    case ImmWidth::I16:
+				    return imm.signedValue ? FitsSigned16(imm.s) : FitsUnsigned16(imm.u);
+			    case ImmWidth::I32:
+				    return imm.signedValue ? FitsSigned32(imm.s) : FitsUnsigned32(imm.u);
+			    default:
+				    return false;
+			}
+		}
+
+		struct GpRegInfo
+		{
+			uint8_t bits = 0;
+			uint8_t code = 0;
+			bool rex = false;
+			bool high8 = false;
+		};
+
+		static bool TryGetGpRegInfo(ZydisRegister reg, GpRegInfo& out)
+		{
+			switch (reg)
+			{
+			    case ZYDIS_REGISTER_AL:  out = { 8, 0, false, false }; return true;
+			    case ZYDIS_REGISTER_CL:  out = { 8, 1, false, false }; return true;
+			    case ZYDIS_REGISTER_DL:  out = { 8, 2, false, false }; return true;
+			    case ZYDIS_REGISTER_BL:  out = { 8, 3, false, false }; return true;
+			    case ZYDIS_REGISTER_AH:  out = { 8, 4, false, true  }; return true;
+			    case ZYDIS_REGISTER_CH:  out = { 8, 5, false, true  }; return true;
+			    case ZYDIS_REGISTER_DH:  out = { 8, 6, false, true  }; return true;
+			    case ZYDIS_REGISTER_BH:  out = { 8, 7, false, true  }; return true;
+
+			    case ZYDIS_REGISTER_SPL: out = { 8, 4, true,  false }; return true;
+			    case ZYDIS_REGISTER_BPL: out = { 8, 5, true,  false }; return true;
+			    case ZYDIS_REGISTER_SIL: out = { 8, 6, true,  false }; return true;
+			    case ZYDIS_REGISTER_DIL: out = { 8, 7, true,  false }; return true;
+
+			    case ZYDIS_REGISTER_R8B:  out = { 8, 0, true, false }; return true;
+			    case ZYDIS_REGISTER_R9B:  out = { 8, 1, true, false }; return true;
+			    case ZYDIS_REGISTER_R10B: out = { 8, 2, true, false }; return true;
+			    case ZYDIS_REGISTER_R11B: out = { 8, 3, true, false }; return true;
+			    case ZYDIS_REGISTER_R12B: out = { 8, 4, true, false }; return true;
+			    case ZYDIS_REGISTER_R13B: out = { 8, 5, true, false }; return true;
+			    case ZYDIS_REGISTER_R14B: out = { 8, 6, true, false }; return true;
+			    case ZYDIS_REGISTER_R15B: out = { 8, 7, true, false }; return true;
+
+			    case ZYDIS_REGISTER_AX:   out = { 16, 0, false, false }; return true;
+			    case ZYDIS_REGISTER_CX:   out = { 16, 1, false, false }; return true;
+			    case ZYDIS_REGISTER_DX:   out = { 16, 2, false, false }; return true;
+			    case ZYDIS_REGISTER_BX:   out = { 16, 3, false, false }; return true;
+			    case ZYDIS_REGISTER_SP:   out = { 16, 4, false, false }; return true;
+			    case ZYDIS_REGISTER_BP:   out = { 16, 5, false, false }; return true;
+			    case ZYDIS_REGISTER_SI:   out = { 16, 6, false, false }; return true;
+			    case ZYDIS_REGISTER_DI:   out = { 16, 7, false, false }; return true;
+
+			    case ZYDIS_REGISTER_R8W:  out = { 16, 0, true, false }; return true;
+			    case ZYDIS_REGISTER_R9W:  out = { 16, 1, true, false }; return true;
+			    case ZYDIS_REGISTER_R10W: out = { 16, 2, true, false }; return true;
+			    case ZYDIS_REGISTER_R11W: out = { 16, 3, true, false }; return true;
+			    case ZYDIS_REGISTER_R12W: out = { 16, 4, true, false }; return true;
+			    case ZYDIS_REGISTER_R13W: out = { 16, 5, true, false }; return true;
+			    case ZYDIS_REGISTER_R14W: out = { 16, 6, true, false }; return true;
+			    case ZYDIS_REGISTER_R15W: out = { 16, 7, true, false }; return true;
+
+			    case ZYDIS_REGISTER_EAX:   out = { 32, 0, false, false }; return true;
+			    case ZYDIS_REGISTER_ECX:   out = { 32, 1, false, false }; return true;
+			    case ZYDIS_REGISTER_EDX:   out = { 32, 2, false, false }; return true;
+			    case ZYDIS_REGISTER_EBX:   out = { 32, 3, false, false }; return true;
+			    case ZYDIS_REGISTER_ESP:   out = { 32, 4, false, false }; return true;
+			    case ZYDIS_REGISTER_EBP:   out = { 32, 5, false, false }; return true;
+			    case ZYDIS_REGISTER_ESI:   out = { 32, 6, false, false }; return true;
+			    case ZYDIS_REGISTER_EDI:   out = { 32, 7, false, false }; return true;
+
+			    case ZYDIS_REGISTER_R8D:  out = { 32, 0, true, false }; return true;
+			    case ZYDIS_REGISTER_R9D:  out = { 32, 1, true, false }; return true;
+			    case ZYDIS_REGISTER_R10D: out = { 32, 2, true, false }; return true;
+			    case ZYDIS_REGISTER_R11D: out = { 32, 3, true, false }; return true;
+			    case ZYDIS_REGISTER_R12D: out = { 32, 4, true, false }; return true;
+			    case ZYDIS_REGISTER_R13D: out = { 32, 5, true, false }; return true;
+			    case ZYDIS_REGISTER_R14D: out = { 32, 6, true, false }; return true;
+			    case ZYDIS_REGISTER_R15D: out = { 32, 7, true, false }; return true;
+
+			    case ZYDIS_REGISTER_RAX:   out = { 64, 0, false, false }; return true;
+			    case ZYDIS_REGISTER_RCX:   out = { 64, 1, false, false }; return true;
+			    case ZYDIS_REGISTER_RDX:   out = { 64, 2, false, false }; return true;
+			    case ZYDIS_REGISTER_RBX:   out = { 64, 3, false, false }; return true;
+			    case ZYDIS_REGISTER_RSP:   out = { 64, 4, false, false }; return true;
+			    case ZYDIS_REGISTER_RBP:   out = { 64, 5, false, false }; return true;
+			    case ZYDIS_REGISTER_RSI:   out = { 64, 6, false, false }; return true;
+			    case ZYDIS_REGISTER_RDI:   out = { 64, 7, false, false }; return true;
+
+			    case ZYDIS_REGISTER_R8:  out = { 64, 0, true, false }; return true;
+			    case ZYDIS_REGISTER_R9:  out = { 64, 1, true, false }; return true;
+			    case ZYDIS_REGISTER_R10: out = { 64, 2, true, false }; return true;
+			    case ZYDIS_REGISTER_R11: out = { 64, 3, true, false }; return true;
+			    case ZYDIS_REGISTER_R12: out = { 64, 4, true, false }; return true;
+			    case ZYDIS_REGISTER_R13: out = { 64, 5, true, false }; return true;
+			    case ZYDIS_REGISTER_R14: out = { 64, 6, true, false }; return true;
+			    case ZYDIS_REGISTER_R15: out = { 64, 7, true, false }; return true;
+
+			    default:
+				    return false;
+			}
+		}
+
+		static bool IsGroup1Mnemonic(ZydisMnemonic m, uint8_t& ext)
+		{
+			switch (m)
+			{
+			    case ZYDIS_MNEMONIC_ADD: ext = 0; return true;
+			    case ZYDIS_MNEMONIC_OR:  ext = 1; return true;
+			    case ZYDIS_MNEMONIC_ADC: ext = 2; return true;
+			    case ZYDIS_MNEMONIC_SBB: ext = 3; return true;
+			    case ZYDIS_MNEMONIC_AND: ext = 4; return true;
+			    case ZYDIS_MNEMONIC_SUB: ext = 5; return true;
+			    case ZYDIS_MNEMONIC_XOR: ext = 6; return true;
+			    case ZYDIS_MNEMONIC_CMP: ext = 7; return true;
+			    default: return false;
+			}
+		}
+
+		static bool IsTestMnemonic(ZydisMnemonic m)
+		{
+			return m == ZYDIS_MNEMONIC_TEST;
+		}
+
+		static ImmWidth NormalizeImmWidth(ImmWidth w)
+		{
+			return w == ImmWidth::I64 ? ImmWidth::I32 : w;
+		}
+
+		static ImmWidth SelectImmWidth(const Operand::ImmOp& imm, const BuildOptions& options)
+		{
+			if (imm.width != ImmWidth::Auto)
+				return NormalizeImmWidth(imm.width);
+			return NormalizeImmWidth(options.force_imm_width);
+		}
+
+		static ZyanI64 ImmAsSigned(const Operand::ImmOp& imm)
+		{
+			return imm.signedValue ? imm.s : static_cast<ZyanI64>(imm.u);
+		}
+
+		static ZyanU64 ImmAsUnsigned(const Operand::ImmOp& imm)
+		{
+			return imm.signedValue ? static_cast<ZyanU64>(imm.s) : imm.u;
+		}
+
+		static void EmitImmediate(std::vector<uint8_t>& out, const Operand::ImmOp& imm, ImmWidth w)
+		{
+			const ZyanU64 u = ImmAsUnsigned(imm);
+			switch (w)
+			{
+			    case ImmWidth::I8:  EmitU8(out, static_cast<uint8_t>(u)); break;
+			    case ImmWidth::I16: EmitU16(out, static_cast<uint16_t>(u)); break;
+			    case ImmWidth::I32: EmitU32(out, static_cast<uint32_t>(u)); break;
+			    default: break;
+			}
+		}
+
+		static bool EncodeModRmSibDisp(std::vector<uint8_t>& tail,
+			ZydisMachineMode mode,
+			const Operand::MemOp& mem,
+			uint8_t regField,
+			uint8_t& rex)
+		{
+			tail.clear();
+
+			GpRegInfo baseInfo{};
+			GpRegInfo indexInfo{};
+			const bool hasBase = mem.base != ZYDIS_REGISTER_NONE;
+			const bool hasIndex = mem.index != ZYDIS_REGISTER_NONE;
+
+			if (hasBase && !TryGetGpRegInfo(mem.base, baseInfo)) return false;
+			if (hasIndex && !TryGetGpRegInfo(mem.index, indexInfo)) return false;
+			if (hasIndex && indexInfo.bits == 8) return false;
+			if (mem.scale != 1 && mem.scale != 2 && mem.scale != 4 && mem.scale != 8) return false;
+
+			if (mode != ZYDIS_MACHINE_MODE_LONG_64)
+			{
+				if ((hasBase && baseInfo.rex) || (hasIndex && indexInfo.rex)) return false;
+			}
+
+			const ZyanI64 disp = mem.displacement;
+			const bool dispFits8 = (disp >= -128 && disp <= 127);
+			const bool dispFits32 = (disp >= INT32_MIN && disp <= INT32_MAX);
+			if (!dispFits32) return false;
+
+			rex = 0;
+			if (mode == ZYDIS_MACHINE_MODE_LONG_64)
+			{
+				if (hasBase && baseInfo.rex) rex |= 0x01;
+				if (hasIndex && indexInfo.rex) rex |= 0x02;
+			}
+
+			uint8_t mod = 0;
+			uint8_t rm = 0;
+			bool emitDisp8 = false;
+			bool emitDisp32 = false;
+			ZyanI32 disp32 = static_cast<ZyanI32>(disp);
+			uint8_t sib = 0;
+			bool useSib = false;
+
+			if (!hasBase)
+			{
+				mod = 0;
+				if (mode == ZYDIS_MACHINE_MODE_LONG_64)
+				{
+					useSib = true;
+					rm = 4;
+					const uint8_t scaleBits = (mem.scale == 1) ? 0 : (mem.scale == 2) ? 1 : (mem.scale == 4) ? 2 : 3;
+					const uint8_t indexBits = hasIndex ? indexInfo.code : 4;
+					sib = static_cast<uint8_t>((scaleBits << 6) | (indexBits << 3) | 5);
+					emitDisp32 = true;
+				}
+				else
+				{
+					rm = 5;
+					emitDisp32 = true;
+				}
+			}
+			else
+			{
+				if (disp == 0 && baseInfo.code != 5)
+					mod = 0;
+				else if (dispFits8)
+				{
+					mod = 1;
+					emitDisp8 = true;
+				}
+				else
+				{
+					mod = 2;
+					emitDisp32 = true;
+				}
+
+				if (baseInfo.code == 5 && mod == 0)
+				{
+					mod = 1;
+					emitDisp8 = true;
+					disp32 = 0;
+				}
+
+				const bool needSib = hasIndex || baseInfo.code == 4;
+				if (needSib)
+				{
+					useSib = true;
+					rm = 4;
+					if (hasIndex && indexInfo.code == 4) return false;
+					const uint8_t scaleBits = (mem.scale == 1) ? 0 : (mem.scale == 2) ? 1 : (mem.scale == 4) ? 2 : 3;
+					const uint8_t indexBits = hasIndex ? indexInfo.code : 4;
+					const uint8_t baseBits = baseInfo.code;
+					sib = static_cast<uint8_t>((scaleBits << 6) | (indexBits << 3) | baseBits);
+				}
+				else
+				{
+					rm = baseInfo.code;
+				}
+			}
+
+			tail.push_back(static_cast<uint8_t>((mod << 6) | ((regField & 7) << 3) | (rm & 7)));
+			if (useSib) tail.push_back(sib);
+			if (emitDisp8) tail.push_back(static_cast<uint8_t>(disp32 & 0xFF));
+			else if (emitDisp32) EmitU32(tail, static_cast<uint32_t>(disp32));
+			return true;
+		}
+
+		static bool EncodeAluImm(std::vector<uint8_t>& out,
+			ZydisMachineMode mode,
+			ZydisMnemonic mnemonic,
+			const Operand& dst,
+			const Operand::ImmOp& srcImm,
+			ImmWidth requestedWidth)
+		{
+			const ImmWidth req = NormalizeImmWidth(requestedWidth);
+			uint8_t groupExt = 0;
+			const bool isGroup1 = IsGroup1Mnemonic(mnemonic, groupExt);
+			const bool isTest = IsTestMnemonic(mnemonic);
+			if (!isGroup1 && !isTest) return false;
+
+
+			if (dst.kind == Operand::Kind::Reg)
+			{
+				GpRegInfo r{};
+				if (!TryGetGpRegInfo(dst.reg, r)) return false;
+				if (mode != ZYDIS_MACHINE_MODE_LONG_64 && r.rex) return false;
+
+				const bool need66 = (r.bits == 16);
+				const bool needREXW = (r.bits == 64);
+				const bool needREX = (mode == ZYDIS_MACHINE_MODE_LONG_64 && r.rex);
+				if (r.high8 && (mode == ZYDIS_MACHINE_MODE_LONG_64 && needREX)) return false;
+
+				uint8_t opcode = 0;
+				ImmWidth immWidth = ImmWidth::Auto;
+
+				if (isTest)
+				{
+					if (r.bits == 8) { opcode = 0xF6; immWidth = ImmWidth::I8; }
+					else if (r.bits == 16) { opcode = 0xF7; immWidth = ImmWidth::I16; }
+					else if (r.bits == 32) { opcode = 0xF7; immWidth = ImmWidth::I32; }
+					else if (r.bits == 64) { opcode = 0xF7; immWidth = ImmWidth::I32; }
+					else return false;
+
+					if (req != ImmWidth::Auto)
+						immWidth = req == ImmWidth::I64 ? ImmWidth::I32 : req;
+
+					if (!CanEmitImmWidth(srcImm, immWidth)) return false;
+					if (immWidth == ImmWidth::I64) return false;
+
+					out.clear();
+					if (need66) EmitU8(out, 0x66);
+					if (mode == ZYDIS_MACHINE_MODE_LONG_64 && (needREXW || needREX))
+					{
+						uint8_t rex = 0x40;
+						if (needREXW) rex |= 0x08;
+						if (needREX) rex |= 0x01;
+						EmitU8(out, rex);
+					}
+					EmitU8(out, opcode);
+					EmitU8(out, static_cast<uint8_t>(0xC0 | (0 << 3) | (r.code & 7)));
+					EmitImmediate(out, srcImm, immWidth);
+					return true;
+				}
+
+				if (r.bits == 8)
+				{
+					opcode = 0x80;
+					immWidth = ImmWidth::I8;
+					if (req == ImmWidth::I16 || req == ImmWidth::I32 || req == ImmWidth::I64) return false;
+				}
+				else
+				{
+					if (req == ImmWidth::I8)
+					{
+						opcode = 0x83;
+						immWidth = ImmWidth::I8;
+					}
+					else if (req == ImmWidth::I16)
+					{
+						if (r.bits != 16) return false;
+						opcode = 0x81;
+						immWidth = ImmWidth::I16;
+					}
+					else if (req == ImmWidth::I32)
+					{
+						if (r.bits == 16) return false;
+						opcode = 0x81;
+						immWidth = ImmWidth::I32;
+					}
+					else if (req == ImmWidth::I64)
+					{
+						if (r.bits != 64) return false;
+						opcode = 0x81;
+						immWidth = ImmWidth::I32;
+					}
+					else
+					{
+						const ZyanI64 v = ImmAsSigned(srcImm);
+						if (FitsSigned8(v)) { opcode = 0x83; immWidth = ImmWidth::I8; }
+						else { opcode = 0x81; immWidth = (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32; }
+					}
+				}
+
+				if (!CanEmitImmWidth(srcImm, immWidth)) return false;
+
+				out.clear();
+				if (need66) EmitU8(out, 0x66);
+				if (mode == ZYDIS_MACHINE_MODE_LONG_64 && (needREXW || needREX))
+				{
+					uint8_t rex = 0x40;
+					if (needREXW) rex |= 0x08;
+					if (needREX) rex |= 0x01;
+					EmitU8(out, rex);
+				}
+				EmitU8(out, opcode);
+				EmitU8(out, static_cast<uint8_t>(0xC0 | ((groupExt & 7) << 3) | (r.code & 7)));
+				EmitImmediate(out, srcImm, immWidth);
+				return true;
+			}
+
+			if (dst.kind == Operand::Kind::Mem)
+			{
+				if (dst.mem.size != 1 && dst.mem.size != 2 && dst.mem.size != 4 && dst.mem.size != 8) return false;
+
+				uint8_t opcode = 0;
+				ImmWidth immWidth = ImmWidth::Auto;
+				if (isTest)
+				{
+					opcode = (dst.mem.size == 1) ? 0xF6 : 0xF7;
+					immWidth = (dst.mem.size == 1) ? ImmWidth::I8 : (dst.mem.size == 2) ? ImmWidth::I16 : ImmWidth::I32;
+					if (req != ImmWidth::Auto) immWidth = (req == ImmWidth::I64) ? ImmWidth::I32 : req;
+				}
+				else
+				{
+					if (dst.mem.size == 1)
+					{
+						opcode = 0x80;
+						immWidth = ImmWidth::I8;
+					}
+					else if (req == ImmWidth::I16)
+					{
+						if (dst.mem.size != 2) return false;
+						opcode = 0x81;
+						immWidth = ImmWidth::I16;
+					}
+					else if (req == ImmWidth::I32 || req == ImmWidth::I64)
+					{
+						if (dst.mem.size == 2) return false;
+						opcode = 0x81;
+						immWidth = ImmWidth::I32;
+					}
+					else
+					{
+						const ZyanI64 v = ImmAsSigned(srcImm);
+						if (FitsSigned8(v)) { opcode = 0x83; immWidth = ImmWidth::I8; }
+						else { opcode = 0x81; immWidth = (dst.mem.size == 2) ? ImmWidth::I16 : ImmWidth::I32; }
+					}
+				}
+
+				if (!CanEmitImmWidth(srcImm, immWidth)) return false;
+
+				out.clear();
+				if (dst.mem.size == 2) EmitU8(out, 0x66);
+
+				std::vector<uint8_t> tail;
+				uint8_t rex = 0;
+				if (!EncodeModRmSibDisp(tail, mode, dst.mem, isTest ? 0 : groupExt, rex)) return false;
+
+				if (dst.mem.size == 8)
+					rex |= 0x08;
+
+				if (mode == ZYDIS_MACHINE_MODE_LONG_64 && rex != 0)
+					EmitU8(out, static_cast<uint8_t>(0x40 | rex));
+
+				EmitU8(out, opcode);
+				out.insert(out.end(), tail.begin(), tail.end());
+				EmitImmediate(out, srcImm, immWidth);
+				return true;
+			}
+
+			return false;
+		}
+
+		static bool TryExactEncodeLegacyImm(std::vector<uint8_t>& out,
+			ZydisMachineMode mode,
+			ZydisMnemonic mnemonic,
+			std::initializer_list<Operand> ops,
+			const BuildOptions& options)
+		{
+			if (ops.size() != 2)
+				return false;
+
+			auto it = ops.begin();
+			const Operand& a = *it++;
+			const Operand& b = *it;
+			if (b.kind != Operand::Kind::Imm)
+				return false;
+
+			ImmWidth requested = b.imm.width != ImmWidth::Auto ? b.imm.width : options.force_imm_width;
+			return EncodeAluImm(out, mode, mnemonic, a, b.imm, requested);
+		}
+
+		static void FillOperand(ZydisEncoderOperand& dst, const Operand& src)
+		{
+			dst = {};
+			switch (src.kind)
+			{
+			    case Operand::Kind::Reg:
+				    dst.type = ZYDIS_OPERAND_TYPE_REGISTER;
+				    dst.reg.value = src.reg;
+				    break;
+			    case Operand::Kind::Imm:
+				    dst.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+				    if (src.imm.signedValue) dst.imm.s = src.imm.s;
+				    else dst.imm.u = src.imm.u;
+				    break;
+			    case Operand::Kind::Mem:
+				    dst.type = ZYDIS_OPERAND_TYPE_MEMORY;
+				    dst.mem.base = src.mem.base;
+				    dst.mem.index = src.mem.index;
+				    dst.mem.scale = src.mem.scale;
+				    dst.mem.displacement = src.mem.displacement;
+				    dst.mem.size = src.mem.size;
+				    break;
+			    case Operand::Kind::Ptr:
+				    dst.type = ZYDIS_OPERAND_TYPE_POINTER;
+				    dst.ptr.segment = src.ptr.segment;
+				    dst.ptr.offset = src.ptr.offset;
+				    break;
+			}
+		}
+	}
+
+	Operand Operand::Reg(ZydisRegister r)
+	{
+		Operand o;
+		o.kind = Kind::Reg;
+		o.reg = r;
+		return o;
+	}
+
+	Operand Operand::Mem(ZydisRegister base, ZydisRegister index, ZyanU8 scale, ZyanI64 displacement, ZyanU16 size)
+	{
+		Operand o;
+		o.kind = Kind::Mem;
+		o.mem.base = base;
+		o.mem.index = index;
+		o.mem.scale = scale;
+		o.mem.displacement = displacement;
+		o.mem.size = size;
+		return o;
+	}
+
+	Operand Operand::Ptr(ZyanU16 segment, ZyanU32 offset)
+	{
+		Operand o;
+		o.kind = Kind::Ptr;
+		o.ptr.segment = segment;
+		o.ptr.offset = offset;
+		return o;
+	}
+
+	bool BuildAsm(std::vector<uint8_t>& bytes,
+		ZydisMachineMode mode,
+		ZydisMnemonic mnemonic,
+		std::initializer_list<Operand> ops,
+		const BuildOptions& options,
+		ZyanU64 runtimeAddress)
+	{
+		bytes.clear();
+
+		if (detail::TryExactEncodeLegacyImm(bytes, mode, mnemonic, ops, options))
+			return true;
+
+		if (ops.size() > ZYDIS_ENCODER_MAX_OPERANDS)
+			return false;
+
+		ZydisEncoderRequest req{};
+		req.machine_mode = mode;
+		req.mnemonic = mnemonic;
+		req.allowed_encodings = options.allowed_encodings;
+		req.prefixes = options.prefixes;
+		req.branch_type = options.branch_type;
+		req.branch_width = options.branch_width;
+		req.address_size_hint = options.address_size_hint;
+		req.operand_size_hint = options.operand_size_hint;
+		req.operand_count = static_cast<ZyanU8>(ops.size());
+
+		std::size_t i = 0;
+		for (const auto& op : ops)
+			detail::FillOperand(req.operands[i++], op);
+
+		std::array<ZyanU8, ZYDIS_MAX_INSTRUCTION_LENGTH> buffer{};
+		ZyanUSize length = buffer.size();
+		const ZyanStatus st = (runtimeAddress != 0)
+			? ZydisEncoderEncodeInstructionAbsolute(&req, buffer.data(), &length, runtimeAddress)
+			: ZydisEncoderEncodeInstruction(&req, buffer.data(), &length);
+
+		if (!ZYAN_SUCCESS(st))
+			return false;
+
+		bytes.assign(buffer.begin(), buffer.begin() + static_cast<std::size_t>(length));
+		return true;
+	}
+}
+
 
 #if 0
 void TestArBuilder()
@@ -7370,7 +8712,56 @@ void VMTEST(int a1)
     uintptr_t pB64 = (uintptr_t)(_ADDR(0x60F303A0));
     uintptr_t pMd5 = (uintptr_t)(_ADDR(0x61020220));
 
-    AsmRunner::TestScanA(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000);
+    std::vector<uintptr_t> jcc = { // TestScanC
+        0x62A3F44E,
+        0x62A856A9,
+        0x62A8F8D7,
+        0x62AA2FB8,
+        0x62ABE7B8,
+        0x62B6CE83,
+        0x62B6DF05,
+        0x62BCF4C4,
+        0x62BD1A2B,
+        0x62BDCEA5,
+        //0x62BE10B5,
+        0x62CE3E24,
+        0x62D2C575,
+        0x62D355D7,
+        0x62D47D1B,
+        0x62D52E25,
+        0x62D77055,
+        0x62DD02A0,
+        //0x62E52D54,
+        0x62E55700,
+        0x62E581CC,
+    };
+    uintptr_t jvvBpTolerance = 100; // окно вверх от паттерна &40 чтобы выйти на безусловный прямой codeflow
+    auto JccBpCb = [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        printf("JccBpCb: 0x%p\n", address);
+        MboxSTD("IF COND FLOW BLOCK", "disasm"); // *possible
+
+        return true;
+    };
+    for (const auto& p : jcc) {
+        //runner.SetUsingBpCodeSizeRange(true);
+        runner.SetBreakpointRangeCode((uintptr_t)_ADDR(p - jvvBpTolerance), (uintptr_t)_ADDR(p), JccBpCb, &runner);
+        //runner.SetBreakpointCode((uintptr_t)_ADDR(p - jvvBpTolerance), JccBpCb, &runner, jvvBpTolerance);
+    }
+
+    //runner.SetBreakpointCode((uintptr_t)_ADDR(0x610C495A), JccBpCb, &runner, 50);
+    //runner.SetBreakpointRangeCode((uintptr_t)_ADDR(0x610C495A - 50), (uintptr_t)_ADDR(0x610C495A), JccBpCb, &runner);
+    //runner.SetBreakpointMem(p4Ex, 20, BP_MEM_RW,
+    //	[&](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    //	auto* self = static_cast<AsmRunner*>(user_data);
+    //	printf("mem bp: 0x%p\n", address);
+    //	MboxSTD("mem bp", "disasm");
+
+    //	return true;
+    //	}, &runner);
+
+
+    //AsmRunner::TestScanC(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000);
     MboxSTD("VMENTRY_UT_HK", "hold");
 
     //crc start 0x60F01000,  size 0x47A000
@@ -7430,6 +8821,9 @@ void VMTEST(int a1)
             SetConsoleColor(1);
         }
 
+        //if(address == (uintptr_t)_ADDR(0x610C495A))
+        //	MboxSTD("bp", "disasm");
+
         //if(address == pMd5)
         //	MboxSTD("md5", "disasm");
         //if (address == pB64)
@@ -7488,7 +8882,7 @@ void VMTEST(int a1)
 
     auto MemCb = [&](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        //printf("MemCb 0x%p %d %d %d pc 0x%p\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc));
+        //printf("MemCb 0x%p %d %d %d pc 0x%p mn %d\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic);
 
         if (!self || !uc || size == 0)
             return true;
@@ -8017,16 +9411,16 @@ void VMTEST(int a1)
                     self->SetRegister(self->AxReg(), 0);
                     self->UpdatePC(retaddr, true);
                     return true;
-                }
+                    }
 
                 printf("[malloc] allocated 0x%p bytes at 0x%p\n", (void*)dwSize, (void*)allocated);
-            }
+                }
 
             self->SetRegister(self->AxReg(), allocated);
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore, true);
+            }, &runner, bBefore, true);
 
     // Themida: читает из какой то памяти вне модуля crc посчитанную в boot
     // MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch_  
@@ -8048,7 +9442,7 @@ void VMTEST(int a1)
     runner.AddDeadzoneIC(nA1, nA2, false);
     runner.InitIDAWS();
     //runner.WaitIDAWSConnection();
-    runner.ComparePCTrace("TR1.txt", "TR2.txt", true, "TR_cmp.txt");
+    //runner.ComparePCTrace("TR1.txt", "TR2.txt", true, "TR_cmp.txt");
     //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
     if (!bCRC) {
         uintptr_t mod = runner.CopyModule(STEAM_LIB);

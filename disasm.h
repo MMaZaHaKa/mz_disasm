@@ -21,6 +21,7 @@
 #define AR_IDA_WS
 //#define AR_HALT_JMPCB // allow jmp cb notify jmp to halt
 #define AR_HALT_ADDR_ONLY // fast + correct halt shutdown log, the rest is neat (unmapped execute)
+//#define AR_BP_AFTER_DZ // faster dz
 
 #ifdef CopyMemory
 #undef CopyMemory
@@ -121,7 +122,7 @@ enum eBpType : uint32_t
 	BP_CODE = 0,  // инструкция (UC_HOOK_CODE)
 	BP_MEM_READ = 1,  // чтение памяти
 	BP_MEM_WRITE = 2,  // запись памяти
-	BP_MEM_RW = 3   // чтение или запись
+	BP_MEM_RW = 3   // чтение или запись // access
 };
 
 
@@ -138,9 +139,6 @@ public:
 
 	// Тип колбэка для перехода: вызывается при jmp/call/ret // Pre - Jump transfer callback
 	using OnJmpCb = std::function<bool(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data)>;
-
-	// Тип колбэка для брейкпоинта
-	using OnBreakpointCb = std::function<bool(uc_engine* uc, uintptr_t address, void* user_data)>;
 
 	// Тип колбэка для трассировки: возвращает true для остановки трассировки
 	using TraceCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t instruction_count, void* user_data)>;
@@ -169,6 +167,8 @@ public:
 	bool IsLogRunner() const { return m_bLogRunner; }
 	void SetX64(bool isX64) { m_bX64 = isX64; }
 	bool IsX64() const { return m_bX64; }
+	void SetUsingBpCodeSizeRange(bool bUsingBpCodeSizeRange) { m_bUsingBpCodeSizeRange = bUsingBpCodeSizeRange; }
+	bool IsUsingBpCodeSizeRange() const { return m_bUsingBpCodeSizeRange; }
 	void SetSkipCBCallsWithNewPC(bool bSkipCBCallsWithNewPC) { m_bSkipCBCallsWithNewPC = bSkipCBCallsWithNewPC; }
 	bool IsSkipCBCallsWithNewPC() const { return m_bSkipCBCallsWithNewPC; }
 	void SetRWHistory(bool enabled) { m_bRWHistory = enabled; }
@@ -215,6 +215,7 @@ public:
 	static uintptr_t SearchPointerByPattern(uintptr_t ptrStart, uint32_t block_size, std::string pattern);
 	static std::vector<uintptr_t> ScanPattern(uintptr_t pStart, uintptr_t pEnd, std::string pattern);
 	static std::vector<uintptr_t> ScanBytes(uintptr_t pStart, uintptr_t pEnd, const std::vector<uint8_t>& bytes);
+	static uintptr_t ScanBytesBlock(uintptr_t pStart, uintptr_t pEnd, const std::vector<std::vector<uint8_t>>& bytes, bool bStartAlignPat);
 	struct tMemoryRegion
 	{
 		void* baseAddress;
@@ -303,8 +304,8 @@ public:
 	// callbacks / execution
 	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false); // !moduleHook for new dummy region
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
-	void SetIATCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
-	void SetSysCallCB(OnOpcodeCb cb = nullptr, void* data = nullptr);
+	void SetIATCallCB(OnJmpCb cb, void* data = nullptr);
+	void SetSysCallCB(OnOpcodeCb cb, void* data = nullptr);
 	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
 	tIEFuncNode* FindIATNode(std::string funcName, std::string moduleName = "", bool bLowerCmp = true, bool bContains = false);
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
@@ -334,7 +335,7 @@ public:
 	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
 	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
 	void ClearRWHistory();
-	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC = true, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true, bool skipTrace = true);
+	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC = true, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true, bool skipTrace = true, bool skipHistory = true);
 	void InstallDefaultHooks(HookNotifyCb cb);
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
@@ -345,9 +346,12 @@ public:
 	void DisassembleWithZydis();
 	void DisassembleWithCapstone();
 
-	void SetBreakpoint(uintptr_t pAddr, eBpType type = BP_CODE, uint32_t size = 1, OnBreakpointCb cb = nullptr, void* data = nullptr);
+	void SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data = nullptr, uint32_t size = 1);
+	void SetBreakpointRangeCode(uintptr_t pStart, uintptr_t pEnd, OnOpcodeCb cb, void* data = nullptr/*, uint32_t size = 1*/);
+	void SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, OnMemCb cb, void* data = nullptr);
+	void SetBreakpointRangeMem(uintptr_t pStart, uintptr_t pEnd, uint32_t size, eBpType type, OnMemCb cb, void* data = nullptr);
 	void RemoveBreakpoint(uintptr_t pAddr);
-	// TODO: AddTraceInstructionPoint // точка с которой начинается логирование в обчном Run
+	void DumpAllBreakpoints(void);
 	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr, bool bPCArray = false); // 0 until end, cb can null autofalse
 
 	// IDA 7.6 IDC // https://docs.hex-rays.com/9.0/developer-guide/idc/idc-api-reference/alphabetical-list-of-idc-functions/686
@@ -389,11 +393,11 @@ public:
 	// "r+" - чтение и запись (файл должен существовать)
 	// "w+" - чтение и запись (создает новый или перезаписывает)
 	// "a+" - чтение и добавление (создает новый, если не существует)
-	FILE* FileOpen(const char* filename, const char* mode = "w");
-	size_t FileSize(FILE* file);
-	size_t FileRead(FILE* file, void* pb, size_t sz);
-	void FileAdd(FILE* file, const char* fmt, ...);
-	void FileClose(FILE* file);
+	static FILE* FileOpen(const char* filename, const char* mode = "w");
+	static size_t FileSize(FILE* file);
+	static size_t FileRead(FILE* file, void* pb, size_t sz);
+	static void FileAdd(FILE* file, const char* fmt, ...);
+	static void FileClose(FILE* file);
 
 	// Snapshot
 	struct tMemSnapshot
@@ -408,6 +412,8 @@ public:
 
 	// Others
 	static void TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
+	static void TestScanB(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
+	static void TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
 
 	template <typename T>
 	T ReadMemory(uintptr_t pAddr)
@@ -481,9 +487,9 @@ private:
 	{
 		uint32_t size = 1;
 		eBpType type = BP_CODE;
-		OnBreakpointCb cb;
+		OnOpcodeCb opcodeCb = nullptr;
+		OnMemCb memCb = nullptr;
 		void* data = nullptr;
-		uc_hook hook = 0;
 	};
 
 	// состояние трасировки Tenet
@@ -549,7 +555,8 @@ private:
 		bool skipMem;          // Пропускать MEM колбэки
 		bool skipOpcode;       // Пропускать Opcode колбэки
 		bool skipAll;          // Пропустить всё
-		bool skipTrace;        // Пропустить трасировку
+		bool skipTrace;        // Пропустить трасировку (OpcodeCB)
+		bool skipHistory;      // Пропустить историю (MemCB)
 		bool active;           // Активен ли сейчас
 	};
 
@@ -606,7 +613,7 @@ private:
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
-	OnOpcodeCb m_cbIATCall; // when any call smth from m_iat
+	OnJmpCb m_cbIATCall; // when any call smth from m_iat
 	void* m_cbIATCallData = nullptr;
 	OnOpcodeCb m_cbSysCall; // syscall, int, ud2, etc
 	void* m_cbSysCallData = nullptr;
@@ -634,14 +641,16 @@ private:
 	void* m_cbMemData = nullptr;
 	OnJmpCb m_cbJmp;
 	void* m_cbJmpData = nullptr;
-	OnBreakpointCb m_cbBreak;
-	void* m_cbBreakData = nullptr;
 
 	// флаги управления эмуляцией
 	bool m_bPaused = false;
 	bool m_bStopped = false;
 
+	//std::unordered_map<uintptr_t, tBpInfo> m_breakpoints;
 	std::map<uintptr_t, tBpInfo> m_breakpoints;
+	bool m_bUsingBp = false;
+	bool m_bUsingBpCodeSizeRange = false;
+
 	tTraceState m_trace; // separate run
 	tRTTrace m_rttrace; // default
 
@@ -672,12 +681,13 @@ private:
 	bool CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size);
 	void UpdateDeadzoneIC(uintptr_t currentIC);
 	tDeadzoneIC* GetCurrentDeadzoneIC();
+	tBpInfo* FindBreakpoint(uintptr_t pAddr, bool bCheckRange);
 
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
 	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uint32_t size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
 	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic);        // jmp/call/ret детектируется в _OnInstructionStep
-	void _OnBreakpoint(uc_engine* uc, uintptr_t address);             // срабатывание точки останова
+	bool _OnBreakpoint(const tBpInfo& bp, uc_engine* uc, uint64_t address, uint32_t size, void* user_data, bool bMemory, uc_mem_type type, int64_t value);
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
 
 	// symbol helpers
@@ -691,6 +701,7 @@ private:
 	bool IsInModule(uintptr_t addr) const;
 	void TraceWriteLine(const std::string& s);
 	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands, bool& bResOK);
+	bool DecodeOpcode(uc_engine* uc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands);
 
 	// exports / PE helpers
 	static void TrimInPlace(std::string& s);
@@ -701,6 +712,15 @@ private:
 // TODO: RAII-обёртку для сегментов кода, Добавить поддержку относительных меток, 
 namespace ArAsmCode
 {
+	enum class ImmWidth : uint8_t
+	{
+		Auto,
+		I8,
+		I16,
+		I32,
+		I64
+	};
+
 	struct Operand
 	{
 		enum class Kind : uint8_t
@@ -715,9 +735,13 @@ namespace ArAsmCode
 
 		ZydisRegister reg = ZYDIS_REGISTER_NONE;
 
-		bool immSigned = false;
-		ZyanU64 immU = 0;
-		ZyanI64 immS = 0;
+		struct ImmOp
+		{
+			bool signedValue = false;
+			ImmWidth width = ImmWidth::Auto;
+			ZyanU64 u = 0;
+			ZyanI64 s = 0;
+		} imm;
 
 		struct MemOp
 		{
@@ -725,7 +749,7 @@ namespace ArAsmCode
 			ZydisRegister index = ZYDIS_REGISTER_NONE;
 			ZyanU8 scale = 1;
 			ZyanI64 displacement = 0;
-			ZyanU16 size = 0; // bytes
+			ZyanU16 size = 0; // bytes: 1/2/4/8
 		} mem;
 
 		struct PtrOp
@@ -735,23 +759,35 @@ namespace ArAsmCode
 		} ptr;
 
 		static Operand Reg(ZydisRegister r);
+
 		template<typename T, typename std::enable_if_t<std::is_integral_v<T>, int> = 0>
-		static Operand Imm(T v)
+		static Operand Imm(T v, ImmWidth width = ImmWidth::Auto)
 		{
 			Operand o;
 			o.kind = Kind::Imm;
+			o.imm.width = width;
 			if constexpr (std::is_signed_v<T>)
 			{
-				o.immSigned = true;
-				o.immS = static_cast<ZyanI64>(v);
+				o.imm.signedValue = true;
+				o.imm.s = static_cast<ZyanI64>(v);
 			}
 			else
 			{
-				o.immSigned = false;
-				o.immU = static_cast<ZyanU64>(v);
+				o.imm.signedValue = false;
+				o.imm.u = static_cast<ZyanU64>(v);
 			}
 			return o;
 		}
+
+		static Operand Imm8(ZyanI64 v) { return Imm(v, ImmWidth::I8); }
+		static Operand Imm16(ZyanI64 v) { return Imm(v, ImmWidth::I16); }
+		static Operand Imm32(ZyanI64 v) { return Imm(v, ImmWidth::I32); }
+		static Operand Imm64(ZyanI64 v) { return Imm(v, ImmWidth::I64); }
+
+		static Operand UImm8(ZyanU64 v) { return Imm(v, ImmWidth::I8); }
+		static Operand UImm16(ZyanU64 v) { return Imm(v, ImmWidth::I16); }
+		static Operand UImm32(ZyanU64 v) { return Imm(v, ImmWidth::I32); }
+		static Operand UImm64(ZyanU64 v) { return Imm(v, ImmWidth::I64); }
 
 		static Operand Mem(ZydisRegister base = ZYDIS_REGISTER_NONE,
 			ZydisRegister index = ZYDIS_REGISTER_NONE,
@@ -770,6 +806,7 @@ namespace ArAsmCode
 		ZydisBranchWidth branch_width = ZYDIS_BRANCH_WIDTH_NONE;
 		ZydisInstructionAttributes prefixes = 0;
 		ZydisEncodableEncoding allowed_encodings = ZYDIS_ENCODABLE_ENCODING_DEFAULT;
+		ImmWidth force_imm_width = ImmWidth::Auto;
 	};
 
 	bool BuildAsm(std::vector<uint8_t>& bytes,
@@ -813,44 +850,44 @@ namespace ArAsmCode
 		return BuildAsm(bytes, ZYDIS_MACHINE_MODE_LONG_64, mnemonic, ops, options, runtimeAddress);
 	}
 
-	inline bool BuildAsm86Op0(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic)
+	inline bool BuildAsm86Op0(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm86(bytes, mnemonic, {});
+		return BuildAsm86(bytes, mnemonic, {}, options);
 	}
 
-	inline bool BuildAsm64Op0(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic)
+	inline bool BuildAsm64Op0(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm64(bytes, mnemonic, {});
+		return BuildAsm64(bytes, mnemonic, {}, options);
 	}
 
-	inline bool BuildAsm86Op1(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a)
+	inline bool BuildAsm86Op1(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm86(bytes, mnemonic, { a });
+		return BuildAsm86(bytes, mnemonic, { a }, options);
 	}
 
-	inline bool BuildAsm64Op1(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a)
+	inline bool BuildAsm64Op1(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm64(bytes, mnemonic, { a });
+		return BuildAsm64(bytes, mnemonic, { a }, options);
 	}
 
-	inline bool BuildAsm86Op2(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b)
+	inline bool BuildAsm86Op2(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm86(bytes, mnemonic, { a, b });
+		return BuildAsm86(bytes, mnemonic, { a, b }, options);
 	}
 
-	inline bool BuildAsm64Op2(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b)
+	inline bool BuildAsm64Op2(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm64(bytes, mnemonic, { a, b });
+		return BuildAsm64(bytes, mnemonic, { a, b }, options);
 	}
 
-	inline bool BuildAsm86Op3(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, Operand c)
+	inline bool BuildAsm86Op3(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, Operand c, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm86(bytes, mnemonic, { a, b, c });
+		return BuildAsm86(bytes, mnemonic, { a, b, c }, options);
 	}
 
-	inline bool BuildAsm64Op3(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, Operand c)
+	inline bool BuildAsm64Op3(std::vector<uint8_t>& bytes, ZydisMnemonic mnemonic, Operand a, Operand b, Operand c, const BuildOptions& options = BuildOptions{})
 	{
-		return BuildAsm64(bytes, mnemonic, { a, b, c });
+		return BuildAsm64(bytes, mnemonic, { a, b, c }, options);
 	}
 }
 
