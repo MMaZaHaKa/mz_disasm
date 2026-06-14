@@ -1861,11 +1861,15 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 {
     (void)user_data;
 
+    bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT || type == UC_MEM_READ_AFTER);
+    bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
+    bool isAnyFetch = (type == UC_MEM_FETCH || type == UC_MEM_FETCH_UNMAPPED || type == UC_MEM_FETCH_PROT); // code read
+
 #ifndef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
         tBpInfo* bp = FindBreakpoint(address, true);
-        if (bp && bp->type != BP_CODE && bp->memCb)
+        if (bp && ((bp->type == BP_MEM_READ && isRead) || (bp->type == BP_MEM_WRITE && isWrite) || (bp->type == BP_MEM_RW && (isRead || isWrite))) && bp->memCb)
         {
             if (!_OnBreakpoint(*bp, uc, address, size, user_data, true, type, value)) {
                 return false;
@@ -1895,8 +1899,6 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
         {
             uintptr_t addr = static_cast<uintptr_t>(address);
             uintptr_t sz = static_cast<uintptr_t>(size);
-            bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
-            bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT);
 
             uintptr_t pc = CurrentPc(uc);
             uintptr_t histVal = 0;
@@ -1950,9 +1952,6 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 
     uintptr_t addr = static_cast<uintptr_t>(address);
     uintptr_t sz = static_cast<uintptr_t>(size);
-
-    bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
-    bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT);
 
     if (m_bRWHistory)
     {
