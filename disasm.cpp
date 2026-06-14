@@ -1927,8 +1927,8 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 #ifdef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
-        tBpInfo* bp = FindBreakpoint(address, true); // or fast false
-        if (bp && bp->type != BP_CODE && bp->memCb)
+        tBpInfo* bp = FindBreakpoint(address, true);
+        if (bp && ((bp->type == BP_MEM_READ && isRead) || (bp->type == BP_MEM_WRITE && isWrite) || (bp->type == BP_MEM_RW && (isRead || isWrite))) && bp->memCb)
         {
             if (!_OnBreakpoint(*bp, uc, address, size, user_data, true, type, value)) {
                 return false;
