@@ -59,14 +59,32 @@ void AsmRunner::Log(const char* fmt, ...) const
 void AsmRunner::HookCodeTrampoline(uc_engine* uc, uint64_t address, uint32_t size, void* user_data)
 {
     auto* self = static_cast<AsmRunner*>(user_data);
-    if (self) self->_OnInstructionStep(uc, address, size, user_data);
+    if (!self) {
+        printf("[!] HookCodeTrampoline: Error!\n");
+        return;
+    }
+    self->_OnInstructionStep(uc, address, size, user_data);
 }
 
 bool AsmRunner::HookMemTrampoline(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data)
 {
     auto* self = static_cast<AsmRunner*>(user_data);
-    if (!self) return false;
+    if (!self) {
+        printf("[!] HookMemTrampoline: Error!\n");
+        return false;
+    }
     return self->_OnMemory(uc, type, address, size, value, user_data);
+}
+
+void AsmRunner::HookInsnTrampoline(uc_engine* uc, void* user_data)
+{
+    auto* hook = static_cast<tInsnHookNode*>(user_data);
+    if (!hook || !hook->owner) {
+        printf("[!] HookInsnTrampoline: Error! hook 0x%p, hook->owner 0x%p\n", hook, hook->owner);
+        return;
+    }
+
+    hook->owner->_OnInsn(hook, uc);
 }
 
 bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
@@ -153,10 +171,51 @@ bool AsmRunner::IsSystem(ZydisMnemonic mn)
         case ZYDIS_MNEMONIC_UD0:
         case ZYDIS_MNEMONIC_HLT:
             return true;
-
-        default:
-            return false;
     }
+
+    return false;
+}
+
+bool AsmRunner::IsInsnAllowedZydis(ZydisMnemonic mn)
+{
+    switch (mn)
+    {
+        case ZYDIS_MNEMONIC_IN:
+        case ZYDIS_MNEMONIC_OUT:
+        case ZYDIS_MNEMONIC_SYSCALL:
+        case ZYDIS_MNEMONIC_SYSENTER:
+        case ZYDIS_MNEMONIC_CPUID:
+
+        // ARM64
+        //case ZYDIS_MNEMONIC_MRS:
+        //case ZYDIS_MNEMONIC_MSR:
+        //case ZYDIS_MNEMONIC_SYS:
+        //case ZYDIS_MNEMONIC_SYSL:
+            return true;
+    }
+
+    return false;
+}
+
+bool AsmRunner::IsInsnAllowed(uintptr_t insn)
+{
+    switch (insn)
+    { // see also SetAllInsnCB list
+        case UC_X86_INS_IN:
+        case UC_X86_INS_OUT:
+        case UC_X86_INS_SYSCALL:
+        case UC_X86_INS_SYSENTER:
+        case UC_X86_INS_CPUID:
+        
+        // ARM64
+        case UC_ARM64_INS_MRS:
+        case UC_ARM64_INS_MSR:
+        case UC_ARM64_INS_SYS:
+        case UC_ARM64_INS_SYSL:
+            return true;
+    }
+
+    return false;
 }
 
 bool AsmRunner::ResolveFlagsConditional(ZydisMnemonic mn, bool& bOutCondMn, bool& bOutInvMn)
@@ -1032,12 +1091,12 @@ bool AsmRunner::CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t 
         return false;
     }
 
-    if (m_bLogRunner)
-    {
-        Log("[+] Copied %zu bytes", static_cast<size_t>(size));
-        Log("pStart: 0x%p", (void*)real_base);
-        Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(size), static_cast<size_t>(size / (1024 * 1024)));
-    }
+    //if (m_bLogRunner)
+    //{
+    //    Log("[+] Copied %zu bytes", static_cast<size_t>(size));
+    //    Log("pStart: 0x%p", (void*)real_base);
+    //    Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(size), static_cast<size_t>(size / (1024 * 1024)));
+    //}
 
     return true;
 }
@@ -1071,25 +1130,6 @@ AsmRunner::tDeadzoneIC* AsmRunner::GetCurrentDeadzoneIC()
         return nullptr;
 
     return &m_deadzonesIC[idx];
-}
-
-AsmRunner::tBpInfo* AsmRunner::FindBreakpoint(uintptr_t pAddr, bool bCheckRange)
-{
-    if (!m_bUsingBp)
-        return nullptr;
-
-    if (bCheckRange) {
-        auto it = m_breakpoints.upper_bound(pAddr); // первый > pAddr
-        if (it != m_breakpoints.begin()) {
-            --it;
-            if (pAddr >= it->first && pAddr - it->first < it->second.size)
-                return &it->second;
-        }
-        return nullptr;
-    }
-
-    auto it = m_breakpoints.find(pAddr);
-    return it != m_breakpoints.end() ? &it->second : nullptr;
 }
 
 void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC)
@@ -1162,6 +1202,7 @@ void AsmRunner::Shutdown()
             uc_hook_del(m_uc, m_hkMem);
             m_hkMem = 0;
         }
+        RemoveAllInsnCB();
         uc_close(m_uc);
         m_uc = nullptr;
     }
@@ -1217,6 +1258,11 @@ void AsmRunner::Shutdown()
     m_currentDeadzoneICIndex = -1;
     m_RWHistory.clear();
     m_bRWHistory = false;
+    m_gstftBaseFt64 = 0;
+    m_gstftBaseIc = 0;
+    m_gstftSleepDelta = 0;
+    m_gstftInited = false;
+    m_insnHooks.clear();
 }
 
 void AsmRunner::ShutdownByCallback(uc_engine* uc)
@@ -1403,7 +1449,7 @@ std::string AsmRunner::MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr
 
     bResOK = false;
 
-    if (!instr || !operands)
+    if (!bytes || size == 0 || !instr || !operands)
         return "???";
 
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
@@ -1453,17 +1499,26 @@ bool AsmRunner::DecodeOpcode(uc_engine* uc, ZydisDecodedInstruction* instr, Zydi
     uintptr_t pc = CurrentPc(uc);
     std::array<uint8_t, 16> bytes{};
     if (uc_mem_read(uc, pc, bytes.data(), bytes.size()) == UC_ERR_OK) {
-        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
-            bytes.data(),
-            static_cast<ZyanUSize>(bytes.size()),
-            instr,
-            operands)))
-        {
-            return true;
-        }
+        return DecodeOpcode(bytes.data(), bytes.size(), instr, operands);
     }
 
     return false;
+}
+
+bool AsmRunner::DecodeOpcode(const uint8_t* bytes, size_t size, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands)
+{
+    if (!bytes || size == 0 || !instr || !operands)
+        return false;
+
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&m_decoder,
+        bytes,
+        static_cast<ZyanUSize>(size),
+        instr,
+        operands))) {
+        return false;
+    }
+
+    return true;
 }
 
 void AsmRunner::DisassembleWithZydis()
@@ -1534,7 +1589,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 #ifndef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
-        tBpInfo* bp = FindBreakpoint(curPc, m_bUsingBpCodeSizeRange);
+        uintptr_t bpBase = 0;
+        tBpInfo* bp = FindBreakpoint(curPc, m_bUsingBpCodeSizeRange, bpBase);
         if (bp && bp->type == BP_CODE && bp->opcodeCb)
         {
             if (!_OnBreakpoint(*bp, uc, address, size, user_data, false, (uc_mem_type)0, 0)) {
@@ -1629,7 +1685,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 #ifdef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
-        tBpInfo* bp = FindBreakpoint(curPc, m_bUsingBpCodeSizeRange);
+        uintptr_t bpBase = 0;
+        tBpInfo* bp = FindBreakpoint(curPc, m_bUsingBpCodeSizeRange, bpBase);
         if (bp && bp->type == BP_CODE && bp->opcodeCb)
         {
             if (!_OnBreakpoint(*bp, uc, address, size, user_data, false, (uc_mem_type)0, 0)) {
@@ -1868,7 +1925,8 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 #ifndef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
-        tBpInfo* bp = FindBreakpoint(address, true);
+        uintptr_t bpBase = 0;
+        tBpInfo* bp = FindBreakpoint(address, true, bpBase);
         if (bp && ((bp->type == BP_MEM_READ && isRead) || (bp->type == BP_MEM_WRITE && isWrite) || (bp->type == BP_MEM_RW && (isRead || isWrite))) && bp->memCb)
         {
             if (!_OnBreakpoint(*bp, uc, address, size, user_data, true, type, value)) {
@@ -1927,7 +1985,8 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 #ifdef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
-        tBpInfo* bp = FindBreakpoint(address, true);
+        uintptr_t bpBase = 0;
+        tBpInfo* bp = FindBreakpoint(address, true, bpBase);
         if (bp && ((bp->type == BP_MEM_READ && isRead) || (bp->type == BP_MEM_WRITE && isWrite) || (bp->type == BP_MEM_RW && (isRead || isWrite))) && bp->memCb)
         {
             if (!_OnBreakpoint(*bp, uc, address, size, user_data, true, type, value)) {
@@ -2041,6 +2100,42 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
     return true;
 }
 
+bool AsmRunner::_OnInsn(tInsnHookNode* hook, uc_engine* uc)
+{
+    if (!hook || !uc || !hook->cb)
+        return true;
+
+    ZydisDecodedInstruction instr{};
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+
+    if (!DecodeOpcode(uc, &instr, operands))
+    {
+        if (m_bLogRunner)
+            Log("[INSN] decode failed for UC_X86_INS_%zu", hook->nInsn);
+        return true;
+    }
+
+    const uintptr_t pc = CurrentPc(uc);
+    const uintptr_t size = static_cast<uintptr_t>(instr.length);
+    const ZydisMnemonic mnemonic = instr.mnemonic;
+
+    if (m_bLogRunner)
+    {
+        Log("[INSN] 0x%p (%s) size=%u insn=%zu mn=%d", (void*)pc, FormatRuntimeAddressWithSymbol(pc).c_str(), (unsigned)size, (size_t)hook->nInsn, mnemonic);
+    }
+
+    if (!hook->cb(uc, pc, static_cast<uint32_t>(size), hook->nInsn, mnemonic, hook->data))
+    {
+        ShutdownByCallback(uc);
+        return false;
+    }
+
+    if (ShouldStopCB(false))
+        return true;
+
+    return true;
+}
+
 bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic)
 {
     tDeadzoneIC* dz = GetCurrentDeadzoneIC();
@@ -2116,7 +2211,7 @@ bool AsmRunner::_OnBreakpoint(const tBpInfo& bp, uc_engine* uc, uint64_t address
 {
     (void)uc;
     if (m_bLogRunner) {
-        Log("[BP %s] hit at 0x%p", bMemory ? "MEM" : "CODE", (void*)address);
+        Log("[BP %s] hit at 0x%p ( +0x%p)", bMemory ? "MEM" : "CODE", (void*)address, (void*)(address - m_modStart));
     }
 
     ZydisDecodedInstruction instr{};
@@ -2265,6 +2360,134 @@ std::string AsmRunner::PrintHexOnly(uintptr_t v, bool bDec)
     else
         oss << "0x" << std::hex << std::uppercase << v;
     return oss.str();
+}
+
+void AsmRunner::TestPerformanceConstants()
+{
+    const uint64_t TEST_INSTRUCTIONS = 100'000'000; // 100 млн NOP'ов
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (uint64_t i = 0; i < TEST_INSTRUCTIONS; i++) { __asm { nop }; }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+
+    uint64_t realIPS = (TEST_INSTRUCTIONS * 1'000'000'000ULL) / ns;
+    uint64_t realMIPS = realIPS / 1'000'000;
+    double nsPerInstr = (double)ns / TEST_INSTRUCTIONS;
+
+    const uint64_t FILETIME_UNITS_PER_SECOND = 10'000'000; // 100ns интервалов в секунде
+    uint64_t instructionsPerFiletimeUnit = realIPS / FILETIME_UNITS_PER_SECOND;
+    uint64_t filetimeUnitsPerInstruction = FILETIME_UNITS_PER_SECOND / realIPS;
+
+    printf("========== Performance Test ==========\n");
+    printf("Test instructions: %llu NOPs\n", TEST_INSTRUCTIONS);
+    printf("Time elapsed: %.3f ms (%.3f seconds)\n", ns / 1'000'000.0, ns / 1'000'000'000.0);
+    printf("Time elapsed: %llu ns\n", ns);
+    printf("\n");
+    printf("Results:\n");
+    printf("  Real IPS: %llu instructions/second\n", realIPS);
+    printf("  Real MIPS: %llu million instructions/second\n", realMIPS);
+    printf("  %.2f ns per instruction\n", nsPerInstr);
+    printf("\n");
+    printf("Constants for CalcTime():\n");
+    printf("  INSTRUCTIONS_PER_SECOND = %lluULL\n", realIPS);
+    printf("  FILETIME_UNITS_PER_SECOND = %lluULL\n", FILETIME_UNITS_PER_SECOND);
+    printf("\n");
+    printf("Derived values:\n");
+    printf("  %.2f instructions per 100ns (FileTime unit)\n", (double)realIPS / FILETIME_UNITS_PER_SECOND);
+    printf("  %.4f FileTime units per instruction\n", (double)FILETIME_UNITS_PER_SECOND / realIPS);
+    printf("\n");
+
+    // Пример: сколько времени займут 1000 инструкций
+    uint64_t testInstr = 1000;
+    uint64_t emulatedTime = (testInstr * FILETIME_UNITS_PER_SECOND) / realIPS;
+    printf("Example: %llu instructions = %llu FileTime units (%.3f ms)\n",
+        testInstr, emulatedTime, emulatedTime / 10'000.0);
+    printf("=======================================\n");
+}
+
+void AsmRunner::SetPerformanceConstantsHost(float k)
+{
+    const uint64_t TEST_INSTRUCTIONS = 100'000'000;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < TEST_INSTRUCTIONS; i++) { __asm { nop }; }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+
+#if 1
+    // Apply scaling factor k:
+    // k = 1.0 -> normal speed
+    // k < 1.0 (e.g., 0.9) -> slower (simulate weaker CPU)
+    // k > 1.0 (e.g., 1.2) -> faster (simulate powerful CPU)
+    uint64_t measuredIPS = (TEST_INSTRUCTIONS * 1'000'000'000ULL) / ns;
+    m_instructionsPerSecond = static_cast<uint64_t>(measuredIPS * k);
+    m_filetimeUnitsPerSecond = 10'000'000ULL;
+
+    if (m_bLogRunner) {
+        Log("SetPerformanceConstants: Performance test completed: %llu instructions in %llu ns = %llu measured IPS",
+            TEST_INSTRUCTIONS, ns, measuredIPS);
+        Log("SetPerformanceConstants: Applied scaling factor k=%.2f -> Effective IPS = %llu (%.2f%% of measured)",
+            k, m_instructionsPerSecond, k * 100.0);
+}
+#else
+    m_instructionsPerSecond = (TEST_INSTRUCTIONS * 1'000'000'000ULL) / ns;
+    m_filetimeUnitsPerSecond = 10'000'000ULL;
+
+    if (m_bLogRunner)
+        Log("SetPerformanceConstants: Performance test completed: %llu instructions in %llu ns = %llu IPS", TEST_INSTRUCTIONS, ns, m_instructionsPerSecond);
+#endif
+}
+
+void AsmRunner::SetPerformanceConstants(uint64_t instructionsPerSecond, uint64_t filetimeUnitsPerSecond)
+{
+    m_instructionsPerSecond = instructionsPerSecond;
+    m_filetimeUnitsPerSecond = filetimeUnitsPerSecond;
+
+    if (m_bLogRunner) {
+        Log("Performance constants set: IPS=%llu, FT_USEC=%llu",
+            m_instructionsPerSecond, m_filetimeUnitsPerSecond);
+        Log("Instructions per 100ns: %.2f",
+            (double)m_instructionsPerSecond / m_filetimeUnitsPerSecond);
+    }
+}
+
+uint64_t AsmRunner::CalcTime(uint64_t nInstrDelta, float k)
+{
+    if (m_instructionsPerSecond == 0) {
+        if (m_bLogRunner) {
+            Log("WARNING: CalcTime called but performance constants not set!");
+        }
+        return 0;
+    }
+
+    // Apply scaling factor k to the effective IPS for this calculation
+    // k = 1.0 -> normal speed
+    // k < 1.0 (e.g., 0.9) -> slower (more time)
+    // k > 1.0 (e.g., 1.2) -> faster (less time)
+    uint64_t effectiveIPS = static_cast<uint64_t>(m_instructionsPerSecond * k);
+
+    if (effectiveIPS == 0) {
+        if (m_bLogRunner) {
+            Log("WARNING: CalcTime called with k=%.2f resulting in zero effective IPS!", k);
+        }
+        return 0;
+    }
+
+    uint64_t result = (nInstrDelta * m_filetimeUnitsPerSecond) / effectiveIPS;
+
+    if (m_bLogRunner) {
+        Log("CalcTime: %llu instructions * k=%.2f = %llu FileTime units",
+            nInstrDelta, k, result);
+    }
+
+    return result;
+}
+
+double AsmRunner::CalcTimeMs(uint64_t nInstrDelta, float k)
+{
+    return CalcTime(nInstrDelta, k) / 10000.0; // 1 ms = 10000 units of 100ns
 }
 
 uintptr_t AsmRunner::GetMappedModuleSizeByName(LPCSTR moduleName)
@@ -3523,6 +3746,7 @@ void AsmRunner::SetStackArgEbpIndex(uint32_t nArgIdx, uintptr_t arg)
     StackSetValue(arg, false, static_cast<int32_t>(nArgIdx) + 1);
 }
 
+//TID TB FS SEH MSR_FS_BASE MSR IRP etc https://github.com/thpatch/thcrap/blob/af5b5e190493887258a64affba7ec220c892e7a6/thcrap/src/ntdll.h
 #if 1 // temp hack avoid fakin skip write UC_X86_REG_FS_BASE in SetTebBase
 void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
 {
@@ -4090,6 +4314,112 @@ void AsmRunner::SetSysCallCB(OnOpcodeCb cb, void* data)
     m_cbSysCallData = data;
 }
 
+void AsmRunner::SetInsnCB(uintptr_t nInsn, OnInsnCb cb, void* data)
+{
+    if (!m_uc || !nInsn || !cb)
+        return;
+
+    if (!IsInsnAllowed(nInsn))
+    {
+        if (m_bLogRunner)
+            Log("[!] UC_HOOK_INSN not allowed: insn=%d", nInsn);
+        return;
+    }
+
+    for (const auto& h : m_insnHooks)
+    {
+        if (h.nInsn == nInsn)
+        {
+            if (m_bLogRunner)
+                Log("InsnHook already exists for insn=%d", nInsn);
+            MboxSTD("InsnHook already exists for this insn", AR_SNAME);
+            return;
+        }
+    }
+
+    m_insnHooks.push_back({});
+    auto it = std::prev(m_insnHooks.end());
+
+    it->nInsn = nInsn;
+    it->cb = std::move(cb);
+    it->data = data;
+    it->owner = this;
+
+    // UC_HOOK_INSN expects the instruction id as the extra variadic argument.
+    const uc_err err = uc_hook_add(
+        m_uc,
+        &it->hk,
+        UC_HOOK_INSN,
+        reinterpret_cast<void*>(HookInsnTrampoline),
+        &(*it),
+        1,
+        0,
+        static_cast<int>(nInsn));
+
+    if (err != UC_ERR_OK)
+    {
+        if (m_bLogRunner)
+            Log("uc_hook_add(UC_HOOK_INSN) failed for insn=%zu: %s",
+                (size_t)nInsn, uc_strerror(err));
+        m_insnHooks.pop_back();
+        return;
+    }
+
+    if (m_bLogRunner)
+        Log("[*] Insn hook added: insn=%zu", (size_t)nInsn);
+}
+
+void AsmRunner::SetAllInsnCB(OnInsnCb cb, void* data)
+{
+    // see also IsInsnAllowed list
+    SetInsnCB(UC_X86_INS_IN, cb, data);
+    SetInsnCB(UC_X86_INS_OUT, cb, data);
+    SetInsnCB(UC_X86_INS_SYSCALL, cb, data);
+    SetInsnCB(UC_X86_INS_SYSENTER, cb, data);
+    SetInsnCB(UC_X86_INS_CPUID, cb, data);
+
+    // ARM64
+    SetInsnCB(UC_ARM64_INS_MRS, cb, data);
+    SetInsnCB(UC_ARM64_INS_MSR, cb, data);
+    SetInsnCB(UC_ARM64_INS_SYS, cb, data);
+    SetInsnCB(UC_ARM64_INS_SYSL, cb, data);
+}
+
+void AsmRunner::RemoveInsnCB(uintptr_t nInsn)
+{
+    if (!m_uc || !nInsn)
+        return;
+
+    for (auto it = m_insnHooks.begin(); it != m_insnHooks.end(); ++it)
+    {
+        if (it->nInsn == nInsn)
+        {
+            if (it->hk)
+                uc_hook_del(m_uc, it->hk);
+
+            if (m_bLogRunner)
+                Log("[*] Insn hook removed: insn=%zu", (size_t)nInsn);
+
+            m_insnHooks.erase(it);
+            return;
+        }
+    }
+}
+
+void AsmRunner::RemoveAllInsnCB()
+{
+    if (m_uc)
+    {
+        for (auto& h : m_insnHooks)
+        {
+            if (h.hk)
+                uc_hook_del(m_uc, h.hk);
+        }
+    }
+
+    m_insnHooks.clear();
+}
+
 tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
 {
     if (bRVA) {
@@ -4188,40 +4518,46 @@ uintptr_t AsmRunner::CopyModule(const char* szModule, uintptr_t nSize)
         Log("[%s] base=0x%p end=0x%p size=0x%zx", szModule, (void*)pStart, (void*)pEnd, (size_t)iSize);
 
     uintptr_t copySize = (nSize == 0) ? iSize : nSize;
-    if (!CopyModuleUC(pStart, pStart, copySize)) {
-        Shutdown();
+    if (!CopyModule(pStart, pStart, copySize)) { // emuTo, ntFrom, size
         return 0;
-    }
-
-    m_modStart = pStart;
-    m_modEnd = pEnd;
-
-    if (m_bLogRunner)
-    {
-        Log("=== %s ===", szModule);
-        Log("pStart: 0x%p", (void*)pStart);
-        Log("pEnd:   0x%p", (void*)pEnd);
-        Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(iSize), static_cast<size_t>(iSize / (1024 * 1024)));
     }
 
     return pStart;
 }
 
-void AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize)
+bool AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize) // pFrom as hModule
 {
-    assert(pFrom != 0);
+    if (!pFrom || nSize == 0) {
+        if (m_bLogRunner)
+            Log("[!] CopyModule: Error in args, pFrom 0x%p, nSize %d", (void*)pFrom, nSize);
+        return false;
+    }
 
     if (!nSize) {
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pFrom);
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(pFrom + dos->e_lfanew);
+        IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(pFrom);
+        IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(pFrom + dos->e_lfanew);
         nSize = nt->OptionalHeader.SizeOfImage;
         if (m_bLogRunner)
             Log("IMAGE_NT_HEADERS: 0x%zx", nSize);
     }
 
-    if (!CopyModuleUC(pFrom, pFrom, nSize)) {
+    return CopyModule(pFrom, pFrom, nSize); // emuTo, ntFrom, size
+}
+
+bool AsmRunner::CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
+{
+    if (!pVTo || !pFrom || nSize == 0) {
+        if (m_bLogRunner)
+            Log("[!] CopyModule: Error in args, pVTo 0x%p, pFrom 0x%p, nSize %d", (void*)pVTo, (void*)pFrom, nSize);
+        return false;
+    }
+
+    if (!CopyModuleUC(pFrom, pVTo, nSize)) {
+        if (m_bLogRunner) {
+            Log("[!] CopyModule: Error in CopyModuleUC");
+        }
         Shutdown();
-        return;
+        return false;
     }
 
     m_modStart = pFrom;
@@ -4234,6 +4570,8 @@ void AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize)
         Log("pEnd:   0x%p", (void*)m_modEnd);
         Log("Size:   0x%zx (%zu MB)", static_cast<size_t>(nSize), static_cast<size_t>(nSize / (1024 * 1024)));
     }
+
+    return true;
 }
 
 void AsmRunner::LoadModule(const char* szModule)
@@ -4359,6 +4697,22 @@ void AsmRunner::ResolveIATModule()
         if (m_bLogRunner)
             Log("[!] ResolveIATModule: exception while parsing PE image");
     }
+}
+
+uintptr_t AsmRunner::GetRandomEntryPoint()
+{
+    const uintptr_t align = 0x1000;
+
+    uint64_t t = __rdtsc();
+    t ^= (t << 13);
+    t ^= (t >> 7);
+    t ^= (t << 17);
+
+    uintptr_t base = m_bX64 ? 0x0000000140000000ull : 0x00400000u;
+    uintptr_t span = m_bX64 ? 0x0000000100000000ull : 0x70000000u;
+
+    uintptr_t addr = base + (static_cast<uintptr_t>(t) % (span / align)) * align;
+    return AlignUp(addr, align);
 }
 
 void AsmRunner::AddExecRegion(uintptr_t pStart, uintptr_t pEnd)
@@ -4739,7 +5093,10 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, b
 
 void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 {
-    if (!m_uc || m_modStart == 0 || m_modEnd == 0) return;
+    if (!m_uc || m_modStart == 0 || m_modEnd == 0 || !m_bInitialised) {
+        Log("[!] AsmRunner::Run ERROR: m_uc 0x%p, m_modStart 0x%p, m_modEnd 0x%p, m_bInitialised %d", m_uc, m_modStart, m_modEnd, m_bInitialised);
+        return;
+    }
 
     uintptr_t pc = pEntry;
     if (!m_bX64) pc = static_cast<uint32_t>(pc);
@@ -4758,6 +5115,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE |
             UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
             UC_HOOK_MEM_FETCH_UNMAPPED | UC_HOOK_MEM_READ_PROT |
+            //UC_HOOK_MEM_READ_AFTER |
             //UC_HOOK_MEM_FETCH | // чтение самой инструкции, warn! old+unused
             UC_HOOK_MEM_WRITE_PROT | UC_HOOK_MEM_FETCH_PROT,
             reinterpret_cast<void*>(HookMemTrampoline), this, 1, 0);
@@ -5562,6 +5920,11 @@ void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, 
 // TODO: others ntdll, ws
 void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 {
+    m_gstftBaseFt64 = 0;
+    m_gstftBaseIc = 0;
+    m_gstftSleepDelta = 0;
+    m_gstftInited = false;
+
     const bool bBefore = false;
 
     // kernel32.dll
@@ -5690,6 +6053,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             return true;
         }, this, bBefore);
 
+    // TODO: Replace with instruction-based time emulation (CalcTime) instead of caching real time (fake perfomance)
     SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
@@ -5717,21 +6081,65 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
             FILETIME ft = { 0 };
 
-#if 0
+            // 0 = всегда реальное
+            // 1 = первый вызов реальное, дальше кешированное
+            // 2 = первый вызов реальное, дальше пересчитанное от instruction count
+#define AR_GSTFT_MODE 2
+#if AR_GSTFT_MODE == 0
+            // всегда реальное время
             GetSystemTimeAsFileTime(&ft);
-#else
-            static FILETIME s_ft = { 0 };
-            static BOOL bInitialized = FALSE;
 
-            if (!bInitialized)
+#elif AR_GSTFT_MODE == 1
+        // первый вызов реальное, дальше кешированное
+            static FILETIME s_ft = {};
+            static bool s_inited = false;
+
+            if (!s_inited)
             {
                 GetSystemTimeAsFileTime(&s_ft);
-                bInitialized = TRUE;
-                printf("[GetSystemTimeAsFileTime] Static time initialized: 0x%08X%08X\n",
-                    s_ft.dwHighDateTime, s_ft.dwLowDateTime);
+                s_inited = true;
+                if (m_bLogRunner)
+                    printf("[GetSystemTimeAsFileTime] Static time initialized: 0x%08X%08X\n",
+                        s_ft.dwHighDateTime, s_ft.dwLowDateTime);
             }
 
             ft = s_ft;
+
+#elif AR_GSTFT_MODE == 2
+            if (!self->m_gstftInited)
+            {
+                FILETIME realFt{};
+                GetSystemTimeAsFileTime(&realFt);
+
+                ULARGE_INTEGER u{};
+                u.LowPart = realFt.dwLowDateTime;
+                u.HighPart = realFt.dwHighDateTime;
+
+                self->m_gstftBaseFt64 = u.QuadPart;
+                self->m_gstftBaseIc = static_cast<uint64_t>(self->GetInstructionCount());
+                self->m_gstftSleepDelta = 0;
+                self->m_gstftInited = true;
+                if(m_bLogRunner)
+                    printf("[GetSystemTimeAsFileTime] Static time initialized: 0x%08X%08X\n",
+                        realFt.dwHighDateTime, realFt.dwLowDateTime);
+            }
+
+            const uint64_t curIc = static_cast<uint64_t>(self->GetInstructionCount());
+            const uint64_t deltaIc = (curIc >= self->m_gstftBaseIc) ? (curIc - self->m_gstftBaseIc) : 0;
+
+            uint64_t deltaFtFromIc = 0;
+            if (self->GetInstructionsPerSecond() != 0)
+                deltaFtFromIc = self->CalcTime(deltaIc);
+
+            const uint64_t totalFt = self->m_gstftBaseFt64 + deltaFtFromIc + self->m_gstftSleepDelta;
+            self->m_gstftSleepDelta = 0;
+
+            ULARGE_INTEGER t{};
+            t.QuadPart = totalFt;
+            ft.dwLowDateTime = t.LowPart;
+            ft.dwHighDateTime = t.HighPart;
+#else
+#   error "Define AR_GSTFT_MODE as 0, 1 or 2"
 #endif
 
             printf("[GetSystemTimeAsFileTime] result: 0x%08X%08X\n", ft.dwHighDateTime, ft.dwLowDateTime);
@@ -5769,6 +6177,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             }
 
             if (!self->StackGetArg(dwMilliseconds, 0, bShouldPopArgs_NoCdecl)) return false;
+
+            // по идее ещё можно бустануть ic, но это сломает ic хуки
+            if (dwMilliseconds != 0)
+            {
+                // 1 ms = 10,000 * 100ns
+                self->m_gstftSleepDelta += static_cast<uint64_t>(dwMilliseconds) * 10'000ULL;
+            }
 
             printf("[Sleep] dwMilliseconds=0x%X\n", dwMilliseconds);
 
@@ -5809,6 +6224,66 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
             return true;
         }, this, bBefore);
+
+    // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
+
+    SetInsnCB(UC_X86_INS_CPUID,
+        [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            (void)address;
+            (void)size;
+            (void)nUcInsn;
+            (void)mnemonic;
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self || !uc)
+                return true;
+
+            MboxSTD("Warn! UC_X86_INS_CPUID", AR_SNAME);
+
+            const uint32_t leaf = static_cast<uint32_t>(self->GetRegister(self->AxReg())); // main function ID (leaf)
+            const uint32_t subleaf = static_cast<uint32_t>(self->GetRegister(self->CxReg())); // subfunction ID(subleaf)
+
+            uint32_t outEax = 0; // CPUID leaf / return value
+            uint32_t outEbx = 0; // "Genu" part of "GenuineIntel"
+            uint32_t outEcx = 0; // feature flags or vendor string part 3
+            uint32_t outEdx = 0; // feature flags or vendor string part 1
+
+#if defined(_MSC_VER)
+            int cpuInfo[4] = {};
+            __cpuidex(cpuInfo, static_cast<int>(leaf), static_cast<int>(subleaf));
+            outEax = static_cast<uint32_t>(cpuInfo[0]);
+            outEbx = static_cast<uint32_t>(cpuInfo[1]);
+            outEcx = static_cast<uint32_t>(cpuInfo[2]);
+            outEdx = static_cast<uint32_t>(cpuInfo[3]);
+#elif defined(__GNUC__) || defined(__clang__)
+            unsigned int a = 0, b = 0, c = 0, d = 0;
+            __cpuid_count(leaf, subleaf, a, b, c, d);
+            outEax = a;
+            outEbx = b;
+            outEcx = c;
+            outEdx = d;
+#else
+#   error "CPUID hook requires __cpuidex or __cpuid_count"
+#endif
+
+            self->SetRegister(self->AxReg(), static_cast<uintptr_t>(outEax));
+            self->SetRegister(self->BxReg(), static_cast<uintptr_t>(outEbx));
+            self->SetRegister(self->CxReg(), static_cast<uintptr_t>(outEcx));
+            self->SetRegister(self->DxReg(), static_cast<uintptr_t>(outEdx));
+
+            // Skip original CPUID execution and move to next instruction.
+            self->UpdatePC(address + size, true);
+
+            if (self->m_bLogRunner)
+            {
+                printf("[CPUID] leaf=0x%08X subleaf=0x%08X -> "
+                    "EAX=0x%08X EBX=0x%08X ECX=0x%08X EDX=0x%08X\n",
+                    leaf, subleaf, outEax, outEbx, outEcx, outEdx);
+            }
+
+            return true;
+        }, this);
 }
 
 void AsmRunner::TrimInPlace(std::string& s)
@@ -5892,6 +6367,12 @@ void AsmRunner::SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data, ui
     if (!cb)
         return;
 
+    uintptr_t existingBpAddr;
+    tBpInfo* existingBp = FindBreakpoint(pAddr, true, existingBpAddr);
+    if (existingBp && m_bLogRunner) {
+        Log("[!] Warning: Breakpoint at 0x%llx overlaps with existing breakpoint at 0x%p (size: %u)", (void*)pAddr, existingBpAddr, existingBp->size);
+    }
+
     if (size != 1 && !m_bUsingBpCodeSizeRange) {
         SetUsingBpCodeSizeRange(true);
         if (m_bLogRunner)
@@ -5907,6 +6388,7 @@ void AsmRunner::SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data, ui
     m_bUsingBp = true;
 }
 
+#ifdef AR_BP_RANGE
 void AsmRunner::SetBreakpointRangeCode(uintptr_t pStart, uintptr_t pEnd, OnOpcodeCb cb, void* data/*, uint32_t size*/)
 {
     if (/*pStart == 0 ||*/ pEnd == 0 || pEnd <= pStart || !cb)
@@ -5916,6 +6398,7 @@ void AsmRunner::SetBreakpointRangeCode(uintptr_t pStart, uintptr_t pEnd, OnOpcod
     for (uintptr_t addr = pStart; addr < pEnd; ++addr)
         SetBreakpointCode(addr, cb, data/*, size*/);
 }
+#endif
 
 void AsmRunner::SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, OnMemCb cb, void* data)
 {
@@ -5924,6 +6407,12 @@ void AsmRunner::SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, O
 
     if (type != BP_MEM_READ && type != BP_MEM_WRITE && type != BP_MEM_RW)
         return;
+
+    uintptr_t existingBpAddr;
+    tBpInfo* existingBp = FindBreakpoint(pAddr, true, existingBpAddr);
+    if (existingBp && m_bLogRunner) {
+        Log("[!] Warning: Memory breakpoint at 0x%p (size: %u) overlaps with existing breakpoint at 0x%p (size: %u)", (void*)pAddr, size, (void*)existingBpAddr, existingBp->size);
+    }
 
     tBpInfo& bp = m_breakpoints[pAddr];
     bp.size = size;
@@ -5934,6 +6423,7 @@ void AsmRunner::SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, O
     m_bUsingBp = true;
 }
 
+#ifdef AR_BP_RANGE
 void AsmRunner::SetBreakpointRangeMem(uintptr_t pStart, uintptr_t pEnd, uint32_t size, eBpType type, OnMemCb cb, void* data)
 {
     if (/*pStart == 0 ||*/ pEnd == 0 || pEnd <= pStart || size == 0 || !cb)
@@ -5943,12 +6433,81 @@ void AsmRunner::SetBreakpointRangeMem(uintptr_t pStart, uintptr_t pEnd, uint32_t
     for (uintptr_t addr = pStart; addr < pEnd; addr += step)
         SetBreakpointMem(addr, size, type, cb, data);
 }
+#endif
 
 void AsmRunner::RemoveBreakpoint(uintptr_t pAddr)
 {
     m_breakpoints.erase(pAddr);
     if (m_breakpoints.size() == 0)
         m_bUsingBp = false;
+}
+
+AsmRunner::tBpInfo* AsmRunner::FindBreakpoint(uintptr_t pAddr, bool bCheckRange, uintptr_t& outBpAddr)
+{
+    outBpAddr = 0;
+    if (!m_bUsingBp)
+        return nullptr;
+
+    if (bCheckRange) {
+        auto it = m_breakpoints.upper_bound(pAddr); // первый > pAddr
+        if (it != m_breakpoints.begin()) {
+            --it;
+            if (pAddr >= it->first && pAddr - it->first < it->second.size) {
+                outBpAddr = it->first;
+                return &it->second;
+            }
+        }
+        return nullptr;
+    }
+
+    auto it = m_breakpoints.find(pAddr);
+    if (it != m_breakpoints.end()) {
+        outBpAddr = it->first;
+        return &it->second;
+    }
+
+    return nullptr;
+}
+
+// we set big range(size) for bp to capture ~exec flow, when trigger bp we know 1st priority addr, dupl can be removed // antispam
+bool AsmRunner::AdjustBreakpointCodeRangeAt(uintptr_t pAtRt)
+{
+    uintptr_t bpBase = 0;
+    tBpInfo* bp = FindBreakpoint(pAtRt, true, bpBase);
+    if (!bp || bp->type != BP_CODE || !bp->UseRange()) return false; // !UseRange its direct bp
+    if (bpBase == pAtRt) { // trimEnd
+        // Case 1: Trigger is exactly at the base address
+        // Just trim the size to 1 (single instruction)
+        if (m_bLogRunner) {
+            Log("[*] Resized breakpoint at 0x%p from range (+0x%X) to single instruction", (void*)bpBase, bp->size);
+        }
+        bp->size = 1;
+        return true;
+    }
+    else {
+        // Case 2: Trigger is somewhere inside the range (offset > 0)
+        // Need to rebase: remove old breakpoint, create new one at exact trigger address
+
+        // Save callback and data before removing
+        auto opcodeCb = std::move(bp->opcodeCb);
+        uint32_t nOldSize = bp->size;
+        void* data = bp->data;
+
+        // Remove the old range breakpoint
+        RemoveBreakpoint(bpBase);
+
+        // Create new precise breakpoint at the actual trigger address
+        SetBreakpointCode(pAtRt, std::move(opcodeCb), data);
+
+        if (m_bLogRunner) {
+            Log("[*] Resized breakpoint: moved from range [0x%p +0x%X] to precise address 0x%p (+0x%p)",
+                (void*)bpBase, nOldSize, (void*)pAtRt, (void*)(pAtRt - m_modStart));
+        }
+
+        return true;
+    }
+
+    return false;
 }
 
 void AsmRunner::DumpAllBreakpoints(void)
@@ -5967,10 +6526,10 @@ void AsmRunner::DumpAllBreakpoints(void)
         const char* typeStr = "UNKNOWN";
         switch (bp.type)
         {
-            case BP_CODE: typeStr = "CODE"; break;
-            case BP_MEM_READ: typeStr = "MEM_READ"; break;
-            case BP_MEM_WRITE: typeStr = "MEM_WRITE"; break;
-            case BP_MEM_RW: typeStr = "MEM_RW"; break;
+        case BP_CODE: typeStr = "CODE"; break;
+        case BP_MEM_READ: typeStr = "MEM_READ"; break;
+        case BP_MEM_WRITE: typeStr = "MEM_WRITE"; break;
+        case BP_MEM_RW: typeStr = "MEM_RW"; break;
         }
 
         printf("Addr: 0x%p | Type: %s | Size: %u | Data: 0x%p | ", (void*)addr, typeStr, bp.size, bp.data);
@@ -6802,6 +7361,13 @@ size_t AsmRunner::FileRead(FILE* file, void* pb, size_t sz)
     return fread(pb, 1, sz, file);
 }
 
+void AsmRunner::FileWrite(FILE* file, void* pb, size_t sz)
+{
+    if (!file || !pb || sz == 0) return;
+
+    fwrite(pb, 1, sz, file);
+}
+
 void AsmRunner::FileAdd(FILE* file, const char* fmt, ...)
 {
     if (!file) return;
@@ -7051,6 +7617,170 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
 
     restoreColor();
     std::cout << std::flush;
+}
+
+std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart, uintptr_t pEnd, std::vector<AsmRunner::tScanPatternNode> patterns,
+    const std::vector<AsmRunner::tScanNeed>& need, uintptr_t nWindowSize, bool bStartAlignPat, bool bDisplayProgress)
+{
+#undef max // windows header hell kek
+
+    std::vector<tScanWindowResult> result;
+
+    if (pStart == 0 || pEnd == 0 || pStart >= pEnd || nWindowSize == 0)
+        return result;
+
+    if ((pEnd - pStart + 1) < nWindowSize)
+        return result;
+
+    std::sort(patterns.begin(), patterns.end(),
+        [](const tScanPatternNode& a, const tScanPatternNode& b)
+        {
+            return a.bytesAsm < b.bytesAsm;
+        });
+
+    auto last = std::unique(patterns.begin(), patterns.end(),
+        [](const tScanPatternNode& a, const tScanPatternNode& b)
+        {
+            return a.bytesAsm == b.bytesAsm;
+        });
+    patterns.erase(last, patterns.end());
+
+    size_t kindCount = 0;
+    for (const auto& p : patterns)
+    {
+        if (p.type >= 0)
+            kindCount = std::max(kindCount, (size_t)p.type + 1);
+    }
+    for (const auto& req : need)
+    {
+        if (req.type >= 0)
+            kindCount = std::max(kindCount, (size_t)req.type + 1);
+    }
+
+    if (kindCount == 0)
+        return result;
+
+    std::vector<std::vector<const tScanPatternNode*>> byType(kindCount);
+    for (const auto& p : patterns)
+    {
+        if (p.type >= 0 && (size_t)p.type < kindCount)
+            byType[(size_t)p.type].push_back(&p);
+    }
+
+    auto ValidateWindow =
+        [&](uintptr_t ws, uintptr_t we, uintptr_t& firstHit, std::vector<size_t>& foundCounts) -> bool
+    {
+        foundCounts.assign(kindCount, 0);
+        firstHit = 0;
+        uintptr_t minPos = std::numeric_limits<uintptr_t>::max();
+
+        for (const auto& req : need)
+        {
+            if (req.type < 0 || (size_t)req.type >= kindCount)
+                continue;
+
+            const size_t t = (size_t)req.type;
+
+            for (const auto* pat : byType[t])
+            {
+                auto hits = ScanBytes(ws, we, pat->bytesAsm);
+                if (hits.empty())
+                    continue;
+
+                foundCounts[t] += hits.size();
+
+                for (uintptr_t h : hits)
+                {
+                    if (h < minPos)
+                        minPos = h;
+                }
+            }
+        }
+
+        for (const auto& req : need)
+        {
+            if (req.type < 0 || (size_t)req.type >= kindCount)
+                continue;
+
+            if (foundCounts[(size_t)req.type] < req.count)
+                return false;
+        }
+
+        firstHit = (minPos == std::numeric_limits<uintptr_t>::max()) ? ws : minPos;
+        return true;
+    };
+
+    auto UpdateProgress = [](uintptr_t scanned, uintptr_t total, uintptr_t found, bool force = false)
+    {
+        static uintptr_t lastUpdate = 0;
+
+        if (total == 0)
+            return;
+
+        if (scanned < lastUpdate)
+            lastUpdate = 0;
+
+        if (!force && (scanned - lastUpdate) < 1000 && scanned < total)
+            return;
+
+        lastUpdate = scanned;
+        int percent = (int)((scanned * 100) / total);
+        int barWidth = 50;
+        int pos = (barWidth * percent) / 100;
+
+        printf("\r[");
+        for (int i = 0; i < barWidth; ++i)
+        {
+            if (i < pos) printf("=");
+            else if (i == pos && percent < 100) printf(">");
+            else printf(" ");
+        }
+        printf("] %d%% (%zu / %zu windows, found: %zu)", percent, (size_t)scanned, (size_t)total, (size_t)found);
+        fflush(stdout);
+    };
+
+    uintptr_t totalWindows = 0;
+    uintptr_t scannedWindows = 0;
+    uintptr_t foundWindows = 0;
+
+    const uintptr_t lastStart = pEnd - nWindowSize + 1;
+    totalWindows = (lastStart - pStart + 1);
+
+    for (uintptr_t winStart = pStart; winStart <= lastStart; )
+    {
+        const uintptr_t winEnd = winStart + nWindowSize - 1;
+
+        uintptr_t firstHit = 0;
+        std::vector<size_t> foundCounts;
+        if (ValidateWindow(winStart, winEnd, firstHit, foundCounts))
+        {
+            foundWindows++;
+
+            tScanWindowResult r;
+            r.address = bStartAlignPat ? firstHit : winStart;
+            r.counts = foundCounts;
+            result.push_back(r);
+
+            winStart += nWindowSize;
+        }
+        else
+        {
+            ++winStart;
+        }
+
+        scannedWindows++;
+
+        if (bDisplayProgress)
+            UpdateProgress(scannedWindows, totalWindows, foundWindows);
+    }
+
+    if (bDisplayProgress)
+    {
+        UpdateProgress(totalWindows, totalWindows, foundWindows, true);
+        printf("\n");
+    }
+
+    return result;
 }
 
 #if 0
@@ -7533,9 +8263,9 @@ void AsmRunner::TestScanB(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
 #endif
 
 // By Window (the best)
-void AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
+//https://back.engineering/blog/09/05/2026/
+std::vector<uintptr_t> AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
 {
-#undef max
     using namespace ArAsmCode;
 
     // Themida jcc >>11 >>7
@@ -7568,15 +8298,7 @@ void AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
         SHR_7, // 0x7 R2
     };
 
-    struct tPatternNode {
-        std::vector<uint8_t> bytesAsm;
-        eOpType type;
-        std::string str;
-        std::string reg;
-        ZydisRegister r;
-    };
-
-    std::vector<tPatternNode> patterns;
+    std::vector<AsmRunner::tScanPatternNode> patterns;
 
     auto AddPattern = [&](ZydisMnemonic mnemonic,
         const Operand& dst,
@@ -7584,12 +8306,11 @@ void AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
         eOpType type,
         const std::string& desc,
         const std::string& regName,
-        ZydisRegister r,
         const BuildOptions& opts = BuildOptions{})
     {
         std::vector<uint8_t> buffer;
         if (BuildAsm86Op2(buffer, mnemonic, dst, src, opts)) {
-            patterns.push_back({ buffer, type, desc, regName, r });
+            patterns.push_back({ buffer, (int32_t)type });
             {
                 printf("[%s] %s: ", regName.c_str(), desc.c_str());
                 for (uint8_t b : buffer) printf("%02X ", b);
@@ -7608,91 +8329,69 @@ void AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
         // ========== AND 0x40 (64) ==========
         // Вариант 1: 83 /0 ib (signed 8-bit)
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm8(0x40),
-            AND, "v2 & 0x40 [83/s8]", reg.second, reg.first, opts8);
+            AND, "v2 & 0x40 [83/s8]", reg.second, opts8);
 
         // Вариант 2: 81 /0 id (32-bit)
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x40),
-            AND, "v2 & 0x40 [81/s32]", reg.second, reg.first, opts32);
+            AND, "v2 & 0x40 [81/s32]", reg.second, opts32);
 
         // Вариант 3: Unsigned 8-bit (для полноты)
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm8(0x40),
-            AND, "v2 & 0x40 [83/u8]", reg.second, reg.first, opts8);
+            AND, "v2 & 0x40 [83/u8]", reg.second, opts8);
 
 
         // ========== AND 0x800 (2048) ==========
         // Только 32-бит (не влезает в 8/16)
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x800),
-            AND_11, "v1 & 0x800) >> 11 [81]", reg.second, reg.first, opts32);
+            AND_11, "v1 & 0x800) >> 11 [81]", reg.second, opts32);
 
         // Unsigned 32-bit
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm32(0x800),
-            AND_11, "v1 & 0x800) >> 11 [81/u]", reg.second, reg.first, opts32);
+            AND_11, "v1 & 0x800) >> 11 [81/u]", reg.second, opts32);
 
 
         // ========== SHR 0x0B (11) ==========
         // SHR всегда использует 8-битный immediate
         AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm8(0x0B),
-            SHR_11, ">> v1 & 0x800) >> 11 [C1]", reg.second, reg.first, opts8);
+            SHR_11, ">> v1 & 0x800) >> 11 [C1]", reg.second, opts8);
 
         AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::UImm8(0x0B),
-            SHR_11, ">> v1 & 0x800) >> 11 [C1/u]", reg.second, reg.first, opts8);
+            SHR_11, ">> v1 & 0x800) >> 11 [C1/u]", reg.second, opts8);
 
 
         // ========== AND 0x80 (128) ==========
         BuildOptions opts8signed;
         opts8signed.force_imm_width = ImmWidth::I8;
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm8(0x80),
-            AND_7, "v1 & 0x80) >> 7 [83/s8-fail]", reg.second, reg.first, opts8signed);
+            AND_7, "v1 & 0x80) >> 7 [83/s8-fail]", reg.second, opts8signed);
 
         // Unsigned 8-bit
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm8(0x80),
-            AND_7, "v1 & 0x80) >> 7 [83/u8]", reg.second, reg.first, opts8);
+            AND_7, "v1 & 0x80) >> 7 [83/u8]", reg.second, opts8);
 
         // 32-bit
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x80),
-            AND_7, "v1 & 0x80) >> 7 [81/s32]", reg.second, reg.first, opts32);
+            AND_7, "v1 & 0x80) >> 7 [81/s32]", reg.second, opts32);
 
         // 16-bit
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm16(0x80),
-            AND_7, "v1 & 0x80) >> 7 [81/s16]", reg.second, reg.first, opts16);
+            AND_7, "v1 & 0x80) >> 7 [81/s16]", reg.second, opts16);
 
 
         // ========== SHR 0x07 (7) ==========
         AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm8(0x07),
-            SHR_7, ">> v1 & 0x80) >> 7 [C1/s8]", reg.second, reg.first, opts8);
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/s8]", reg.second, opts8);
 
         AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::UImm8(0x07),
-            SHR_7, ">> v1 & 0x80) >> 7 [C1/u8]", reg.second, reg.first, opts8);
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/u8]", reg.second, opts8);
 
         // SHR с 32-бит imm (редко, но бывает)
         AddPattern(ZYDIS_MNEMONIC_SHR, Operand::Reg(reg.first), Operand::Imm32(0x07),
-            SHR_7, ">> v1 & 0x80) >> 7 [C1/s32]", reg.second, reg.first, opts32);
+            SHR_7, ">> v1 & 0x80) >> 7 [C1/s32]", reg.second, opts32);
     }
 
-    std::sort(patterns.begin(), patterns.end(),
-        [](const tPatternNode& a, const tPatternNode& b) {
-            return a.bytesAsm < b.bytesAsm;
-        });
-
-    auto last = std::unique(patterns.begin(), patterns.end(),
-        [](const tPatternNode& a, const tPatternNode& b) {
-            return a.bytesAsm == b.bytesAsm;
-        });
-    patterns.erase(last, patterns.end());
-
-    struct tWindowResult {
-        uintptr_t address;
-        std::array<size_t, 5> counts;
-    };
-    std::vector<tWindowResult> result;
-
-    struct tNeed {
-        eOpType type;
-        size_t count;
-    };
-
     // Settings
-    const std::vector<tNeed> need = {
+    const std::vector<AsmRunner::tScanNeed> need = {
         { AND,    1 },
         { AND_11, 3 }, // 4 default // с 3 окно может высоко и поймать только нужные 3, при 4 окно base будет ниже, 3 на всякий из за оптимизаций jmp reuse?
         { SHR_11, 3 }, // 4 default
@@ -7700,135 +8399,17 @@ void AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
         { SHR_7,  3 }, // 4 default
     };
 
-    uintptr_t nWindowSize = 800; // окно, максимум что встречал 597 от 11 до 7
+    uintptr_t nWindowSize = 800; // окно, максимум что встречал 597 от 11 до 7 // больше окно - дольше поиск
     bool bStartAlignPat = true;   // true -> добавлять первый матч в окне, false -> добавлять winStart
+    bool bDisplayProgress = true;
 
+    std::vector<AsmRunner::tScanWindowResult> result = ScanWindow(pStart, pEnd, patterns, need, nWindowSize, bStartAlignPat, bDisplayProgress);
 
-    std::array<std::vector<const tPatternNode*>, 5> byType;
-    for (const auto& p : patterns) {
-        byType[p.type].push_back(&p);
-    }
-
-    auto ValidateWindow = [&](uintptr_t ws, uintptr_t we, uintptr_t& firstHit, std::array<size_t, 5>& foundCounts) -> bool
-    {
-        std::array<size_t, 5> found{};
-        firstHit = 0;
-        uintptr_t minPos = std::numeric_limits<uintptr_t>::max();
-
-        for (const auto& req : need)
-        {
-            for (const auto* pat : byType[req.type])
-            {
-                auto hits = ScanBytes(ws, we, pat->bytesAsm);
-                if (hits.empty())
-                    continue;
-
-                found[req.type] += hits.size();
-
-                for (uintptr_t h : hits) {
-                    if (h < minPos)
-                        minPos = h;
-                }
-            }
-        }
-
-        foundCounts = found;
-
-        for (const auto& req : need) {
-            if (found[req.type] < req.count)
-                return false;
-        }
-
-        firstHit = (minPos == std::numeric_limits<uintptr_t>::max()) ? ws : minPos;
-        return true;
-    };
-
-    // pEnd здесь считается inclusive
-#if 0
-    if (pStart != 0 && pEnd != 0 && pStart < pEnd && nWindowSize > 0 && (pEnd - pStart + 1) >= nWindowSize)
-    {
-        const uintptr_t lastStart = pEnd - nWindowSize + 1;
-
-        for (uintptr_t winStart = pStart; winStart <= lastStart; )
-        {
-            const uintptr_t winEnd = winStart + nWindowSize - 1;
-
-            uintptr_t firstHit = 0;
-            std::array<size_t, 5> foundCounts{};
-            if (ValidateWindow(winStart, winEnd, firstHit, foundCounts))
-            {
-                result.push_back({ bStartAlignPat ? firstHit : winStart, foundCounts });
-                winStart += nWindowSize;
-            }
-            else
-            {
-                ++winStart;
-            }
-        }
-    }
-#else
-    auto UpdateProgress = [](uintptr_t scanned, uintptr_t total, uintptr_t found, bool force = false) {
-        static uintptr_t lastUpdate = 0;
-
-        if (!force && (scanned - lastUpdate) < 1000 && scanned < total)
-            return;
-
-        lastUpdate = scanned;
-        int percent = (int)((scanned * 100) / total);
-        int barWidth = 50;
-        int pos = (barWidth * percent) / 100;
-
-        printf("\r[");
-        for (int i = 0; i < barWidth; ++i) {
-            if (i < pos) printf("=");
-            else if (i == pos && percent < 100) printf(">");
-            else printf(" ");
-        }
-        printf("] %d%% (%d / %d windows, found: %d)", percent, scanned, total, found);
-        fflush(stdout);
-    };
-
-    uintptr_t totalWindows = 0;
-    uintptr_t scannedWindows = 0;
-    uintptr_t foundWindows = 0;
-
-    // pEnd здесь считается inclusive
-    if (pStart != 0 && pEnd != 0 && pStart < pEnd && nWindowSize > 0 && (pEnd - pStart + 1) >= nWindowSize)
-    {
-        const uintptr_t lastStart = pEnd - nWindowSize + 1;
-        totalWindows = (lastStart - pStart + 1);
-
-        for (uintptr_t winStart = pStart; winStart <= lastStart; )
-        {
-            const uintptr_t winEnd = winStart + nWindowSize - 1;
-
-            uintptr_t firstHit = 0;
-            std::array<size_t, 5> foundCounts{};
-            if (ValidateWindow(winStart, winEnd, firstHit, foundCounts))
-            {
-                foundWindows++;
-                uintptr_t blockAddr = bStartAlignPat ? firstHit : winStart;
-                result.push_back({ blockAddr, foundCounts });
-                winStart += nWindowSize;
-            }
-            else
-            {
-                winStart++;
-            }
-
-            scannedWindows++;
-
-            // Update progress on each iteration
-            UpdateProgress(scannedWindows, totalWindows, foundWindows);
-        }
-
-        // Force 100% after loop
-        UpdateProgress(totalWindows, totalWindows, foundWindows, true);
-        printf("\n");
-    }
-#endif
+    std::vector<uintptr_t> outRes; // you can set bp for this by (range! linear code flow not equal pWindow) to capture if branch at runtime
 
     for (uint32_t i = 0; i < result.size(); ++i) {
+        outRes.push_back(result[i].address);
+
         //printf("Window %d: start=0x%p\n", (i + 1), (void*)(result[i].address - pOffset));
         printf("Window %d: start=0x%p | entries: AND=%d, AND_11=%d, SHR_11=%d, AND_7=%d, SHR_7=%d\n",
             (i + 1),
@@ -7847,6 +8428,132 @@ void AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset)
 
         FileClose(f);
         printf("Saved: %zu blocks to scan_results.txt\n", result.size());
+    }
+
+    return outRes;
+}
+
+void AsmRunner::TestScanD(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset, std::vector<uintptr_t>& outVMEntries, std::vector<uintptr_t>& outVMExits)
+{
+    using namespace ArAsmCode;
+
+    //outVMEntries
+    //  pushf + push any reg x6 count
+    //outVMExits
+    //  popf + pop any reg x6 count
+
+    outVMEntries.clear();
+    outVMExits.clear();
+
+    std::vector<std::pair<ZydisRegister, std::string>> anyRegs = {
+        { ZYDIS_REGISTER_EAX, "EAX" },
+        { ZYDIS_REGISTER_ECX, "ECX" },
+        { ZYDIS_REGISTER_EDX, "EDX" },
+        { ZYDIS_REGISTER_EBX, "EBX" },
+        { ZYDIS_REGISTER_ESP, "ESP" },
+        { ZYDIS_REGISTER_EBP, "EBP" },
+        { ZYDIS_REGISTER_ESI, "ESI" },
+        { ZYDIS_REGISTER_EDI, "EDI" },
+
+        //{ ZYDIS_REGISTER_R8D, "R8D" },
+        //{ ZYDIS_REGISTER_R9D, "R9D" },
+        //{ ZYDIS_REGISTER_R10D, "R10D" },
+        //{ ZYDIS_REGISTER_R11D, "R11D" },
+        //{ ZYDIS_REGISTER_R12D, "R12D" },
+        //{ ZYDIS_REGISTER_R13D, "R13D" },
+        //{ ZYDIS_REGISTER_R14D, "R14D" },
+        //{ ZYDIS_REGISTER_R15D, "R15D" },
+    };
+
+    auto RunPass = [&](bool bEntries, std::vector<uintptr_t>& outVec)
+    {
+        enum eOpType
+        {
+            HEAD = 0,
+            ANY_REG = 1,
+        };
+
+        std::vector<AsmRunner::tScanPatternNode> patterns;
+
+        auto AddPattern0 = [&](ZydisMnemonic mnemonic, eOpType type)
+        {
+            std::vector<uint8_t> buffer;
+            if (BuildAsm86Op0(buffer, mnemonic))
+                patterns.push_back({ buffer, (int32_t)type });
+        };
+
+        auto AddPattern1 = [&](ZydisMnemonic mnemonic, ZydisRegister reg, eOpType type)
+        {
+            std::vector<uint8_t> buffer;
+            if (BuildAsm86Op1(buffer, mnemonic, Operand::Reg(reg)))
+                patterns.push_back({ buffer, (int32_t)type });
+        };
+
+        if (bEntries)
+        {
+            AddPattern0(ZYDIS_MNEMONIC_PUSHFD, HEAD);
+
+            for (auto reg : anyRegs)
+                AddPattern1(ZYDIS_MNEMONIC_PUSH, reg.first, ANY_REG);
+        }
+        else
+        {
+            AddPattern0(ZYDIS_MNEMONIC_POPFD, HEAD);
+
+            for (auto reg : anyRegs)
+                AddPattern1(ZYDIS_MNEMONIC_POP, reg.first, ANY_REG);
+        }
+
+        std::vector<AsmRunner::tScanNeed> need = {
+            { HEAD, 1 },
+            { ANY_REG, 6 },
+        };
+
+        uintptr_t nWindowSize = 100; // adj it
+        bool bStartAlignPat = true;
+        bool bDisplayProgress = true;
+
+        std::vector<AsmRunner::tScanWindowResult> result = ScanWindow(
+            pStart,
+            pEnd,
+            patterns,
+            need,
+            nWindowSize,
+            bStartAlignPat,
+            bDisplayProgress);
+
+        for (const auto& r : result)
+            outVec.push_back(r.address);
+    };
+
+    RunPass(true, outVMEntries);
+    RunPass(false, outVMExits);
+
+    printf("\n=== TestScanD Results ===\n");
+    printf("VMEntries found: %zu\n", outVMEntries.size());
+    for (uint32_t i = 0; i < outVMEntries.size(); ++i) {
+        printf("Entry %d: 0x%p (0x%p)\n", (i + 1), (void*)outVMEntries[i], (void*)(outVMEntries[i] - pOffset));
+    }
+    FILE* f = FileOpen("vm_entries.txt", "w");
+    if (f) {
+        for (auto& addr : outVMEntries)
+            FileAdd(f, "0x%p 0x%p", (void*)addr, (void*)(addr - pOffset));
+        FileClose(f);
+        f = nullptr;
+        printf("Saved: %zu VM entries to vm_entries.txt\n", outVMEntries.size());
+    }
+
+    printf("\nVMExits found: %zu\n", outVMExits.size());
+    for (uint32_t i = 0; i < outVMExits.size(); ++i) {
+        printf("Exit %d: 0x%p (0x%p)\n", (i + 1), (void*)outVMExits[i], (void*)(outVMExits[i] - pOffset));
+    }
+    f = FileOpen("vm_exits.txt", "w");
+    if (f) {
+        for (auto& addr : outVMExits)
+            FileAdd(f, "0x%p 0x%p", (void*)addr, (void*)(addr - pOffset));
+        FileClose(f);
+        f = nullptr;
+        printf("Saved: %zu VM exits to vm_exits.txt\n", outVMExits.size());
     }
 }
 
@@ -8672,10 +9379,89 @@ void TestStackArgs()
     MboxSTD("halt", "hold");
 }
 
+void TestInsnHookCpuid()
+{
+    AsmRunner runner(false);
+    runner.Initialise(true, false, false, true);  // disasm + memrw + runner logs
+
+    // xor eax,eax; xor ecx,ecx; cpuid; nop; ret
+    static const uint8_t code[] = {
+        0x31, 0xC0,       // xor eax, eax
+        0x31, 0xC9,       // xor ecx, ecx
+        0x0F, 0xA2,       // cpuid
+        0x90,             // nop
+        0xC3              // ret
+    };
+    uintptr_t pVEntry = runner.GetRandomEntryPoint();
+    runner.CopyModule(pVEntry, (uintptr_t)code, sizeof(code));
+
+    auto OpcodeCb = [](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        printf("[OPCODE] pc=0x%p size=%u mn=%d\n", (void*)address, (unsigned)size, (int)mnemonic);
+        return true;
+    };
+
+    //runner.SetInsnCB(
+    //	UC_X86_INS_CPUID,
+    //	[](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    //		auto* self = static_cast<AsmRunner*>(user_data);
+    //		if (!self || !uc)
+    //			return true;
+
+    //		MboxSTD("CPUID hook hit!", "TestInsnHookCpuid");
+    //		printf("[INSN] CPUID hit: pc=0x%p size=%u insn=%zu mn=%d\n",
+    //			(void*)address, (unsigned)size, (size_t)nUcInsn, (int)mnemonic);
+
+    //		// Опционально: подставить фейковые значения в регистры
+    //		// self->SetRegister(UC_X86_REG_EAX, 0x00000F43); // Vendor: GenuineIntel
+    //		// self->SetRegister(UC_X86_REG_EBX, 0x756E6547); // "Genu"
+    //		// self->SetRegister(UC_X86_REG_ECX, 0x6C65746E); // "inel"
+    //		// self->SetRegister(UC_X86_REG_EDX, 0x49656E69); // "Ieni"
+
+    //		// Пропускаем инструкцию CPUID (переходим к следующей)
+    //		self->UpdatePC(address + size, true);
+    //		return true; // continue execution
+    //	},
+    //	&runner);
+
+    runner.SetAllInsnCB(
+        [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            MboxSTD("Warn! UC_HOOK_INSN SetAllInsnCB!!!!", AR_SNAME);
+            return true;
+        },
+        &runner);
+
+    auto MemCb = [](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic);
+        return true;
+    };
+
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+        auto* self = static_cast<AsmRunner*>(user_data);
+        printf("[JMP] from 0x%p to 0x%p\n", (void*)from, (void*)to);
+        return true;
+    };
+
+    runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
+
+    printf("[*] CPUID test entry point: 0x%p\n", (void*)pVEntry);
+    printf("[*] Expected execution: XOR EAX,EAX -> XOR ECX,ECX -> CPUID (hook) -> NOP -> RET\n");
+
+    runner.Run(pVEntry, 0);
+    runner.Shutdown();
+    MboxSTD("Test completed", "TestInsnHookCpuid");
+}
+
 void VMTEST(int a1)
 {
     //IatTestUC();
     //Test1();
+    //TestInsnHookCpuid();
     //return;
 
     ULONG_PTR lowLimit = 0;
@@ -8710,6 +9496,7 @@ void VMTEST(int a1)
     uintptr_t pMalloc = (uintptr_t)(_ADDR(0x610AE29B));
     uintptr_t pB64 = (uintptr_t)(_ADDR(0x60F303A0));
     uintptr_t pMd5 = (uintptr_t)(_ADDR(0x61020220));
+    uintptr_t pDLLS = (uintptr_t)(_ADDR(0x60F2FA89)); // MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89
 
     std::vector<uintptr_t> jcc = { // TestScanC
         0x62A3F44E,
@@ -8734,18 +9521,19 @@ void VMTEST(int a1)
         0x62E55700,
         0x62E581CC,
     };
-    uintptr_t jvvBpTolerance = 100; // окно вверх от паттерна &40 чтобы выйти на безусловный прямой codeflow
+    uintptr_t jccBpTolerance = 100; // окно вверх от паттерна &40 чтобы выйти на безусловный прямой codeflow
     auto JccBpCb = [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
+        //self->AdjustBreakpointCodeRangeAt(address); // adj100 попадаем в тело if выше (bp на частичный flow)
         printf("JccBpCb: 0x%p\n", address);
-        MboxSTD("IF COND FLOW BLOCK", "disasm"); // *possible
+        //MboxSTD("IF COND FLOW BLOCK", "disasm"); // *possible
 
         return true;
     };
     for (const auto& p : jcc) {
-        //runner.SetUsingBpCodeSizeRange(true);
-        runner.SetBreakpointRangeCode((uintptr_t)_ADDR(p - jvvBpTolerance), (uintptr_t)_ADDR(p), JccBpCb, &runner);
-        //runner.SetBreakpointCode((uintptr_t)_ADDR(p - jvvBpTolerance), JccBpCb, &runner, jvvBpTolerance);
+        runner.SetUsingBpCodeSizeRange(true);
+        //runner.SetBreakpointRangeCode((uintptr_t)_ADDR(p - jccBpTolerance), (uintptr_t)_ADDR(p), JccBpCb, &runner);
+        runner.SetBreakpointCode((uintptr_t)_ADDR(p - jccBpTolerance), JccBpCb, &runner, jccBpTolerance);
     }
 
     //runner.SetBreakpointCode((uintptr_t)_ADDR(0x610C495A), JccBpCb, &runner, 50);
@@ -8753,14 +9541,29 @@ void VMTEST(int a1)
     //runner.SetBreakpointMem(p4Ex, 20, BP_MEM_RW,
     //	[&](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
     //	auto* self = static_cast<AsmRunner*>(user_data);
-    //	printf("mem bp: 0x%p\n", address);
+    //	//printf("mem bp: 0x%p\n", address);
     //	MboxSTD("mem bp", "disasm");
 
     //	return true;
     //	}, &runner);
 
+    runner.SetBreakpointCode(pDLLS,
+        [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            //printf("bp: 0x%p\n", address);
+            MboxSTD("MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89 sucesss", "disasm");
 
-    //AsmRunner::TestScanC(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000);
+            return true;
+        }, &runner);
+
+    AsmRunner::HookNotifyCb hcb = [&](tIEFuncNode* pNode) {
+        //MboxSTD("hook call " + pNode->GetAbsoluteName(), "hook");
+    };
+
+    //std::vector<uintptr_t> possibleJcc = AsmRunner::TestScanC(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000);
+    std::vector<uintptr_t> outVMEntries;
+    std::vector<uintptr_t> outVMExits;
+    //AsmRunner::TestScanD(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000, outVMEntries, outVMExits);
     MboxSTD("VMENTRY_UT_HK", "hold");
 
     //crc start 0x60F01000,  size 0x47A000
@@ -8881,10 +9684,27 @@ void VMTEST(int a1)
 
     auto MemCb = [&](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
-        //printf("MemCb 0x%p %d %d %d pc 0x%p mn %d\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic);
+        bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT || type == UC_MEM_READ_AFTER);
+        bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
+        bool isAnyFetch = (type == UC_MEM_FETCH || type == UC_MEM_FETCH_UNMAPPED || type == UC_MEM_FETCH_PROT); // code read
 
+        //printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
         if (!self || !uc || size == 0)
             return true;
+
+        // TODO capture virtualalloc ranges
+        if (self->IsInAddr(address, self->GetFSTIDStart(), self->GetFSTIDEnd())) {
+            printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n",
+                (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
+            MboxSTD("Warn! access TID", "MemCb");
+        }
+        else if (!self->IsInAddr(address, self->GetModStart(), self->GetModEnd()) &&
+            !self->IsInAddr(address, self->GetStackStart(), self->GetStackEnd())) {
+            printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n",
+                (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
+            //MboxSTD("Warn! access smth outside the module", "MemCb");
+        }
+
 
         if (address == p4Ex) // [93228455] 0x62D872AD
         { // custom, tmp
@@ -8985,10 +9805,6 @@ void VMTEST(int a1)
         }
 
         return true;
-    };
-
-    AsmRunner::HookNotifyCb hcb = [&](tIEFuncNode* pNode) {
-        //MboxSTD("hook call " + pNode->GetAbsoluteName(), "hook");
     };
 
     runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
@@ -9305,6 +10121,43 @@ void VMTEST(int a1)
 
     //WSAStartup WS2_32.dll
 
+    runner.SetAllInsnCB(
+        [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            MboxSTD("Warn! UC_HOOK_INSN SetAllInsnCB!!!!", AR_SNAME);
+            return true;
+        },
+        &runner);
+
+    runner.SetInsnCB(UC_X86_INS_MOV,
+        [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self || !uc)
+                return true;
+
+            MboxSTD("Warn! HOOK!!!!", AR_SNAME);
+
+            return true;
+        }, &runner);
+
+    runner.SetInsnCB(UC_X86_INS_ADD,
+        [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self || !uc)
+                return true;
+
+            MboxSTD("Warn! HOOK!!!!", AR_SNAME);
+
+
+            // Let the instruction execute normally
+            return true;
+        }, &runner);
+
     runner.SetAnyJmpHook(pPostSend,
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
@@ -9410,16 +10263,16 @@ void VMTEST(int a1)
                     self->SetRegister(self->AxReg(), 0);
                     self->UpdatePC(retaddr, true);
                     return true;
-                    }
+                }
 
                 printf("[malloc] allocated 0x%p bytes at 0x%p\n", (void*)dwSize, (void*)allocated);
-                }
+            }
 
             self->SetRegister(self->AxReg(), allocated);
             self->UpdatePC(retaddr, true);
 
             return true;
-            }, &runner, bBefore, true);
+        }, &runner, bBefore, true);
 
     // Themida: читает из какой то памяти вне модуля crc посчитанную в boot
     // MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch_  
@@ -9428,7 +10281,8 @@ void VMTEST(int a1)
 
     //runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
     runner.InitialiseSymMap("idasym.txt", 0x60F00000); // IDB base -> RVA map
-    runner.SetDisasmAfterCB(true);
+    //runner.SetDisasmAfterCB(true);
+    runner.SetPerformanceConstantsHost(1.0f);
     //runner.SetRWHistory(true);
     runner.SetDisasmRVA(true, 0x60F00000);
     //runner.SetPCTrace("TR1.txt", true, 0, /*9'500'000*/nCrcSumEnd);

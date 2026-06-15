@@ -22,13 +22,16 @@
 //#define AR_HALT_JMPCB // allow jmp cb notify jmp to halt
 #define AR_HALT_ADDR_ONLY // fast + correct halt shutdown log, the rest is neat (unmapped execute)
 //#define AR_BP_AFTER_DZ // faster dz
+//#define AR_BP_RANGE // size or range
 
 #ifdef CopyMemory
 #undef CopyMemory
 #endif
 
-// TODO: normal seh, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb, cb UC_HOOK_INSN, UC_HOOK_INTR, cb on register change?, trace deadzone?
+// TODO: normal seh+frame unwind MSR_FS_BASE, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb, cb UC_HOOK_INSN, UC_HOOK_INTR, cb on register change?, trace deadzone?
 // UC bugs: 1 can't set fs: but res ok, 2 update pc + emu_stop() can't stop emu
+// все хуки в Unicorn по умолчанию являются pre-hooks, Разработчики обсуждали добавление пост-хуков, но столкнулись с техническими сложностями из-за JIT-компиляции (особенно с повторяющимися инструкциями вроде REP STOS) .
+// Поэтому официально реализованы только pre-hooks.
 
 #include <vector>
 #include <map>
@@ -143,7 +146,11 @@ public:
 	// Тип колбэка для трассировки: возвращает true для остановки трассировки
 	using TraceCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t instruction_count, void* user_data)>;
 
+	// UC_HOOK_INSN - UC_X86_INS_CPUID
+	using OnInsnCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data)>;
+
 	using HookNotifyCb = std::function<void(tIEFuncNode* pNode)>;
+
 
 	AsmRunner(bool bX64 = false);
 	~AsmRunner();
@@ -176,6 +183,12 @@ public:
 	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
 	uintptr_t GetModStart() const { return m_modStart; }
 	uintptr_t GetModEnd() const { return m_modEnd; }
+	uintptr_t GetStackStart() const { return m_stackBase; } // ebp
+	uintptr_t GetStackEnd() const { return m_stackBase + m_stackSize; } // esp
+	uintptr_t GetFSTIDStart() const { return m_fsBase; }
+	uintptr_t GetFSTIDEnd() const { return m_fsBase + m_fsSize; }
+	uint64_t GetInstructionsPerSecond() const { return m_instructionsPerSecond; }
+	uint64_t GetFiletimeUnitsPerSecond() const { return m_filetimeUnitsPerSecond; }
 
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
@@ -195,6 +208,12 @@ public:
 	static void DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label = nullptr);
 	static std::string PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec = false, bool bDecBracket = true);
 	static std::string PrintHexOnly(uintptr_t v, bool bDec = false);
+
+	static void TestPerformanceConstants();
+	void SetPerformanceConstantsHost(float k = 1.0f);
+	void SetPerformanceConstants(uint64_t instructionsPerSecond = 1'706'928'617, uint64_t filetimeUnitsPerSecond = 10000000ULL);
+	uint64_t CalcTime(uint64_t nInstrDelta, float k = 1.0f);
+	double CalcTimeMs(uint64_t nInstrDelta, float k = 1.0f);
 
 	uintptr_t GetMappedModuleSizeByName(LPCSTR moduleName);
 	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
@@ -306,6 +325,10 @@ public:
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	void SetIATCallCB(OnJmpCb cb, void* data = nullptr);
 	void SetSysCallCB(OnOpcodeCb cb, void* data = nullptr);
+	void SetInsnCB(uintptr_t nInsn, OnInsnCb cb, void* data = nullptr); // UC_X86_INS_CPUID warn!!! check IsInsnAllowed
+	void SetAllInsnCB(OnInsnCb cb, void* data = nullptr);
+	void RemoveInsnCB(uintptr_t nInsn);
+	void RemoveAllInsnCB();
 	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
 	tIEFuncNode* FindIATNode(std::string funcName, std::string moduleName = "", bool bLowerCmp = true, bool bContains = false);
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
@@ -313,19 +336,22 @@ public:
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
 	void SetICCallback(uintptr_t nIC, OnOpcodeCb opcode_cb, void* opcode_data);
 	uintptr_t CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename)
-	void CopyModule(uintptr_t pFrom, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
+	bool CopyModule(uintptr_t pFrom, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
+	bool CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize);
 	void LoadModule(const char* szModule); // mz pe? (exe+dll)
 	void ResolveIATModule();
+	uintptr_t GetRandomEntryPoint();
 	void AddExecRegion(uintptr_t pStart, uintptr_t pEnd);
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
 	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0);
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
-	void Run(uintptr_t pEntry, uintptr_t nStepsDeep);
+	void Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
 	void Pause();
 	void Resume();
 	void Stop();
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
+	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr, bool bPCArray = false); // 0 until end, cb can null autofalse
 	void DumpRegisters(bool bFull = true); // and flags
 	void DumpSegmentRegisters();
 	void DumpFlags();
@@ -346,13 +372,30 @@ public:
 	void DisassembleWithZydis();
 	void DisassembleWithCapstone();
 
+	// точки останова: addr info
+	struct tBpInfo
+	{
+		uint32_t size = 1;
+		eBpType type = BP_CODE;
+		OnOpcodeCb opcodeCb = nullptr;
+		OnMemCb memCb = nullptr;
+		void* data = nullptr;
+		// TODO:? OnOpcodeCb OnMemCb condCb, это можно фильтровать просто в самих калбеках
+
+		inline bool UseRange() { return size > 1; }
+	};
 	void SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data = nullptr, uint32_t size = 1);
+#ifdef AR_BP_RANGE
 	void SetBreakpointRangeCode(uintptr_t pStart, uintptr_t pEnd, OnOpcodeCb cb, void* data = nullptr/*, uint32_t size = 1*/);
+#endif
 	void SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, OnMemCb cb, void* data = nullptr);
+#ifdef AR_BP_RANGE
 	void SetBreakpointRangeMem(uintptr_t pStart, uintptr_t pEnd, uint32_t size, eBpType type, OnMemCb cb, void* data = nullptr);
+#endif
 	void RemoveBreakpoint(uintptr_t pAddr);
+	tBpInfo* FindBreakpoint(uintptr_t pAddr, bool bCheckRange, uintptr_t& outBpAddr);
+	bool AdjustBreakpointCodeRangeAt(uintptr_t pAtRt); // 4 runtime exec flow range brute // !! very carefully with big tolerance!!
 	void DumpAllBreakpoints(void);
-	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr, bool bPCArray = false); // 0 until end, cb can null autofalse
 
 	// IDA 7.6 IDC // https://docs.hex-rays.com/9.0/developer-guide/idc/idc-api-reference/alphabetical-list-of-idc-functions/686
 	std::string SanitizeIdaName(const std::string& in);
@@ -396,6 +439,7 @@ public:
 	static FILE* FileOpen(const char* filename, const char* mode = "w");
 	static size_t FileSize(FILE* file);
 	static size_t FileRead(FILE* file, void* pb, size_t sz);
+	static void FileWrite(FILE* file, void* pb, size_t sz);
 	static void FileAdd(FILE* file, const char* fmt, ...);
 	static void FileClose(FILE* file);
 
@@ -411,9 +455,30 @@ public:
 	void CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly = true);
 
 	// Others
-	static void TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
-	static void TestScanB(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
-	static void TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
+	struct tScanPatternNode
+	{
+		std::vector<uint8_t> bytesAsm;
+		int32_t type = 0;
+	};
+
+	struct tScanNeed
+	{
+		int32_t type = 0;
+		size_t count = 0;
+	};
+
+	struct tScanWindowResult
+	{
+		uintptr_t address = 0;
+		std::vector<size_t> counts;
+	};
+	static std::vector<tScanWindowResult> ScanWindow(uintptr_t pStart, uintptr_t pEnd, std::vector<tScanPatternNode> patterns,
+		const std::vector<tScanNeed>& need, uintptr_t nWindowSize, bool bStartAlignPat, bool bDisplayProgress);
+
+	//static void TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
+	//static void TestScanB(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
+	static std::vector<uintptr_t> TestScanC(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
+	static void TestScanD(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset, std::vector<uintptr_t>& outVMEntries, std::vector<uintptr_t>& outVMExits);
 
 	template <typename T>
 	T ReadMemory(uintptr_t pAddr)
@@ -482,16 +547,6 @@ public:
 	}
 
 private:
-	// точки останова: addr info
-	struct tBpInfo
-	{
-		uint32_t size = 1;
-		eBpType type = BP_CODE;
-		OnOpcodeCb opcodeCb = nullptr;
-		OnMemCb memCb = nullptr;
-		void* data = nullptr;
-	};
-
 	// состояние трасировки Tenet
 	struct tTraceState
 	{
@@ -582,6 +637,15 @@ private:
 		bool bRead;
 	};
 
+	struct tInsnHookNode
+	{
+		uintptr_t nInsn = 0;
+		uc_hook hk = 0;
+		OnInsnCb cb = nullptr;
+		void* data = nullptr;
+		AsmRunner* owner = nullptr; // stable back-reference for trampoline
+	};
+
 	uc_engine* m_uc = nullptr;
 	bool m_bInitialised = false;
 	bool m_bLogEnabled = true;
@@ -610,6 +674,7 @@ private:
 	int32_t m_currentDeadzoneICIndex = -1;
 	std::vector<tRWHistory> m_RWHistory;
 	bool m_bRWHistory = false;
+	std::vector<tInsnHookNode> m_insnHooks;
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
@@ -626,7 +691,7 @@ private:
 	uintptr_t m_stackEPSize = 0x100; // m_bX64 ? 0x20 : 8
 	uintptr_t m_allocBase = 0x20000000;
 	uintptr_t m_allocCursor = 0x20000000;
-	uintptr_t m_fsBase = 0;
+	uintptr_t m_fsBase = 0; // 0x7FFDF000 TEB normal when?? fs:/MSR
 	uintptr_t m_fsSize = 0;
 	uintptr_t m_halt = 0x0; // 0x0 0x13371337 0xDEADBEEF
 	uintptr_t m_lastPC = 0;
@@ -634,6 +699,13 @@ private:
 	uintptr_t m_instrCount = 0;
 	uc_hook m_hkCode = 0;
 	uc_hook m_hkMem = 0;
+
+	uint64_t m_instructionsPerSecond = 0;
+	uint64_t m_filetimeUnitsPerSecond = 10000000ULL;
+	uint64_t m_gstftBaseFt64 = 0;      // база FILETIME на первом вызове GSTFT
+	uint64_t m_gstftBaseIc = 0;        // IC на первом вызове GSTFT
+	uint64_t m_gstftSleepDelta = 0;    // накопленное Sleep() в 100ns units
+	bool m_gstftInited = false;
 
 	OnOpcodeCb m_cbOpcode;
 	void* m_cbOpcodeData = nullptr;
@@ -671,8 +743,11 @@ private:
 
 	static void HookCodeTrampoline(uc_engine* uc, uint64_t address, uint32_t size, void* user_data);
 	static bool HookMemTrampoline(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
+	static void HookInsnTrampoline(uc_engine* uc, void* user_data);
 	static bool IsAnyIpTransfer(ZydisMnemonic mn);
 	static bool IsSystem(ZydisMnemonic mn);
+	static bool IsInsnAllowedZydis(ZydisMnemonic mn);
+	static bool IsInsnAllowed(uintptr_t insn);
 	bool ResolveFlagsConditional(ZydisMnemonic mn, bool& bOutCondMn, bool& bOutInvMn);
 	bool TryResolveIpTransfer(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t curPc, uintptr_t& outTarget);
 	bool ReadZydisRegisterValue(uc_engine* uc, ZydisRegister reg, uintptr_t& out) const;
@@ -681,11 +756,11 @@ private:
 	bool CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size);
 	void UpdateDeadzoneIC(uintptr_t currentIC);
 	tDeadzoneIC* GetCurrentDeadzoneIC();
-	tBpInfo* FindBreakpoint(uintptr_t pAddr, bool bCheckRange);
 
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
 	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uint32_t size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
+	bool _OnInsn(tInsnHookNode* hook, uc_engine* uc);
 	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic);        // jmp/call/ret детектируется в _OnInstructionStep
 	bool _OnBreakpoint(const tBpInfo& bp, uc_engine* uc, uint64_t address, uint32_t size, void* user_data, bool bMemory, uc_mem_type type, int64_t value);
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
@@ -702,6 +777,7 @@ private:
 	void TraceWriteLine(const std::string& s);
 	std::string MakeDisasmLine(const uint8_t* bytes, size_t size, uintptr_t runtimeAddress, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands, bool& bResOK);
 	bool DecodeOpcode(uc_engine* uc, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands);
+	bool DecodeOpcode(const uint8_t* bytes, size_t size, ZydisDecodedInstruction* instr, ZydisDecodedOperand* operands);
 
 	// exports / PE helpers
 	static void TrimInPlace(std::string& s);
@@ -1004,6 +1080,19 @@ public:
 
 //0x7FFDF000 fs TEB Thread Environment Block FS:[0]
 
+//; Запрос function_id = 1
+//mov eax, 1; В EAX - вопрос к процессору
+//cpuid; Выполняем инструкцию
+//; Результат:
+//; EAX - информация о версии
+//; EBX - дополнительная информация
+//; ECX - флаги возможностей(бит 31 здесь!)
+//; EDX - флаги возможностей
+//
+//; Проверка 31 - го бита в ECX
+//test ecx, 80000000h; 80000000h = бит 31
+//jnz hypervisor_found
+
 // Themida Research Notes
 //https://github.com/stuxnet147/Themida-Research
 // читает в vmentry байты из кучи вне модуля правильной crc
@@ -1011,8 +1100,10 @@ public:
 // crc проверяет так: читает правильный crc из boot, virtualalloc(ctrlsectionsz) rep movsb секции, считает checksum, virtualfree kernel32
 // MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch количество их в билде неограниченное // https://back.engineering/blog/09/05/2026/
 // jcc(.themida) (разные константы && (v1 & 0x40) == 0) всегда v5 = (unsigned __int16)(v1 & 0x800) >> 11; v1 = (unsigned __int8)(v1 & 0x80) >> 7;
+// возможно помимо CRC .boot ещё замеряет perfomance для GetSystemTimeAsFileTime и ложит в VM_CONTEXT
 
 // links
+//https://www.youtube.com/watch?v=hOFfR2APbyk
 //https://github.com/colby57/VMP-Imports-Deobfuscator
 //https://github.com/KuNgia09/vmp3-import-fix
 //https://github.com/pulpgit/Themida-Imports-Deobfuscator-main/tree/84e8edf96a2b8a9134bf40c97ad94e8cb558ff16
@@ -1021,6 +1112,8 @@ public:
 //https://github.com/MMaZaHaKa/awesome_anti_virus_engine
 //https://github.com/gmh5225/awesome-game-security/tree/1f857416ca85858759eb44da277bf070046498b0
 //https://github.com/samshine/VoyagerWithEPT
+//https://github.com/thpatch/thcrap/blob/af5b5e190493887258a64affba7ec220c892e7a6/thcrap/src/ntdll.h
+//https://github.com/jyotidwi/Vmprotect-VMP/blob/94ff35398868c7c5890e494971be404ca659e7e5/runtime/loader.cc
 //
 //https://github.com/unicorn-engine/unicorn
 //https://github.com/DarthTon/Blackbone
