@@ -213,6 +213,10 @@ public:
 	static void DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label = nullptr);
 	static std::string PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec = false, bool bDecBracket = true);
 	static std::string PrintHexOnly(uintptr_t v, bool bDec = false);
+	static uintptr_t DumpModule(uintptr_t pAddr);
+	static uintptr_t DumpModule(const char* moduleName, bool bLoadLib);
+	static bool DumpModuleToFile(uintptr_t pAddr, const char* fileName);
+	static bool DumpModuleToFile(const char* moduleName, const char* fileName, bool bLoadLib = true);
 	static uintptr_t RemapModule(uintptr_t pAddr, bool bTerminateAll); // флешка
 	static uintptr_t RemapModule(const char* moduleName, bool bLoadLib = true, bool bTerminateAll = true);
 

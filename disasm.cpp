@@ -1674,18 +1674,23 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             bool bOutInvMn = false; // is inversed mn
             const bool bCond = ResolveFlagsConditional(instr.mnemonic, bOutCondMn, bOutInvMn);
 
-            disasm += std::string(" ;");
-
+            bool bPrefix = false;
             if (bOutCondMn) {
+                bPrefix = true;
                 if (bOutInvMn)
-                    disasm += std::string(" (inv cond=") + (bCond ? "true" : "false") + ")";
+                    disasm += std::string(" ; (inv cond=") + (bCond ? "true" : "false") + ")";
                 else
-                    disasm += std::string(" (cond=") + (bCond ? "true" : "false") + ")";
+                    disasm += std::string(" ; (cond=") + (bCond ? "true" : "false") + ")";
             }
 
             if (m_bLogDisasmRawBytes && bReadOk && !bytes.empty()) {
                 std::ostringstream bb;
-                bb << " [";
+                if (!bPrefix) {
+                    bb << " ; [";
+                    bPrefix = true;
+                }
+                else
+                    bb << " [";
                 for (size_t i = 0; i < bytes.size(); ++i)
                 {
                     if (i != 0)
@@ -1700,8 +1705,14 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
             if (m_bLogDisasmSection) {
                 const std::string secName = GetSectionNameByRuntimeAddress(curPc);
-                if (!secName.empty())
-                    disasm += " (" + secName + ")";
+                if (!secName.empty()) {
+                    if (!bPrefix) {
+                        disasm += " ; (" + secName + ")";
+                        bPrefix = true;
+                    }
+                    else
+                        disasm += " (" + secName + ")";
+                }
             }
 
             std::ostringstream oss;
@@ -1801,18 +1812,23 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     bool bOutInvMn = false; // is inversed mn
     const bool bCond = ResolveFlagsConditional(instr.mnemonic, bOutCondMn, bOutInvMn);
 
-    disasm += std::string(" ;");
-
+    bool bPrefix = false;
     if (bOutCondMn) {
+        bPrefix = true;
         if (bOutInvMn)
-            disasm += std::string(" (inv cond=") + (bCond ? "true" : "false") + ")";
+            disasm += std::string(" ; (inv cond=") + (bCond ? "true" : "false") + ")";
         else
-            disasm += std::string(" (cond=") + (bCond ? "true" : "false") + ")";
+            disasm += std::string(" ; (cond=") + (bCond ? "true" : "false") + ")";
     }
 
     if (m_bLogDisasmRawBytes && bReadOk && !bytes.empty()) {
         std::ostringstream bb;
-        bb << " [";
+        if (!bPrefix) {
+            bb << " ; [";
+            bPrefix = true;
+        }
+        else
+            bb << " [";
         for (size_t i = 0; i < bytes.size(); ++i)
         {
             if (i != 0)
@@ -1827,8 +1843,14 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
     if (m_bLogDisasmSection) {
         const std::string secName = GetSectionNameByRuntimeAddress(curPc);
-        if (!secName.empty())
-            disasm += " (" + secName + ")";
+        if (!secName.empty()) {
+            if (!bPrefix) {
+                disasm += " ; (" + secName + ")";
+                bPrefix = true;
+            }
+            else
+                disasm += " (" + secName + ")";
+        }
     }
 
     if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
@@ -2452,7 +2474,374 @@ std::string AsmRunner::PrintHexOnly(uintptr_t v, bool bDec)
 //4. .boot мертв, потоки мертвы, анти - отладка мертва
 //5. Осталась RWX флешка с готовым VM - состоянием
 //6. Вызываем VM - обработчики прямо из натива или передаём в unicorn
-// Призрак - модуль есть, а для Windows его нет
+// дамп живого состояния для последующего анализа без риска
+// Призрак - модуль есть, а для Windows его нет Итог: "труп" модуля с готовым замороженным VM-состоянием для эмуляции/анализа
+uintptr_t AsmRunner::DumpModule(uintptr_t pAddr)
+{
+    printf("DumpModule: pAddr=0x%p\n", (void*)pAddr);
+
+    if (!pAddr) {
+        printf("DumpModule: ERROR - Null address\n");
+        return 0;
+    }
+
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pAddr;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        printf("DumpModule: ERROR - Invalid DOS header\n");
+        return 0;
+    }
+
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pAddr + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+        printf("DumpModule: ERROR - Invalid NT header\n");
+        return 0;
+    }
+
+    SIZE_T sz = pNt->OptionalHeader.SizeOfImage;
+    if (!sz) {
+        printf("DumpModule: ERROR - Zero image size\n");
+        return 0;
+    }
+
+    printf("DumpModule: Image size = %zu bytes\n", sz);
+
+    // Сохраняем права доступа к страницам модуля
+    DWORD oldProtect;
+    VirtualProtect((LPVOID)pAddr, sz, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+    // Копируем модуль
+    void* backup = VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!backup) {
+        printf("DumpModule: ERROR - VirtualAlloc for backup failed, error=%d\n", GetLastError());
+        VirtualProtect((LPVOID)pAddr, sz, oldProtect, &oldProtect);
+        return 0;
+    }
+
+    memcpy(backup, (void*)pAddr, sz);
+
+    // Освобождаем модуль
+    HMODULE hMod = (HMODULE)pAddr;
+    while (FreeLibrary(hMod)) {
+        printf("DumpModule: Freed one reference\n");
+    }
+    VirtualFree((LPVOID)pAddr, 0, MEM_RELEASE);
+
+    // Аллоцируем память по тому же адресу
+    void* newBase = VirtualAlloc((void*)pAddr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!newBase) {
+        DWORD err = GetLastError();
+        printf("DumpModule: ERROR - VirtualAlloc at 0x%p failed, error=%d\n", (void*)pAddr, err);
+        VirtualFree(backup, 0, MEM_RELEASE);
+        return 0;
+    }
+
+    if (newBase != (void*)pAddr) {
+        printf("DumpModule: ERROR - Got different address 0x%p\n", newBase);
+        VirtualFree(newBase, 0, MEM_RELEASE);
+        VirtualFree(backup, 0, MEM_RELEASE);
+        return 0;
+    }
+
+    // Восстанавливаем данные
+    memcpy(newBase, backup, sz);
+    VirtualFree(backup, 0, MEM_RELEASE);
+
+    // Восстанавливаем права доступа для секций
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSection++) {
+        DWORD protect = PAGE_READWRITE;
+
+        if (pSection->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            if (pSection->Characteristics & IMAGE_SCN_MEM_READ) {
+                if (pSection->Characteristics & IMAGE_SCN_MEM_WRITE) {
+                    protect = PAGE_EXECUTE_READWRITE;
+                }
+                else {
+                    protect = PAGE_EXECUTE_READ;
+                }
+            }
+            else {
+                protect = PAGE_EXECUTE;
+            }
+        }
+        else {
+            if (pSection->Characteristics & IMAGE_SCN_MEM_READ) {
+                if (pSection->Characteristics & IMAGE_SCN_MEM_WRITE) {
+                    protect = PAGE_READWRITE;
+                }
+                else {
+                    protect = PAGE_READONLY;
+                }
+            }
+            else {
+                protect = PAGE_NOACCESS;
+            }
+        }
+
+        DWORD oldProtectSection;
+        VirtualProtect((LPVOID)((uintptr_t)newBase + pSection->VirtualAddress),
+            pSection->Misc.VirtualSize,
+            protect,
+            &oldProtectSection);
+    }
+
+    printf("DumpModule: SUCCESS - Module dumped at 0x%p\n", newBase);
+    printf("DumpModule: Module is now raw memory, not a Windows module\n");
+    printf("DumpModule: To free use: VirtualFree((void*)0x%p, 0, MEM_RELEASE)\n", newBase);
+    return (uintptr_t)newBase;
+}
+
+uintptr_t AsmRunner::DumpModule(const char* moduleName, bool bLoadLib)
+{
+    printf("DumpModule: Looking for module '%s' (bLoadLib=%d)\n", moduleName ? moduleName : "null", bLoadLib);
+
+    if (!moduleName) {
+        printf("DumpModule: ERROR - Null module name\n");
+        return 0;
+    }
+
+    HMODULE hMod = GetModuleHandleA(moduleName);
+
+    if (!hMod && bLoadLib) {
+        printf("DumpModule: Module '%s' not loaded, trying LoadLibraryA\n", moduleName);
+        hMod = LoadLibraryA(moduleName);
+        if (!hMod) {
+            printf("DumpModule: ERROR - LoadLibraryA failed for '%s', error=%d\n", moduleName, GetLastError());
+            return 0;
+        }
+        printf("DumpModule: LoadLibraryA succeeded, module at 0x%p\n", hMod);
+    }
+
+    if (!hMod) {
+        printf("DumpModule: ERROR - Module '%s' not found, error=%d\n", moduleName, GetLastError());
+        return 0;
+    }
+
+    printf("DumpModule: Found module '%s' at 0x%p\n", moduleName, hMod);
+    return DumpModule((uintptr_t)hMod);
+}
+
+#if 0
+bool AsmRunner::DumpModuleToFile(uintptr_t pAddr, const char* fileName)
+{
+    printf("DumpModuleToFile: pAddr=0x%p, fileName='%s'\n", (void*)pAddr, fileName ? fileName : "null");
+
+    if (!pAddr || !fileName) {
+        printf("DumpModuleToFile: ERROR - Null address or filename\n");
+        return false;
+    }
+
+    // Проверяем DOS заголовок
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pAddr;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        printf("DumpModuleToFile: ERROR - Invalid DOS header\n");
+        return false;
+    }
+
+    // Проверяем NT заголовок
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pAddr + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+        printf("DumpModuleToFile: ERROR - Invalid NT header\n");
+        return false;
+    }
+
+    SIZE_T imageSize = pNt->OptionalHeader.SizeOfImage;
+    if (!imageSize) {
+        printf("DumpModuleToFile: ERROR - Zero image size\n");
+        return false;
+    }
+
+    printf("DumpModuleToFile: Image size = %zu bytes\n", imageSize);
+
+    // Открываем файл для записи
+    HANDLE hFile = CreateFileA(fileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("DumpModuleToFile: ERROR - CreateFileA failed, error=%d\n", GetLastError());
+        return false;
+    }
+
+    // Сохраняем права доступа к страницам модуля
+    DWORD oldProtect;
+    if (!VirtualProtect((LPVOID)pAddr, imageSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        printf("DumpModuleToFile: ERROR - VirtualProtect failed, error=%d\n", GetLastError());
+        CloseHandle(hFile);
+        DeleteFileA(fileName);
+        return false;
+    }
+
+    // Собираем информацию о секциях для правильного дампа
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+    WORD numSections = pNt->FileHeader.NumberOfSections;
+
+    // Вектор для хранения информации о секциях
+    struct SectionInfo {
+        DWORD virtualAddress;
+        DWORD virtualSize;
+        DWORD rawAddress;
+        DWORD rawSize;
+    };
+    std::vector<SectionInfo> sections;
+
+    // Записываем заголовки (DOS + NT + Section headers)
+    DWORD headersSize = pSection ? (DWORD)((uintptr_t)pSection - pAddr) : 0;
+    if (headersSize > 0) {
+        DWORD bytesWritten;
+        if (!WriteFile(hFile, (LPCVOID)pAddr, headersSize, &bytesWritten, NULL) || bytesWritten != headersSize) {
+            printf("DumpModuleToFile: ERROR - Failed to write headers, error=%d\n", GetLastError());
+            VirtualProtect((LPVOID)pAddr, imageSize, oldProtect, &oldProtect);
+            CloseHandle(hFile);
+            DeleteFileA(fileName);
+            return false;
+        }
+        printf("DumpModuleToFile: Written headers: %u bytes\n", headersSize);
+    }
+
+    // Собираем информацию о секциях и записываем их данные
+    for (WORD i = 0; i < numSections; i++, pSection++) {
+        SectionInfo info;
+        info.virtualAddress = pSection->VirtualAddress;
+        info.virtualSize = pSection->Misc.VirtualSize;
+        info.rawAddress = pSection->PointerToRawData;
+        info.rawSize = pSection->SizeOfRawData;
+
+        sections.push_back(info);
+
+        // Если секция имеет данные в файле (raw size > 0)
+        if (info.rawSize > 0 && info.rawAddress > 0) {
+            // Проверяем, что данные секции не выходят за пределы образа
+            if (info.rawAddress + info.rawSize <= imageSize) {
+                // Выравниваем позицию в файле до rawAddress
+                LARGE_INTEGER filePos;
+                filePos.QuadPart = info.rawAddress;
+                if (!SetFilePointerEx(hFile, filePos, NULL, FILE_BEGIN)) {
+                    printf("DumpModuleToFile: WARNING - Failed to seek to raw address 0x%X\n", info.rawAddress);
+                }
+
+                DWORD bytesWritten;
+                LPVOID sectionData = (LPVOID)(pAddr + info.virtualAddress);
+                if (!WriteFile(hFile, sectionData, info.rawSize, &bytesWritten, NULL) || bytesWritten != info.rawSize) {
+                    printf("DumpModuleToFile: WARNING - Failed to write section %d, error=%d\n", i, GetLastError());
+                }
+                else {
+                    printf("DumpModuleToFile: Written section %d: VA=0x%X, Size=%u bytes\n",
+                        i, info.virtualAddress, info.rawSize);
+                }
+            }
+            else {
+                printf("DumpModuleToFile: WARNING - Section %d out of bounds\n", i);
+            }
+        }
+    }
+
+    // Закрываем файл
+    CloseHandle(hFile);
+
+    // Восстанавливаем права доступа
+    VirtualProtect((LPVOID)pAddr, imageSize, oldProtect, &oldProtect);
+
+    printf("DumpModuleToFile: SUCCESS - Module dumped to '%s'\n", fileName);
+    return true;
+}
+#endif
+
+bool AsmRunner::DumpModuleToFile(uintptr_t pAddr, const char* fileName)
+{
+    if (!pAddr || !fileName) {
+        printf("ERROR: Null address or filename\n");
+        return false;
+    }
+
+    // Проверяем DOS заголовок
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pAddr;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        printf("ERROR: Invalid DOS header\n");
+        return false;
+    }
+
+    // Проверяем NT заголовок и получаем размер образа
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pAddr + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+        printf("ERROR: Invalid NT header\n");
+        return false;
+    }
+
+    SIZE_T imageSize = pNt->OptionalHeader.SizeOfImage;
+    if (!imageSize) {
+        printf("ERROR: Zero image size\n");
+        return false;
+    }
+
+    printf("Dumping module at 0x%p, size: %zu bytes to '%s'\n",
+        (void*)pAddr, imageSize, fileName);
+
+    // Открываем файл
+    HANDLE hFile = CreateFileA(fileName, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("ERROR: Failed to create file, error=%d\n", GetLastError());
+        return false;
+    }
+
+    // Меняем защиту памяти для чтения
+    DWORD oldProtect;
+    if (!VirtualProtect((LPVOID)pAddr, imageSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        printf("ERROR: VirtualProtect failed, error=%d\n", GetLastError());
+        CloseHandle(hFile);
+        DeleteFileA(fileName);
+        return false;
+    }
+
+    // Пишем весь образ целиком
+    DWORD bytesWritten;
+    BOOL success = WriteFile(hFile, (LPCVOID)pAddr, (DWORD)imageSize, &bytesWritten, NULL);
+
+    // Восстанавливаем защиту
+    VirtualProtect((LPVOID)pAddr, imageSize, oldProtect, &oldProtect);
+
+    // Закрываем файл
+    CloseHandle(hFile);
+
+    if (!success || bytesWritten != imageSize) {
+        printf("ERROR: Failed to write file, error=%d\n", GetLastError());
+        DeleteFileA(fileName);
+        return false;
+    }
+
+    printf("SUCCESS: Dumped %u bytes to '%s'\n", bytesWritten, fileName);
+    return true;
+}
+
+bool AsmRunner::DumpModuleToFile(const char* moduleName, const char* fileName, bool bLoadLib)
+{
+    printf("DumpModuleToFile: Looking for module '%s' (bLoadLib=%d)\n", moduleName ? moduleName : "null", bLoadLib);
+
+    if (!moduleName || !fileName) {
+        printf("DumpModuleToFile: ERROR - Null module name or filename\n");
+        return false;
+    }
+
+    HMODULE hMod = GetModuleHandleA(moduleName);
+
+    if (!hMod && bLoadLib) {
+        printf("DumpModuleToFile: Module '%s' not loaded, trying LoadLibraryA\n", moduleName);
+        hMod = LoadLibraryA(moduleName);
+        if (!hMod) {
+            printf("DumpModuleToFile: ERROR - LoadLibraryA failed for '%s', error=%d\n", moduleName, GetLastError());
+            return false;
+        }
+        printf("DumpModuleToFile: LoadLibraryA succeeded, module at 0x%p\n", hMod);
+    }
+
+    if (!hMod) {
+        printf("DumpModuleToFile: ERROR - Module '%s' not found, error=%d\n", moduleName, GetLastError());
+        return false;
+    }
+
+    printf("DumpModuleToFile: Found module '%s' at 0x%p\n", moduleName, hMod);
+    return DumpModuleToFile((uintptr_t)hMod, fileName);
+}
+
+#if 0
 uintptr_t AsmRunner::RemapModule(uintptr_t pAddr, bool bTerminateAll)
 {
     printf("RemapModule: pAddr=0x%p, bTerminateAll=%s\n", (void*)pAddr, bTerminateAll ? "true" : "false");
@@ -2660,6 +3049,7 @@ uintptr_t AsmRunner::RemapModule(const char* moduleName, bool bLoadLib, bool bTe
     printf("RemapModule: Found module '%s' at 0x%p\n", moduleName, hMod);
     return RemapModule((uintptr_t)hMod, bTerminateAll);
 }
+#endif
 
 void AsmRunner::TestPerformanceConstants()
 {
@@ -4362,10 +4752,17 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool call
     if (!pAddr)
         return;
 
+    if (!moduleHook && GetModStart() != 0 && GetModEnd() != 0 && IsInAddr(pAddr, GetModStart(), GetModEnd())) {
+        if (m_bLogRunner)
+            Log("[!] AnyJmpHook: ERROR! Install external hook in module");
+        MboxSTD("AnyJmpHook: ERROR! Install external hook in module", AR_SNAME);
+        return;
+    }
+
     for (const auto& h : m_anyJmpHooks) {
         if (h.pAddr == pAddr) {
             if(m_bLogRunner)
-                Log("AnyJmpHook already exists for this address");
+                Log("[!] AnyJmpHook already exists for this address");
             MboxSTD("AnyJmpHook already exists for this address", AR_SNAME);
             return;
         }
@@ -6536,6 +6933,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             return true;
         }, this, bBefore);
 
+    // TODO: GetLastError SetLastError RtlDecodePointer EncodePointer
     // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
 
     SetInsnCB(UC_X86_INS_CPUID,
@@ -9915,6 +10313,9 @@ void VMTEST(int a1)
     //void* pACPISSDT = regions.size() ? regions[0].baseAddress : null;
     //printf("[*] pACPISSDT=0x%p\n", pACPISSDT);
 
+    //HMODULE hMod = LoadLibraryA("c_export_test_dll.dll");
+    //if (hMod) { FreeLibrary(hMod); printf("Module unloaded!\n"); }
+    //printf("Module still loaded: %s\n", GetModuleHandleA("c_export_test_dll.dll") ? "YES" : "NO");
 
     AsmRunner runner(false);
     const bool bCRC = true;
@@ -9931,6 +10332,7 @@ void VMTEST(int a1)
     uintptr_t pCRC = (uintptr_t)(_ADDR(0x60F0101D));
     uintptr_t pPostSend = (uintptr_t)(_ADDR(0x60F2D910));
     uintptr_t pMalloc = (uintptr_t)(_ADDR(0x610AE29B));
+    uintptr_t pFree = (uintptr_t)(_ADDR(0x610AE261));
     uintptr_t pB64 = (uintptr_t)(_ADDR(0x60F303A0));
     uintptr_t pMd5 = (uintptr_t)(_ADDR(0x61020220));
     uintptr_t pDLLS = (uintptr_t)(_ADDR(0x60F2FA89)); // MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89
@@ -9998,7 +10400,7 @@ void VMTEST(int a1)
             //printf("bp: 0x%p\n", address);
             MboxSTD("MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89 sucesss", "disasm");
 
-            return true;
+            return false; // halt exit
         }, &runner);
 
     AsmRunner::HookNotifyCb hcb = [&](tIEFuncNode* pNode) {
@@ -10242,6 +10644,8 @@ void VMTEST(int a1)
         if (self->IsHaltAddr(to))
             return true; // actual false
 
+
+
         //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsPCNormal(to)) {
@@ -10258,6 +10662,16 @@ void VMTEST(int a1)
     };
 
     runner.Initialise(true, false, false, true);      // disasm + memrw + runner logs
+    //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
+    if (!bCRC) {
+        uintptr_t mod = runner.CopyModule(STEAM_LIB);
+        runner.SetIAT((uintptr_t)addr(0x6137B000), (uintptr_t)addr(0x6137B508), false);
+    }
+    else {
+        uintptr_t mod = runner.CopyModule(CRC_STEAM_LIB);
+        runner.SetIAT((uintptr_t)addrCRC(0x6137B000), (uintptr_t)addrCRC(0x6137B508), false);
+    }
+
     //runner.SetAnyJmpHook(0x12345678, [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
     //	{
     //		auto* self = static_cast<AsmRunner*>(user_data);
@@ -10583,32 +10997,32 @@ void VMTEST(int a1)
         &runner);
 
     // unsupported 4 now
-    runner.SetInsnCB(UC_X86_INS_MOV,
-        [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
-        {
-            auto* self = static_cast<AsmRunner*>(user_data);
-            if (!self || !uc)
-                return true;
+    //runner.SetInsnCB(UC_X86_INS_MOV,
+    //	[&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
+    //	{
+    //		auto* self = static_cast<AsmRunner*>(user_data);
+    //		if (!self || !uc)
+    //			return true;
 
-            MboxSTD("Warn! HOOK!!!!", AR_SNAME);
+    //		MboxSTD("Warn! HOOK!!!!", AR_SNAME);
 
-            return true;
-        }, &runner);
+    //		return true;
+    //	}, &runner);
 
-    // unsupported 4 now
-    runner.SetInsnCB(UC_X86_INS_ADD,
-        [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
-        {
-            auto* self = static_cast<AsmRunner*>(user_data);
-            if (!self || !uc)
-                return true;
+    //// unsupported 4 now
+    //runner.SetInsnCB(UC_X86_INS_ADD,
+    //	[&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
+    //	{
+    //		auto* self = static_cast<AsmRunner*>(user_data);
+    //		if (!self || !uc)
+    //			return true;
 
-            MboxSTD("Warn! HOOK!!!!", AR_SNAME);
+    //		MboxSTD("Warn! HOOK!!!!", AR_SNAME);
 
 
-            // Let the instruction execute normally
-            return true;
-        }, &runner);
+    //		// Let the instruction execute normally
+    //		return true;
+    //	}, &runner);
 
     runner.SetAnyJmpHook(pPostSend,
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
@@ -10717,16 +11131,67 @@ void VMTEST(int a1)
                     self->SetRegister(self->AxReg(), 0);
                     self->UpdatePC(retaddr, true);
                     return true;
-                    }
+                }
 
                 printf("[malloc] allocated 0x%p bytes at 0x%p\n", (void*)dwSize, (void*)allocated);
-                }
+            }
 
             self->SetRegister(self->AxReg(), allocated);
             self->UpdatePC(retaddr, true);
 
             return true;
-            }, &runner, bBefore, true);
+        }, &runner, bBefore, true);
+
+    runner.SetAnyJmpHook(pFree,
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        {
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            //MboxSTD("custom wait", "Free");
+
+            printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
+                (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+
+            tIEFuncNode* pNode = self->FindIATNode(to);
+            if (pNode)
+                printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
+
+            // BOOL VirtualFree(
+            //   LPVOID lpAddress,   // x86: [ESP+4], x64: RCX
+            //   SIZE_T dwSize,      // x86: [ESP+8], x64: RDX  
+            //   DWORD dwFreeType    // x86: [ESP+12], x64: R8
+            // );
+
+            const bool bShouldPopArgs_NoCdecl = false; // true=stdcall pop like, false=cdecl peek
+
+            uintptr_t lpAddress = 0;
+            uintptr_t retaddr = 0;
+            if (bBefore) {
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            }
+            else if (!self->StackPop(retaddr)) {
+                return false;
+            }
+
+            if (!self->StackGetArg(lpAddress, 0, bShouldPopArgs_NoCdecl)) return false;
+
+            printf("[Free] lpAddress=0x%p ret=0x%p\n", (void*)lpAddress, (void*)retaddr);
+
+            BOOL result = TRUE; // или VirtualFreeStub((LPVOID)lpAddress, dwSize, dwFreeType);
+
+            if (lpAddress != 0)
+            {
+                self->FreeMemory(lpAddress);
+                printf("[Free] Freeing memory at 0x%p\n", (void*)lpAddress);
+            }
+
+            self->SetRegister(self->AxReg(), result);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, &runner, bBefore, true);
 
     // Themida: читает из какой то памяти вне модуля crc посчитанную в boot
     // MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch_  
@@ -10751,15 +11216,6 @@ void VMTEST(int a1)
     runner.InitIDAWS();
     //runner.WaitIDAWSConnection();
     //runner.ComparePCTrace("TR1.txt", "TR2.txt", true, "TR_cmp.txt");
-    //runner.CopyModule(pStart, nSize);         // копируем модуль в Unicorn по тому же base
-    if (!bCRC) {
-        uintptr_t mod = runner.CopyModule(STEAM_LIB);
-        runner.SetIAT((uintptr_t)addr(0x6137B000), (uintptr_t)addr(0x6137B508), false);
-    }
-    else {
-        uintptr_t mod = runner.CopyModule(CRC_STEAM_LIB);
-        runner.SetIAT((uintptr_t)addrCRC(0x6137B000), (uintptr_t)addrCRC(0x6137B508), false);
-    }
     runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
     //runner.TraceInstruction("C:\\trace.txt", reinterpret_cast<uintptr_t>(pEntry), 300); return; // автостарт
 
