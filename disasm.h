@@ -24,9 +24,10 @@
 //#define AR_BP_AFTER_DZ // faster dz
 //#define AR_BP_RANGE // size or range
 
-#ifdef CopyMemory
+// windows header hell kek
 #undef CopyMemory
-#endif
+#undef min
+#undef max
 
 // TODO: normal seh+frame unwind MSR_FS_BASE, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb, cb UC_HOOK_INSN, UC_HOOK_INTR, cb on register change?, trace deadzone?
 // UC bugs: 1 can't set fs: but res ok, 2 update pc + emu_stop() can't stop emu
@@ -165,6 +166,10 @@ public:
 	uintptr_t CalcWithCASLR(uintptr_t p) const { return p - GetModStart() + GetDisasmCASLR(); }
 	void SetLogDisasm(bool enabled) { m_bLogDisasm = enabled; }
 	bool IsLogDisasm() const { return m_bLogDisasm; }
+	void SetLogDisasmRawBytes(bool enabled) { m_bLogDisasmRawBytes = enabled; }
+	bool IsLogDisasmRawBytes() const { return m_bLogDisasmRawBytes; }
+	void SetLogDisasmSection(bool enabled) { m_bLogDisasmSection = enabled; }
+	bool IsLogDisasmSection() const { return m_bLogDisasmSection; }
 	void SetLogDisasmICNotice(uintptr_t disasmICNotice) { m_DisasmICNotice = disasmICNotice; }
 	void SetLogMemRW(bool enabled) { m_bLogMemRW = enabled; }
 	bool IsLogMemRW() const { return m_bLogMemRW; }
@@ -208,6 +213,8 @@ public:
 	static void DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label = nullptr);
 	static std::string PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec = false, bool bDecBracket = true);
 	static std::string PrintHexOnly(uintptr_t v, bool bDec = false);
+	static uintptr_t RemapModule(uintptr_t pAddr, bool bTerminateAll); // флешка
+	static uintptr_t RemapModule(const char* moduleName, bool bLoadLib = true, bool bTerminateAll = true);
 
 	static void TestPerformanceConstants();
 	void SetPerformanceConstantsHost(float k = 1.0f);
@@ -251,6 +258,7 @@ public:
 	bool AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
 	bool AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
 	void CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
+	uintptr_t MemSet(uintptr_t pAddr, int32_t nVal, uintptr_t nSize);
 	bool FreeMemory(uintptr_t pVTo);
 	bool ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
@@ -361,12 +369,14 @@ public:
 	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
 	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
 	void ClearRWHistory();
-	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC = true, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true, bool skipTrace = true, bool skipHistory = true);
+	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC = true, bool showEnterMessage = true, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true, bool skipTrace = true, bool skipHistory = true);
 	void InstallDefaultHooks(HookNotifyCb cb);
+	bool ParseModuleSections();
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
 	const tFuncNode* FindSymbolByRuntime(uintptr_t rtAddr) const;
+	std::string GetSectionNameByRuntimeAddress(uintptr_t rtAddr) const;
 	tFuncNode GetSymByName(const char* szName);
 	tFuncNode GetSymByAddr(uintptr_t pAddr);
 	void DisassembleWithZydis();
@@ -606,6 +616,7 @@ private:
 		uintptr_t startIC;     // Начальный счётчик инструкций
 		uintptr_t endIC;       // Конечный счётчик инструкций
 		bool checkPC;          // Проверять границы
+		bool showEnterMessage; // Показать окно входа в dz (предупреждение что не будут работать почти все калбеки)
 		bool skipJmps;         // Пропускать JMP колбэки
 		bool skipMem;          // Пропускать MEM колбэки
 		bool skipOpcode;       // Пропускать Opcode колбэки
@@ -646,10 +657,26 @@ private:
 		AsmRunner* owner = nullptr; // stable back-reference for trampoline
 	};
 
+	struct tSection
+	{
+		std::string name;
+		uintptr_t rva = 0;
+		uintptr_t va = 0;
+		uint32_t virtualSize = 0;
+		uint32_t rawSize = 0;
+		uint32_t rawPtr = 0;
+		uint32_t characteristics = 0;
+		bool readable = false;
+		bool writable = false;
+		bool executable = false;
+	};
+
 	uc_engine* m_uc = nullptr;
 	bool m_bInitialised = false;
 	bool m_bLogEnabled = true;
 	bool m_bLogDisasm = false;
+	bool m_bLogDisasmRawBytes = true;
+	bool m_bLogDisasmSection = false; // manual parse + set true
 	bool m_bLogMemRW = false;
 	bool m_bLogAnyJmp = false;
 	bool m_bLogRunner = false;
@@ -675,6 +702,7 @@ private:
 	std::vector<tRWHistory> m_RWHistory;
 	bool m_bRWHistory = false;
 	std::vector<tInsnHookNode> m_insnHooks;
+	std::vector<tSection> m_sections;
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
@@ -754,7 +782,7 @@ private:
 	bool ResolveMemoryOperandAddress(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand& op, uintptr_t insnAddr, uintptr_t& outAddr) const;
 	bool ResolveDirectBranchTarget(uc_engine* uc, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* ops, uintptr_t insnAddr, uintptr_t& outTarget) const;
 	bool CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t size);
-	void UpdateDeadzoneIC(uintptr_t currentIC);
+	void UpdateDeadzoneIC(uintptr_t currentIC, uintptr_t address);
 	tDeadzoneIC* GetCurrentDeadzoneIC();
 
 	// внутренние колбэки Unicorn (static, this передаётся через user_data)
@@ -1079,6 +1107,10 @@ public:
 // STACK: 0xFF (stack base)
 
 //0x7FFDF000 fs TEB Thread Environment Block FS:[0]
+//Команда fs : [0] (обращение к памяти)
+//Когда ты пишешь fs : [0] — это значит :
+//"Возьми индекс из регистра FS, найди по нему дескриптор в GDT, достань оттуда базовый адрес, прибавь к нему смещение 0 и прочитай память"
+//Тут 0 — это СМЕЩЕНИЕ относительно базового адреса TEB.
 
 //; Запрос function_id = 1
 //mov eax, 1; В EAX - вопрос к процессору

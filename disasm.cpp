@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cctype>
 #include <array>
+#include <tlhelp32.h>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -1101,20 +1102,28 @@ bool AsmRunner::CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t 
     return true;
 }
 
-void AsmRunner::UpdateDeadzoneIC(uintptr_t currentIC)
+void AsmRunner::UpdateDeadzoneIC(uintptr_t currentIC, uintptr_t address)
 {
-    m_bInDeadzoneIC = false;
-    m_currentDeadzoneICIndex = -1;
-
     for (size_t i = 0; i < m_deadzonesIC.size(); ++i) {
         const auto& dz = m_deadzonesIC[i];
         if (currentIC >= dz.startIC && currentIC <= dz.endIC)
         {
+            if (!m_bInDeadzoneIC) { // entry
+                if (m_bLogRunner)
+                    Log("[!] Warn! ENTERING INTO DEAD ZONE %d-%d [IC %zu] pc 0x%p ( +0x%p)",
+                        dz.startIC, dz.endIC, static_cast<size_t>(m_instrCount), (void*)address, (void*)(address - m_modStart));
+                if (dz.showEnterMessage)
+                    MboxSTD("Warn! ENTERING INTO DEAD ZONE! No CB/HOOKS other than BP will work!", AR_SNAME);
+            }
+
             m_bInDeadzoneIC = true;
             m_currentDeadzoneICIndex = static_cast<int32_t>(i);
             return;
         }
     }
+
+    m_bInDeadzoneIC = false;
+    m_currentDeadzoneICIndex = -1;
 }
 
 AsmRunner::tDeadzoneIC* AsmRunner::GetCurrentDeadzoneIC()
@@ -1263,6 +1272,7 @@ void AsmRunner::Shutdown()
     m_gstftSleepDelta = 0;
     m_gstftInited = false;
     m_insnHooks.clear();
+    m_sections.clear();
 }
 
 void AsmRunner::ShutdownByCallback(uc_engine* uc)
@@ -1389,6 +1399,32 @@ const tFuncNode* AsmRunner::FindSymbolByRuntime(uintptr_t rtAddr) const
     //    return &(*it);
 
     return nullptr;
+}
+
+std::string AsmRunner::GetSectionNameByRuntimeAddress(uintptr_t addr) const
+{
+    if (m_sections.empty() || m_modStart == 0)
+        return {};
+
+    const uintptr_t rva = addr - m_modStart;
+
+    for (const auto& s : m_sections)
+    {
+        const uintptr_t secEnd = s.rva + std::max<uint32_t>(s.virtualSize, s.rawSize);
+        if (rva >= s.rva && rva < secEnd)
+        {
+            std::string name = s.name;
+
+            size_t spaceCount = std::count(name.begin(), name.end(), ' '); // themida kek
+            if (spaceCount == name.size() && !name.empty()) {
+                std::fill(name.begin(), name.end(), '_');
+            }
+
+            return name;
+        }
+    }
+
+    return {};
 }
 
 std::string AsmRunner::FormatRuntimeAddressWithSymbol(uintptr_t rtAddr) const
@@ -1571,11 +1607,12 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 {
     (void)user_data;
     ++m_instrCount;
-    UpdateDeadzoneIC(m_instrCount);
 
     uintptr_t curPc = static_cast<uintptr_t>(address);
     if (!m_bX64)
         curPc = static_cast<uint32_t>(curPc);
+
+    UpdateDeadzoneIC(m_instrCount, curPc);
 
     auto IsAllowedPc = [&](uintptr_t pc) -> bool
     {
@@ -1637,11 +1674,34 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             bool bOutInvMn = false; // is inversed mn
             const bool bCond = ResolveFlagsConditional(instr.mnemonic, bOutCondMn, bOutInvMn);
 
+            disasm += std::string(" ;");
+
             if (bOutCondMn) {
                 if (bOutInvMn)
                     disasm += std::string(" (inv cond=") + (bCond ? "true" : "false") + ")";
                 else
                     disasm += std::string(" (cond=") + (bCond ? "true" : "false") + ")";
+            }
+
+            if (m_bLogDisasmRawBytes && bReadOk && !bytes.empty()) {
+                std::ostringstream bb;
+                bb << " [";
+                for (size_t i = 0; i < bytes.size(); ++i)
+                {
+                    if (i != 0)
+                        bb << ' ';
+                    bb << "0x" << std::hex << std::uppercase
+                        << std::setw(2) << std::setfill('0')
+                        << static_cast<unsigned>(bytes[i]);
+                }
+                bb << "]";
+                disasm += bb.str();
+            }
+
+            if (m_bLogDisasmSection) {
+                const std::string secName = GetSectionNameByRuntimeAddress(curPc);
+                if (!secName.empty())
+                    disasm += " (" + secName + ")";
             }
 
             std::ostringstream oss;
@@ -1741,11 +1801,34 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     bool bOutInvMn = false; // is inversed mn
     const bool bCond = ResolveFlagsConditional(instr.mnemonic, bOutCondMn, bOutInvMn);
 
+    disasm += std::string(" ;");
+
     if (bOutCondMn) {
         if (bOutInvMn)
             disasm += std::string(" (inv cond=") + (bCond ? "true" : "false") + ")";
         else
             disasm += std::string(" (cond=") + (bCond ? "true" : "false") + ")";
+    }
+
+    if (m_bLogDisasmRawBytes && bReadOk && !bytes.empty()) {
+        std::ostringstream bb;
+        bb << " [";
+        for (size_t i = 0; i < bytes.size(); ++i)
+        {
+            if (i != 0)
+                bb << ' ';
+            bb << "0x" << std::hex << std::uppercase
+                << std::setw(2) << std::setfill('0')
+                << static_cast<unsigned>(bytes[i]);
+        }
+        bb << "]";
+        disasm += bb.str();
+    }
+
+    if (m_bLogDisasmSection) {
+        const std::string secName = GetSectionNameByRuntimeAddress(curPc);
+        if (!secName.empty())
+            disasm += " (" + secName + ")";
     }
 
     if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
@@ -1883,7 +1966,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
             oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
         else if (m_bDisasmRVA)
-            oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart + m_DisasmCustomASLR) << " ( +0x" << (curPc - m_modStart) << ")";
+            oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(curPc) << " ( +0x" << (curPc - m_modStart) << ")";
         else
             oss << "0x" << std::hex << std::uppercase << curPc;
         oss << ": " << disasm;
@@ -2211,7 +2294,7 @@ bool AsmRunner::_OnBreakpoint(const tBpInfo& bp, uc_engine* uc, uint64_t address
 {
     (void)uc;
     if (m_bLogRunner) {
-        Log("[BP %s] hit at 0x%p ( +0x%p)", bMemory ? "MEM" : "CODE", (void*)address, (void*)(address - m_modStart));
+        Log("[BP %s] hit at 0x%p ( +0x%p) IC %zu", bMemory ? "MEM" : "CODE", (void*)address, (void*)(address - m_modStart), static_cast<size_t>(m_instrCount));
     }
 
     ZydisDecodedInstruction instr{};
@@ -2360,6 +2443,222 @@ std::string AsmRunner::PrintHexOnly(uintptr_t v, bool bDec)
     else
         oss << "0x" << std::hex << std::uppercase << v;
     return oss.str();
+}
+
+// VirtualFree((void*)RemapModule(0x123456789), 0, MEM_RELEASE);
+//1. .boot запустился на хосте
+//2. У него есть анти - отладочный поток(крутится, проверяет)
+//3. RemapModule() - TerminateThread убивает ВСЕ потоки
+//4. .boot мертв, потоки мертвы, анти - отладка мертва
+//5. Осталась RWX флешка с готовым VM - состоянием
+//6. Вызываем VM - обработчики прямо из натива или передаём в unicorn
+// Призрак - модуль есть, а для Windows его нет
+uintptr_t AsmRunner::RemapModule(uintptr_t pAddr, bool bTerminateAll)
+{
+    printf("RemapModule: pAddr=0x%p, bTerminateAll=%s\n", (void*)pAddr, bTerminateAll ? "true" : "false");
+
+    if (!pAddr) {
+        printf("RemapModule: ERROR - Null address\n");
+        return 0;
+    }
+
+    PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)pAddr;
+    if (pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+        printf("RemapModule: ERROR - Invalid DOS header\n");
+        return 0;
+    }
+
+    PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pAddr + pDos->e_lfanew);
+    if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+        printf("RemapModule: ERROR - Invalid NT header\n");
+        return 0;
+    }
+
+    SIZE_T sz = pNt->OptionalHeader.SizeOfImage;
+    if (!sz) {
+        printf("RemapModule: ERROR - Zero image size\n");
+        return 0;
+    }
+
+    printf("RemapModule: Image size = %zu bytes\n", sz);
+
+    // Collect all threads (except current) for suspension or termination
+    std::vector<HANDLE> hThreads;
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te;
+        te.dwSize = sizeof(THREADENTRY32);
+
+        if (Thread32First(hSnapshot, &te)) {
+            do {
+                if (te.th32OwnerProcessID == GetCurrentProcessId() &&
+                    te.th32ThreadID != GetCurrentThreadId()) {
+                    HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME | (bTerminateAll ? THREAD_TERMINATE : 0),
+                        FALSE, te.th32ThreadID);
+                    if (hThread) {
+                        hThreads.push_back(hThread);
+                        if (!bTerminateAll) {
+                            SuspendThread(hThread);
+                        }
+                    }
+                }
+            } while (Thread32Next(hSnapshot, &te));
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    // If bTerminateAll, terminate all threads now
+    if (bTerminateAll) {
+        printf("RemapModule: Terminating all threads (bTerminateAll=true)\n");
+        for (HANDLE hThread : hThreads) {
+            TerminateThread(hThread, 0);
+            CloseHandle(hThread);
+        }
+        hThreads.clear();
+        printf("RemapModule: All threads terminated\n");
+    }
+
+    void* backup = VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!backup) {
+        printf("RemapModule: ERROR - VirtualAlloc for backup failed, error=%d\n", GetLastError());
+
+        // Resume threads if not terminating
+        if (!bTerminateAll) {
+            for (HANDLE hThread : hThreads) {
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+            }
+        }
+        return 0;
+    }
+
+    memcpy(backup, (void*)pAddr, sz);
+
+    HMODULE hMod = (HMODULE)pAddr;
+    while (FreeLibrary(hMod)) {
+        printf("RemapModule: Freed one reference\n");
+    }
+    VirtualFree((LPVOID)pAddr, 0, MEM_RELEASE); // recheck
+
+    void* newBase = VirtualAlloc((void*)pAddr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!newBase) {
+        DWORD err = GetLastError();
+        printf("RemapModule: ERROR - VirtualAlloc at 0x%p failed, error=%d\n", (void*)pAddr, err);
+        VirtualFree(backup, 0, MEM_RELEASE);
+
+        if (!bTerminateAll) {
+            for (HANDLE hThread : hThreads) {
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+            }
+        }
+        return 0;
+    }
+
+    if (newBase != (void*)pAddr) {
+        printf("RemapModule: ERROR - Got different address 0x%p\n", newBase);
+        VirtualFree(newBase, 0, MEM_RELEASE);
+        VirtualFree(backup, 0, MEM_RELEASE);
+
+        if (!bTerminateAll) {
+            for (HANDLE hThread : hThreads) {
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+            }
+        }
+        return 0;
+    }
+
+    memcpy(newBase, backup, sz);
+    VirtualFree(backup, 0, MEM_RELEASE);
+
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSection++) {
+        DWORD protect = PAGE_READWRITE;
+
+        if (pSection->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            if (pSection->Characteristics & IMAGE_SCN_MEM_READ) {
+                if (pSection->Characteristics & IMAGE_SCN_MEM_WRITE) {
+                    protect = PAGE_EXECUTE_READWRITE;
+                }
+                else {
+                    protect = PAGE_EXECUTE_READ;
+                }
+            }
+            else {
+                protect = PAGE_EXECUTE;
+            }
+        }
+        else {
+            if (pSection->Characteristics & IMAGE_SCN_MEM_READ) {
+                if (pSection->Characteristics & IMAGE_SCN_MEM_WRITE) {
+                    protect = PAGE_READWRITE;
+                }
+                else {
+                    protect = PAGE_READONLY;
+                }
+            }
+            else {
+                protect = PAGE_NOACCESS;
+            }
+        }
+
+        DWORD oldProtectSection;
+        VirtualProtect((LPVOID)((uintptr_t)newBase + pSection->VirtualAddress),
+            pSection->Misc.VirtualSize,
+            protect,
+            &oldProtectSection);
+    }
+
+    // Resume threads only if not terminating
+    if (!bTerminateAll) {
+        printf("RemapModule: Resuming all threads (bTerminateAll=false)\n");
+        for (HANDLE hThread : hThreads) {
+            ResumeThread(hThread);
+            CloseHandle(hThread);
+        }
+    }
+    else {
+        // Clean up thread handles (already terminated and closed)
+        for (HANDLE hThread : hThreads) {
+            CloseHandle(hThread);
+        }
+    }
+
+    printf("RemapModule: SUCCESS - Module remapped at 0x%p\n", newBase);
+    printf("RemapModule: Module is now raw memory, not a Windows module\n");
+    printf("RemapModule: To free use: VirtualFree((void*)0x%p, 0, MEM_RELEASE)\n", newBase);
+    return (uintptr_t)newBase;
+}
+
+uintptr_t AsmRunner::RemapModule(const char* moduleName, bool bLoadLib, bool bTerminateAll)
+{
+    printf("RemapModule: Looking for module '%s' (bLoadLib=%d)\n", moduleName ? moduleName : "null", bLoadLib);
+
+    if (!moduleName) {
+        printf("RemapModule: ERROR - Null module name\n");
+        return 0;
+    }
+
+    HMODULE hMod = GetModuleHandleA(moduleName);
+
+    if (!hMod && bLoadLib) {
+        printf("RemapModule: Module '%s' not loaded, trying LoadLibraryA\n", moduleName);
+        hMod = LoadLibraryA(moduleName);
+        if (!hMod) {
+            printf("RemapModule: ERROR - LoadLibraryA failed for '%s', error=%d\n", moduleName, GetLastError());
+            return 0;
+        }
+        printf("RemapModule: LoadLibraryA succeeded, module at 0x%p\n", hMod);
+    }
+
+    if (!hMod) {
+        printf("RemapModule: ERROR - Module '%s' not found, error=%d\n", moduleName, GetLastError());
+        return 0;
+    }
+
+    printf("RemapModule: Found module '%s' at 0x%p\n", moduleName, hMod);
+    return RemapModule((uintptr_t)hMod, bTerminateAll);
 }
 
 void AsmRunner::TestPerformanceConstants()
@@ -3263,6 +3562,17 @@ void AsmRunner::CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
     uc_mem_write(m_uc, pVTo, reinterpret_cast<void*>(pFrom), nSize);
 }
 
+uintptr_t AsmRunner::MemSet(uintptr_t pAddr, int32_t nVal, uintptr_t nSize)
+{
+    if (!m_uc || !pAddr || !nSize) return 0;
+    uint8_t* arr = new uint8_t[nSize];
+    memset(arr, nVal, nSize);
+    CopyMemory(pAddr, (uintptr_t)arr, nSize);
+    delete[] arr;
+    arr = nullptr;
+    return pAddr;
+}
+
 bool AsmRunner::FreeMemory(uintptr_t pVTo)
 {
     if (!m_uc || !pVTo) return false;
@@ -3927,6 +4237,7 @@ void AsmRunner::CopyNTSeh(uintptr_t pAddr, uintptr_t nSize)
 }
 
 // TODO: Not work x86 uc_reg_write UC_X86_REG_FS_BASE!!
+// UC_X86_REG_FS UC_X86_REG_FS_BASE: UC_X86_REG_FS [0, 3] selector idx
 bool AsmRunner::SetTebBase(uintptr_t base)
 {
     if (!m_uc)
@@ -4967,7 +5278,7 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, b
         return;
     }
 
-    const size_t minSz = min(a.size(), b.size());
+    const size_t minSz = std::min(a.size(), b.size());
     size_t firstDiff = minSz;
 
     for (size_t i = 0; i < minSz; ++i)
@@ -5004,7 +5315,7 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, b
 
     if (bAll)
     {
-        for (size_t i = 0; i < max(a.size(), b.size()); ++i)
+        for (size_t i = 0; i < std::max(a.size(), b.size()); ++i)
         {
             const bool hasA = i < a.size();
             const bool hasB = i < b.size();
@@ -5036,7 +5347,7 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, b
     }
 
     const size_t begin = (firstDiff > 10) ? (firstDiff - 10) : 0;
-    const size_t end = min(max(a.size(), b.size()), firstDiff + 11);
+    const size_t end = std::min(std::max(a.size(), b.size()), firstDiff + 11);
 
     {
         std::ostringstream ss;
@@ -5142,7 +5453,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 
     if (m_bLogRunner) {
         SetConsoleColor(1);
-        Log("[*] emu end, err=%s, instr=%zu", uc_strerror(err), static_cast<size_t>(m_instrCount));
+        Log("[*] emu end, err=%s, IC instr=%zu", uc_strerror(err), static_cast<size_t>(m_instrCount));
 
         if (err != UC_ERR_OK) {
             SetConsoleColor(0);
@@ -5906,9 +6217,9 @@ void AsmRunner::ClearRWHistory()
     m_RWHistory.clear();
 }
 
-void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode, bool skipTrace, bool skipHistory)
+void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, bool showEnterMessage, bool skipAll, bool skipJmps, bool skipMem, bool skipOpcode, bool skipTrace, bool skipHistory)
 {
-    m_deadzonesIC.push_back({ startIC, endIC, checkPC, skipJmps, skipMem, skipOpcode, skipAll, skipTrace, skipHistory, false });
+    m_deadzonesIC.push_back({ startIC, endIC, checkPC, showEnterMessage, skipJmps, skipMem, skipOpcode, skipAll, skipTrace, skipHistory, false });
 
     std::sort(m_deadzonesIC.begin(), m_deadzonesIC.end(),
         [](const tDeadzoneIC& a, const tDeadzoneIC& b) { return a.startIC < b.startIC; });
@@ -6284,6 +6595,67 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
             return true;
         }, this);
+}
+
+bool AsmRunner::ParseModuleSections()
+{
+    m_sections.clear();
+
+    if (m_modStart == 0)
+        return false;
+
+    //__try
+    {
+        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_modStart);
+        if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+
+        auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(m_modStart + dos->e_lfanew);
+        if (!nt || nt->Signature != IMAGE_NT_SIGNATURE)
+            return false;
+
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        const WORD count = nt->FileHeader.NumberOfSections;
+
+        m_sections.reserve(count);
+
+        for (WORD i = 0; i < count; ++i, ++sec)
+        {
+            tSection s;
+
+            char nameBuf[IMAGE_SIZEOF_SHORT_NAME + 1]{};
+            memcpy(nameBuf, sec->Name, IMAGE_SIZEOF_SHORT_NAME);
+            s.name = nameBuf;
+            while (!s.name.empty() && s.name.back() == '\0')
+                s.name.pop_back();
+
+            s.rva = sec->VirtualAddress;
+            s.va = m_modStart + sec->VirtualAddress;
+            s.virtualSize = sec->Misc.VirtualSize;
+            s.rawSize = sec->SizeOfRawData;
+            s.rawPtr = sec->PointerToRawData;
+            s.characteristics = sec->Characteristics;
+
+            s.readable = (sec->Characteristics & IMAGE_SCN_MEM_READ) != 0;
+            s.writable = (sec->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+            s.executable = (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+
+            m_sections.push_back(std::move(s));
+        }
+
+        std::sort(m_sections.begin(), m_sections.end(),
+            [](const tSection& a, const tSection& b)
+            {
+                return a.rva < b.rva;
+            });
+    }
+    //__except (EXCEPTION_EXECUTE_HANDLER)
+    //{
+    //    m_sections.clear();
+    //    return false;
+    //}
+
+    return !m_sections.empty();
 }
 
 void AsmRunner::TrimInPlace(std::string& s)
@@ -7451,7 +7823,7 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
             SetConsoleTextAttribute(hConsole, oldAttr);
     };
 
-    const size_t cmpSize = min(a.data.size(), b.data.size());
+    const size_t cmpSize = std::min(a.data.size(), b.data.size());
 
     if (a.data.size() != b.data.size() && m_bLogRunner)
     {
@@ -7622,8 +7994,6 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
 std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart, uintptr_t pEnd, std::vector<AsmRunner::tScanPatternNode> patterns,
     const std::vector<AsmRunner::tScanNeed>& need, uintptr_t nWindowSize, bool bStartAlignPat, bool bDisplayProgress)
 {
-#undef max // windows header hell kek
-
     std::vector<tScanWindowResult> result;
 
     if (pStart == 0 || pEnd == 0 || pStart >= pEnd || nWindowSize == 0)
@@ -9451,6 +9821,73 @@ void TestInsnHookCpuid()
 
     printf("[*] CPUID test entry point: 0x%p\n", (void*)pVEntry);
     printf("[*] Expected execution: XOR EAX,EAX -> XOR ECX,ECX -> CPUID (hook) -> NOP -> RET\n");
+    uc_engine* uc = runner.GetCTX();
+
+    // old and wrong test fs/base behav
+    //{
+    //	// ============ FS (селектор) ============
+    //	// 1. Чтение FS
+    //	uint16_t fs_selector;
+    //	auto err = uc_reg_read(uc, UC_X86_REG_FS, &fs_selector);
+    //	if (!err) {
+    //		printf("[READ] FS selector = 0x%04x\n", fs_selector);
+    //	}
+    //	else {
+    //		printf("[READ] FS selector ERROR: %s\n", uc_strerror(err));
+    //	}
+
+    //	// 2. Запись FS
+    //	uint16_t new_fs = (0x003B*0)+4;  // 32-bit селектор
+    //	err = uc_reg_write(uc, UC_X86_REG_FS, &new_fs);
+    //	if (!err) {
+    //		printf("[WRITE] FS selector set to 0x%04x\n", new_fs);
+    //	}
+    //	else {
+    //		printf("[WRITE] FS selector ERROR: %s\n", uc_strerror(err));
+    //	}
+
+    //	// 3. Чтение FS после записи
+    //	uint16_t fs_after;
+    //	err = uc_reg_read(uc, UC_X86_REG_FS, &fs_after);
+    //	if (!err) {
+    //		printf("[READ AGAIN] FS selector = 0x%04x\n", fs_after);
+    //	}
+    //	else {
+    //		printf("[READ AGAIN] FS selector ERROR: %s\n", uc_strerror(err));
+    //	}
+
+    //	// ============ FS_BASE (скрытая часть) ============
+    //	// 4. Чтение FS_BASE
+    //	uint64_t fs_base;
+    //	err = uc_reg_read(uc, UC_X86_REG_FS_BASE, &fs_base);
+    //	if (!err) {
+    //		printf("[READ] FS_BASE = 0x%016llx\n", (unsigned long long)fs_base);
+    //	}
+    //	else {
+    //		printf("[READ] FS_BASE ERROR: %s\n", uc_strerror(err));
+    //	}
+
+    //	// 5. Запись FS_BASE
+    //	uint64_t new_fs_base = 0x7ffdf000;  // TEB
+    //	err = uc_reg_write(uc, UC_X86_REG_FS_BASE, &new_fs_base);
+    //	if (!err) {
+    //		printf("[WRITE] FS_BASE set to 0x%016llx\n", (unsigned long long)new_fs_base);
+    //	}
+    //	else {
+    //		printf("[WRITE] FS_BASE ERROR: %s\n", uc_strerror(err));
+    //	}
+
+    //	// 6. Чтение FS_BASE после записи
+    //	uint64_t fs_base_after;
+    //	err = uc_reg_read(uc, UC_X86_REG_FS_BASE, &fs_base_after);
+    //	if (!err) {
+    //		printf("[READ AGAIN] FS_BASE = 0x%016llx\n", (unsigned long long)fs_base_after);
+    //	}
+    //	else {
+    //		printf("[READ AGAIN] FS_BASE ERROR: %s\n", uc_strerror(err));
+    //	}
+    //}
+
 
     runner.Run(pVEntry, 0);
     runner.Shutdown();
@@ -9497,6 +9934,14 @@ void VMTEST(int a1)
     uintptr_t pB64 = (uintptr_t)(_ADDR(0x60F303A0));
     uintptr_t pMd5 = (uintptr_t)(_ADDR(0x61020220));
     uintptr_t pDLLS = (uintptr_t)(_ADDR(0x60F2FA89)); // MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89
+    uintptr_t pToken = (uintptr_t)(_ADDR(0x615CDFE4));
+    uintptr_t pTokenProt = (uintptr_t)(_ADDR(0x615CDF64));
+
+    uintptr_t pNextAllowedTime = (uintptr_t)_ADDR(0x615CDB18);
+    uintptr_t pLastRequestTime = (uintptr_t)_ADDR(0x615CDB1C);
+    uintptr_t pnSteamID_SHL1 = (uintptr_t)_ADDR(0x615CE164);
+    uintptr_t pbSemaSetSubkey = (uintptr_t)_ADDR(0x615CE064);
+
 
     std::vector<uintptr_t> jcc = { // TestScanC
         0x62A3F44E,
@@ -9531,9 +9976,9 @@ void VMTEST(int a1)
         return true;
     };
     for (const auto& p : jcc) {
-        runner.SetUsingBpCodeSizeRange(true);
+        //runner.SetUsingBpCodeSizeRange(true);
+        //runner.SetBreakpointCode((uintptr_t)_ADDR(p - jccBpTolerance), JccBpCb, &runner, jccBpTolerance);
         //runner.SetBreakpointRangeCode((uintptr_t)_ADDR(p - jccBpTolerance), (uintptr_t)_ADDR(p), JccBpCb, &runner);
-        runner.SetBreakpointCode((uintptr_t)_ADDR(p - jccBpTolerance), JccBpCb, &runner, jccBpTolerance);
     }
 
     //runner.SetBreakpointCode((uintptr_t)_ADDR(0x610C495A), JccBpCb, &runner, 50);
@@ -9577,7 +10022,7 @@ void VMTEST(int a1)
     // GetSystemTimeAsFileTime
     // Sleep
     // vmexit sendPOST
-    uintptr_t nPostAfter = 94'861'903 + 10; // bf post 94861903, af 94861907
+    uintptr_t nPostAfter = 94'956'241 + 10; // bf post 94861903, af 94861907 //!upd normalid 94956241, 0id 94861903
     uintptr_t nPostEnd = 108'500'000; //108500000
     // GetSystemTimeAsFileTime
     uintptr_t nA1 = 109'000'000;
@@ -9632,9 +10077,12 @@ void VMTEST(int a1)
         //	MboxSTD("base64", "disasm");
 
         //if (self->GetInstructionCount() > /*5080*/(/*nCrcSumEnd*/ 93130827)
-        if (self->GetInstructionCount() > /*5080*//*nCpyEnd*/ nPostAfter)
+        //if (self->GetInstructionCount() > /*5080*//*nCpyEnd*/ nPostAfter)
+        if (self->GetInstructionCount() > /*5080*//*nCpyEnd*/ /*nPostAfter*/ 93'944'371)
         {
+            self->SetDisasmAfterCB(false);
             //self->SetLogDisasm(true);
+
             self->SetLogDisasmICNotice(500'000);
 
             //self->SetRWHistory(true);
@@ -9652,17 +10100,19 @@ void VMTEST(int a1)
             self->SetLogDisasm(false);
         }
 
-        if (self->GetInstructionCount() > 142'888'311)
-        {
-            printf("size=%u mnemonic=%u pc=0x%p\n", (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+        //if (self->GetInstructionCount() > 142'917'282)
+        //{
+        //	printf("size=%u mnemonic=%u pc=0x%p\n", (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
 
-            self->SetDisasmAfterCB(false);
-            self->DumpRegisters();
-            //self->DumpFlags();
-            //self->DumpSegmentRegisters();
-            self->DumpStack(7);
-            MboxSTD("apply this opcode", "disasm");
-        }
+        //	self->SetLogDisasm(true);
+        //	self->SetDisasmAfterCB(false);
+        //	self->DumpRegisters();
+        //	//self->DumpFlags();
+        //	//self->DumpSegmentRegisters();
+        //	self->DumpStack(7);
+        //	MboxSTD("apply this opcode", "disasm");
+        //}
+
 
         // VA 153415
         // C 153476  (153477)
@@ -9700,8 +10150,8 @@ void VMTEST(int a1)
         }
         else if (!self->IsInAddr(address, self->GetModStart(), self->GetModEnd()) &&
             !self->IsInAddr(address, self->GetStackStart(), self->GetStackEnd())) {
-            printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n",
-                (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
+            //printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n",
+            //	(void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite); // todo filter out malloc ranges
             //MboxSTD("Warn! access smth outside the module", "MemCb");
         }
 
@@ -10132,6 +10582,7 @@ void VMTEST(int a1)
         },
         &runner);
 
+    // unsupported 4 now
     runner.SetInsnCB(UC_X86_INS_MOV,
         [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
@@ -10144,6 +10595,7 @@ void VMTEST(int a1)
             return true;
         }, &runner);
 
+    // unsupported 4 now
     runner.SetInsnCB(UC_X86_INS_ADD,
         [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
@@ -10168,6 +10620,7 @@ void VMTEST(int a1)
             printf("[hook] pPostSend hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
 
+            //MboxSTD("custom wait", "post");
             //self->DumpRegisters();
             //self->DumpStack(7);
 
@@ -10185,7 +10638,7 @@ void VMTEST(int a1)
             if (!self->StackGetArg(pData, 0, bShouldPopArgs_NoCdecl)) return false;
 
             uintptr_t pArg1 = self->GetRegister(self->CxReg());
-            self->DumpMemory(pArg1, 50);
+            self->DumpMemory(pArg1, 150);
             uintptr_t pbDoneRequest = pData + 0x00000754;
             uintptr_t paPostAnswer = pData + 0x00018E00;
             self->WriteMemory<bool>(pbDoneRequest, true);
@@ -10199,10 +10652,11 @@ void VMTEST(int a1)
             delete[] buffer;
             buffer = nullptr;
             self->FileClose(file);
-            self->DumpMemory(paPostAnswer, 50);
+            self->DumpMemory(paPostAnswer, 150);
 
             self->SetRegister(self->AxReg(), paPostAnswer);
-            //MboxSTD("custom wait", "post");
+
+            MboxSTD("custom wait", "post");
 
             // Устанавливаем возврат
             self->UpdatePC(retaddr, true);
@@ -10217,9 +10671,9 @@ void VMTEST(int a1)
             if (!self)
                 return true;
 
-            self->SetLogDisasm(true);
-            self->DumpRegisters();
-            self->DumpStack(7);
+            //self->SetLogDisasm(true);
+            //self->DumpRegisters();
+            //self->DumpStack(7);
 
             printf("[hook] pMalloc hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
@@ -10263,16 +10717,16 @@ void VMTEST(int a1)
                     self->SetRegister(self->AxReg(), 0);
                     self->UpdatePC(retaddr, true);
                     return true;
-                }
+                    }
 
                 printf("[malloc] allocated 0x%p bytes at 0x%p\n", (void*)dwSize, (void*)allocated);
-            }
+                }
 
             self->SetRegister(self->AxReg(), allocated);
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore, true);
+            }, &runner, bBefore, true);
 
     // Themida: читает из какой то памяти вне модуля crc посчитанную в boot
     // MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch_  
@@ -10285,12 +10739,13 @@ void VMTEST(int a1)
     runner.SetPerformanceConstantsHost(1.0f);
     //runner.SetRWHistory(true);
     runner.SetDisasmRVA(true, 0x60F00000);
+    runner.SetLogDisasmRawBytes(true);
     //runner.SetPCTrace("TR1.txt", true, 0, /*9'500'000*/nCrcSumEnd);
     //runner.SetPCTrace("TR2.txt", true, 0, /*9'500'000*/nCrcSumEnd);
     runner.SetLogDisasmICNotice(500'000 * 20);
-    //runner.AddDeadzoneIC(nCpyStart, nCpyEnd); // skip rep movsd
-    //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd); // skip crc eax sum
-    runner.AddDeadzoneIC(nCpyStart, nCrcSumEnd, false);
+    //runner.AddDeadzoneIC(nCpyStart, nCpyEnd, false, false); // skip rep movsd
+    //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd, false, false); // skip crc eax sum
+    runner.AddDeadzoneIC(nCpyStart, nCrcSumEnd, false, false);
     runner.AddDeadzoneIC(nPostAfter, nPostEnd, false);
     runner.AddDeadzoneIC(nA1, nA2, false);
     runner.InitIDAWS();
@@ -10318,6 +10773,14 @@ void VMTEST(int a1)
     //}
     if (bBrokeCRC)
         runner.WriteMemory<uint8_t>(pCRC, 0x0);
+
+    runner.WriteMemory<uint32_t>(pNextAllowedTime, 0x0);
+    runner.WriteMemory<uint32_t>(pLastRequestTime, 0x0);
+    runner.WriteMemory<bool>(pbSemaSetSubkey, false); // not need
+    runner.WriteMemory<uint32_t>(pnSteamID_SHL1, 0x47CE6816); // 1204709398
+    runner.WriteMemory<uint32_t>(pnSteamID_SHL1, 3531943054); // 3531943054 1765971527
+    runner.MemSet(pTokenProt, 0, 86);
+
     runner.SetEntryPointStackArg(0, reinterpret_cast<uintptr_t>(pEntryArg));
     //runner.SetRegister(UC_X86_REG_ECX, reinterpret_cast<uintptr_t>(pEntryArg)); // if thiscall-style ctx is needed
 
@@ -10339,7 +10802,11 @@ void VMTEST(int a1)
     //	return;
     //}
 
+    runner.ParseModuleSections();
+    runner.SetLogDisasmSection(true);
     runner.Run(reinterpret_cast<uintptr_t>(pEntry), 0); // 0 = без лимита по шагам // 800 000 crc copy
+    runner.DumpMemory(pToken, 50);
+    runner.DumpMemory(pTokenProt, 50);
     runner.Shutdown();
 
 
