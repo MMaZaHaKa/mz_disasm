@@ -1323,6 +1323,7 @@ void AsmRunner::Shutdown()
     m_rttrace.aslr = 0;
     m_rttrace.icoffset = 0;
     m_rttrace.anyjmpmode = 0;
+    m_rttrace.cb = nullptr;
     m_rttrace.rva = false;
     m_rttrace.inited = false;
     m_icHooks.clear();
