@@ -142,7 +142,7 @@ public:
 	using OnMemCb = std::function<bool(uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size, uintptr_t value, ZydisMnemonic mnemonic, void* user_data)>;
 
 	// Тип колбэка для перехода: вызывается при jmp/call/ret // Pre - Jump transfer callback
-	using OnJmpCb = std::function<bool(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data)>;
+	using OnJmpCb = std::function<bool(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data)>;
 
 	// Тип колбэка для трассировки: возвращает true для остановки трассировки
 	using TraceCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t instruction_count, void* user_data)>;
@@ -263,6 +263,8 @@ public:
 	bool AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
 	void CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
 	uintptr_t MemSet(uintptr_t pAddr, int32_t nVal, uintptr_t nSize);
+	uintptr_t MemCpy(uintptr_t pVTo, uintptr_t pVFrom, uintptr_t nSize);
+	uintptr_t StrLen(uintptr_t pVStr);
 	bool FreeMemory(uintptr_t pVTo);
 	bool ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
@@ -335,14 +337,16 @@ public:
 	// callbacks / execution
 	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false); // !moduleHook for new dummy region
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
+	bool SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv = true);
+	bool LoadIATEnv(const char* szIATEnvFile);
+	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
+	tIEFuncNode* FindIATNode(std::string funcName, std::string moduleName = "", bool bLowerCmp = true, bool bContains = false);
 	void SetIATCallCB(OnJmpCb cb, void* data = nullptr);
 	void SetSysCallCB(OnOpcodeCb cb, void* data = nullptr);
 	void SetInsnCB(uintptr_t nInsn, OnInsnCb cb, void* data = nullptr); // UC_X86_INS_CPUID warn!!! check IsInsnAllowed
 	void SetAllInsnCB(OnInsnCb cb, void* data = nullptr);
 	void RemoveInsnCB(uintptr_t nInsn);
 	void RemoveAllInsnCB();
-	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
-	tIEFuncNode* FindIATNode(std::string funcName, std::string moduleName = "", bool bLowerCmp = true, bool bContains = false);
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
 		OnMemCb mem_cb = nullptr, void* mem_data = nullptr,
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
@@ -356,7 +360,7 @@ public:
 	void AddExecRegion(uintptr_t pStart, uintptr_t pEnd);
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
-	void SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0);
+	void SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0);
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
 	void Pause();
@@ -589,6 +593,9 @@ private:
 			uintptr_t to = 0;
 			uint32_t size = 0;
 			ZydisMnemonic mnemonic = ZYDIS_MNEMONIC_INVALID;
+			bool bIsCondMn = false;
+			bool bCond = false;
+			bool bIsInvMn = false;
 			bool valid = false;
 		} bfArgs; // delayed before OnJmpCb args
 	};
@@ -604,6 +611,8 @@ private:
 		std::ofstream file;
 		uintptr_t aslr;
 		uintptr_t icoffset;
+		uint32_t anyjmpmode; // 0 disable, 1 from, 2 to, 3 full
+		OnOpcodeCb cb;
 		bool rva;
 		bool inited;
 	};
@@ -777,6 +786,7 @@ private:
 	static bool HookMemTrampoline(uc_engine* uc, uc_mem_type type, uint64_t address, int size, int64_t value, void* user_data);
 	static void HookInsnTrampoline(uc_engine* uc, void* user_data);
 	static bool IsAnyIpTransfer(ZydisMnemonic mn);
+	static std::string AnyIpTransferTag(ZydisMnemonic mn);
 	static bool IsSystem(ZydisMnemonic mn);
 	static bool IsInsnAllowedZydis(ZydisMnemonic mn);
 	static bool IsInsnAllowed(uintptr_t insn);
@@ -793,7 +803,7 @@ private:
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
 	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uint32_t size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
 	bool _OnInsn(tInsnHookNode* hook, uc_engine* uc);
-	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic);        // jmp/call/ret детектируется в _OnInstructionStep
+	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data); // jmp/call/ret детектируется в _OnInstructionStep
 	bool _OnBreakpoint(const tBpInfo& bp, uc_engine* uc, uint64_t address, uint32_t size, void* user_data, bool bMemory, uc_mem_type type, int64_t value);
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
 

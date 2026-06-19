@@ -146,11 +146,74 @@ bool AsmRunner::IsAnyIpTransfer(ZydisMnemonic mn)
         case ZYDIS_MNEMONIC_UD0:
         case ZYDIS_MNEMONIC_HLT:
 #endif
-            return true;
 
-        default:
-            return false;
+            return true;
     }
+
+    return false;
+}
+
+std::string AsmRunner::AnyIpTransferTag(ZydisMnemonic mn)
+{
+    switch (mn)
+    {
+        // Прямые переходы / вызовы
+        case ZYDIS_MNEMONIC_CALL:   return "call";
+        case ZYDIS_MNEMONIC_JMP:    return "jmp";
+
+        // Условные переходы
+        case ZYDIS_MNEMONIC_JB:     return "jb";
+        case ZYDIS_MNEMONIC_JBE:    return "jbe";
+        case ZYDIS_MNEMONIC_JNB:    return "jnb";
+        case ZYDIS_MNEMONIC_JNBE:   return "jnbe";
+        case ZYDIS_MNEMONIC_JL:     return "jl";
+        case ZYDIS_MNEMONIC_JLE:    return "jle";
+        case ZYDIS_MNEMONIC_JNL:    return "jnl";
+        case ZYDIS_MNEMONIC_JNLE:   return "jnle";
+        case ZYDIS_MNEMONIC_JNO:    return "jno";
+        case ZYDIS_MNEMONIC_JNP:    return "jnp";
+        case ZYDIS_MNEMONIC_JNS:    return "jns";
+        case ZYDIS_MNEMONIC_JNZ:    return "jnz";
+        case ZYDIS_MNEMONIC_JO:     return "jo";
+        case ZYDIS_MNEMONIC_JP:     return "jp";
+        case ZYDIS_MNEMONIC_JS:     return "js";
+        case ZYDIS_MNEMONIC_JZ:     return "jz";
+
+        // Счётчик/цикл
+        case ZYDIS_MNEMONIC_JCXZ:   return "jcxz";
+        case ZYDIS_MNEMONIC_JECXZ:  return "jecxz";
+        case ZYDIS_MNEMONIC_JRCXZ:  return "jrcxz";
+        case ZYDIS_MNEMONIC_JKNZD:  return "jknzd";
+        case ZYDIS_MNEMONIC_JKZD:   return "jkzd";
+        case ZYDIS_MNEMONIC_LOOP:   return "loop";
+        case ZYDIS_MNEMONIC_LOOPE:  return "loope";
+        case ZYDIS_MNEMONIC_LOOPNE: return "loopne";
+
+        // Возвраты
+        case ZYDIS_MNEMONIC_RET:    return "ret";
+        case ZYDIS_MNEMONIC_IRET:   return "iret";
+        case ZYDIS_MNEMONIC_IRETD:  return "iretd";
+        case ZYDIS_MNEMONIC_IRETQ:  return "iretq";
+
+        // Прерывания / системные переходы
+#ifdef AR_SYSCALL_JUMP_CB
+        case ZYDIS_MNEMONIC_INT:    return "int";
+        case ZYDIS_MNEMONIC_INT1:   return "int1";
+        case ZYDIS_MNEMONIC_INT3:   return "int3";
+        case ZYDIS_MNEMONIC_INTO:   return "into";
+        case ZYDIS_MNEMONIC_SYSCALL:return "syscall";
+        case ZYDIS_MNEMONIC_SYSENTER:return "sysenter";
+        case ZYDIS_MNEMONIC_SYSEXIT:return "sysexit";
+        case ZYDIS_MNEMONIC_SYSRET: return "sysret";
+
+        case ZYDIS_MNEMONIC_UD2:    return "ud2";
+        case ZYDIS_MNEMONIC_UD1:    return "ud1";
+        case ZYDIS_MNEMONIC_UD0:    return "ud0";
+        case ZYDIS_MNEMONIC_HLT:    return "hlt";
+#endif
+    }
+
+    return "";
 }
 
 bool AsmRunner::IsSystem(ZydisMnemonic mn)
@@ -1257,10 +1320,11 @@ void AsmRunner::Shutdown()
     if (m_rttrace.file.is_open()) {
         m_rttrace.file.close();
     }
-    m_rttrace.inited = false;
     m_rttrace.aslr = 0;
     m_rttrace.icoffset = 0;
+    m_rttrace.anyjmpmode = 0;
     m_rttrace.rva = false;
+    m_rttrace.inited = false;
     m_icHooks.clear();
     m_deadzonesIC.clear();
     m_bInDeadzoneIC = false;
@@ -1738,8 +1802,8 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             Log("%s", line.c_str());
         }
 
-        // trace
-        if (!dz->skipTrace && m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
+        // dz default trace
+        if (!dz->skipTrace && m_rttrace.inited && m_rttrace.anyjmpmode == 0 && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
         {
             uintptr_t outPc = curPc;
             if (m_rttrace.rva)
@@ -1748,6 +1812,17 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
                 outPc = curPc - m_modStart + m_rttrace.aslr;
 
             m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+
+            if (m_rttrace.cb)
+            {
+                if (!m_rttrace.cb(uc, address, size, ZYDIS_MNEMONIC_INVALID, user_data)) { // temp fast ZYDIS_MNEMONIC_INVALID, todo
+                    ShutdownByCallback(uc);
+                    return;
+                }
+                if (ShouldStopCB(true)) {
+                    return; // prevent notice in cb with old pc opcode
+                }
+            }
         }
 
         return;
@@ -1785,7 +1860,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         const auto args = h.bfArgs;
         h.bfArgs.valid = false;
 
-        if (!h.cb(uc, args.from, args.to, args.size, args.mnemonic, h.data)) {
+        if (!h.cb(uc, args.from, args.to, args.size, args.mnemonic, args.bIsCondMn, args.bCond, args.bIsInvMn, h.data)) {
             ShutdownByCallback(uc);
             return;
         }
@@ -1853,13 +1928,25 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         }
     }
 
-    if (m_rttrace.inited && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
+    // default trace
+    if (m_rttrace.inited && m_rttrace.anyjmpmode == 0 && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
         uintptr_t outPc = curPc;
         if (m_rttrace.rva)
             outPc = curPc - m_modStart;
         if (m_rttrace.aslr != 0)
             outPc = curPc - m_modStart + m_rttrace.aslr;
         m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+
+        if (m_rttrace.cb)
+        {
+            if (!m_rttrace.cb(uc, address, size, instr.mnemonic, user_data)) {
+                ShutdownByCallback(uc);
+                return;
+            }
+            if (ShouldStopCB(true)) {
+                return; // prevent notice in cb with old pc opcode
+            }
+        }
     }
 
     if (!m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm)) {
@@ -1954,7 +2041,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             }
 #endif
 
-            if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic))
+            if (!_OnAnyJmp(uc, curPc, target, size, instr.mnemonic, bOutCondMn, bCond, bOutInvMn, user_data))
                 return;
 
 #ifdef AR_HALT_JMPCB
@@ -2241,11 +2328,97 @@ bool AsmRunner::_OnInsn(tInsnHookNode* hook, uc_engine* uc)
     return true;
 }
 
-bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic)
+bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data)
 {
     tDeadzoneIC* dz = GetCurrentDeadzoneIC();
     if (dz && (dz->skipAll || dz->skipJmps))
+    {
+        // trace (mostly unused when OnOpcode skip)
+        if (!dz->skipTrace && m_rttrace.inited && m_rttrace.anyjmpmode != 0 && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
+        {
+            uintptr_t outPc = from;
+            uintptr_t outTo = to;
+            if (m_rttrace.rva) {
+                outPc = from - m_modStart;
+                outTo = to - m_modStart;
+            }
+            if (m_rttrace.aslr != 0) {
+                outPc = from - m_modStart + m_rttrace.aslr;
+                outTo = to - m_modStart + m_rttrace.aslr;
+            }
+
+            if(m_rttrace.anyjmpmode == 1) // from
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+            else if (m_rttrace.anyjmpmode == 2) // to
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << '\n';
+            else { // full
+                std::string condStr = "";
+                if (bIsCondMn) {
+                    if (bIsInvMn)
+                        condStr = std::string(" [inv cond=") + (bCond ? "true" : "false") + "]";
+                    else
+                        condStr = std::string(" [cond=") + (bCond ? "true" : "false") + "]";
+                }
+
+                m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+            }
+
+            if (m_rttrace.cb)
+            {
+                if (!m_rttrace.cb(uc, from, size, mnemonic, user_data)) {
+                    ShutdownByCallback(uc);
+                    return false;
+                }
+
+                if (ShouldStopCB(false)) // clear in call side
+                    return true; // prevent notice in cb with old pc opcode
+            }
+        }
+
         return true;
+    }
+
+    // trace
+    if (m_rttrace.inited && m_rttrace.anyjmpmode != 0 && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
+    {
+        uintptr_t outPc = from;
+        uintptr_t outTo = to;
+        if (m_rttrace.rva) {
+            outPc = from - m_modStart;
+            outTo = to - m_modStart;
+        }
+        if (m_rttrace.aslr != 0) {
+            outPc = from - m_modStart + m_rttrace.aslr;
+            outTo = to - m_modStart + m_rttrace.aslr;
+        }
+
+        if (m_rttrace.anyjmpmode == 1) // from
+            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+        else if (m_rttrace.anyjmpmode == 2) // to
+            m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << '\n';
+        else { // full
+            std::string condStr = "";
+            if (bIsCondMn) {
+                if (bIsInvMn)
+                    condStr = std::string(" [inv cond=") + (bCond ? "true" : "false") + "]";
+                else
+                    condStr = std::string(" [cond=") + (bCond ? "true" : "false") + "]";
+            }
+
+            m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+        }
+    
+        if (m_rttrace.cb)
+        {
+            if (!m_rttrace.cb(uc, from, size, mnemonic, user_data)) {
+                ShutdownByCallback(uc);
+                return false;
+            }
+
+            if (ShouldStopCB(false)) // clear in call side
+                return true; // prevent notice in cb with old pc opcode
+        }
+    }
 
     if (m_bLogAnyJmp)
     {
@@ -2266,11 +2439,14 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                 h.bfArgs.to = to;
                 h.bfArgs.size = size;
                 h.bfArgs.mnemonic = mnemonic;
+                h.bfArgs.bIsCondMn = bIsCondMn;
+                h.bfArgs.bCond = bCond;
+                h.bfArgs.bIsInvMn = bIsInvMn;
                 h.bfArgs.valid = true;
             }
             else
             {
-                if (!h.cb(uc, from, to, size, mnemonic, h.data)) {
+                if (!h.cb(uc, from, to, size, mnemonic, bIsCondMn, bCond, bIsInvMn, h.data)) {
                     ShutdownByCallback(uc);
                     return false;
                 }
@@ -2287,7 +2463,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
         {
             if (n.moduleBase && n.funcRva && (n.moduleBase + n.funcRva) == to)
             {
-                if (!m_cbIATCall(uc, from, to, size, mnemonic, m_cbIATCallData)) {
+                if (!m_cbIATCall(uc, from, to, size, mnemonic, bIsCondMn, bCond, bIsInvMn, m_cbIATCallData)) {
                     ShutdownByCallback(uc);
                     return false;
                 }
@@ -2300,7 +2476,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
 
     if (m_cbJmp)
     {
-        if (!m_cbJmp(uc, from, to, size, mnemonic, m_cbJmpData)) {
+        if (!m_cbJmp(uc, from, to, size, mnemonic, bIsCondMn, bCond, bIsInvMn, m_cbJmpData)) {
             ShutdownByCallback(uc);
             return false;
         }
@@ -3963,6 +4139,57 @@ uintptr_t AsmRunner::MemSet(uintptr_t pAddr, int32_t nVal, uintptr_t nSize)
     return pAddr;
 }
 
+uintptr_t AsmRunner::MemCpy(uintptr_t pVTo, uintptr_t pVFrom, uintptr_t nSize)
+{
+    if (!m_uc || !pVTo || !pVFrom || !nSize)
+        return 0;
+
+    std::vector<uint8_t> buf;
+    buf.resize(static_cast<size_t>(nSize));
+
+    if (uc_mem_read(m_uc, pVFrom, buf.data(), static_cast<size_t>(nSize)) != UC_ERR_OK)
+    {
+        if (m_bLogRunner)
+            Log("MemCpy: read failed, from=0x%p size=0x%zx", (void*)pVFrom, static_cast<size_t>(nSize));
+        return 0;
+    }
+
+    if (uc_mem_write(m_uc, pVTo, buf.data(), static_cast<size_t>(nSize)) != UC_ERR_OK)
+    {
+        if (m_bLogRunner)
+            Log("MemCpy: write failed, to=0x%p size=0x%zx", (void*)pVTo, static_cast<size_t>(nSize));
+        return 0;
+    }
+
+    return pVTo;
+}
+
+uintptr_t AsmRunner::StrLen(uintptr_t pVStr)
+{
+    if (!m_uc || !pVStr)
+        return 0;
+
+    uintptr_t len = 0;
+    uint8_t ch = 0;
+
+    while (true)
+    {
+        if (uc_mem_read(m_uc, pVStr + len, &ch, 1) != UC_ERR_OK)
+        {
+            if (m_bLogRunner)
+                Log("StrLen: read failed at 0x%p", (void*)(pVStr + len));
+            return 0;
+        }
+
+        if (ch == 0)
+            break;
+
+        ++len;
+    }
+
+    return len;
+}
+
 bool AsmRunner::FreeMemory(uintptr_t pVTo)
 {
     if (!m_uc || !pVTo) return false;
@@ -4858,7 +5085,7 @@ void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModul
             return true;
         };
 
-        auto JmpCb = [&captured](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        auto JmpCb = [&captured](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             (void)from;
@@ -5009,6 +5236,209 @@ void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModul
     }
 }
 
+bool AsmRunner::SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv)
+{
+    if (!szIATEnvFile || !*szIATEnvFile)
+    {
+        if (m_bLogRunner)
+            Log("[!] SaveIATEnv: invalid file name");
+        return false;
+    }
+
+    std::unordered_map<uintptr_t, tIEFuncNode> localExports;
+    CollectAllExports(localExports);
+
+    if (bRecaptureEnv)
+        exportsENV = localExports;
+
+    if (m_bLogRunner)
+        Log("[*] SaveIATEnv: collected %zu exports%s",
+            localExports.size(),
+            bRecaptureEnv ? " and recaptured exportsENV" : "");
+
+    std::ofstream f(szIATEnvFile, std::ios::out | std::ios::trunc);
+    if (!f.is_open())
+    {
+        if (m_bLogRunner)
+            Log("[!] SaveIATEnv: cannot open file: %s", szIATEnvFile);
+        return false;
+    }
+
+    std::vector<std::pair<uintptr_t, tIEFuncNode>> items;
+    items.reserve(localExports.size());
+
+    for (const auto& kv : localExports)
+        items.push_back(kv);
+
+    std::sort(items.begin(), items.end(),
+        [](const std::pair<uintptr_t, tIEFuncNode>& a, const std::pair<uintptr_t, tIEFuncNode>& b)
+        {
+            return a.first < b.first;
+        });
+
+    for (const auto& kv : items)
+    {
+        const tIEFuncNode& n = kv.second;
+
+        f << "0x" << std::hex << std::uppercase << static_cast<uintptr_t>(n.moduleBase)
+            << " 0x" << std::hex << std::uppercase << static_cast<uintptr_t>(n.funcRva)
+            << " " << n.funcName
+            << " " << n.moduleName
+            << "\n";
+    }
+
+    f.flush();
+
+    if (!f.good())
+    {
+        if (m_bLogRunner)
+            Log("[!] SaveIATEnv: write error: %s", szIATEnvFile);
+        return false;
+    }
+
+    if (m_bLogRunner)
+        Log("[+] SaveIATEnv: saved %zu entries to %s", items.size(), szIATEnvFile);
+
+    return true;
+}
+
+bool AsmRunner::LoadIATEnv(const char* szIATEnvFile)
+{
+    if (!szIATEnvFile || !*szIATEnvFile)
+    {
+        if (m_bLogRunner)
+            Log("[!] LoadIATEnv: invalid file name");
+        return false;
+    }
+
+    exportsENV.clear();
+
+    std::ifstream f(szIATEnvFile);
+    if (!f.is_open())
+    {
+        if (m_bLogRunner)
+            Log("[!] LoadIATEnv: cannot open file: %s", szIATEnvFile);
+        return false;
+    }
+
+    size_t lineNo = 0;
+    size_t okCount = 0;
+    std::string line;
+
+    while (std::getline(f, line))
+    {
+        ++lineNo;
+
+        TrimInPlace(line);
+        if (line.empty())
+            continue;
+        if (line[0] == ';' || line[0] == '#')
+            continue;
+
+        std::istringstream iss(line);
+        std::string sBase, sRva;
+
+        if (!(iss >> sBase >> sRva))
+            continue;
+
+        std::vector<std::string> tail;
+        for (std::string tok; iss >> tok; )
+            tail.push_back(tok);
+
+        if (tail.size() < 2)
+            continue;
+
+        std::string moduleName = tail.back();
+        tail.pop_back();
+
+        std::string funcName;
+        for (size_t i = 0; i < tail.size(); ++i)
+        {
+            if (i)
+                funcName.push_back(' ');
+            funcName += tail[i];
+        }
+
+        uintptr_t moduleBase = 0;
+        uintptr_t funcRva = 0;
+
+        if (!ParseHexPtr(sBase, moduleBase) || !ParseHexPtr(sRva, funcRva))
+            continue;
+
+        if (funcName.empty() || moduleName.empty())
+            continue;
+
+        tIEFuncNode n;
+        n.moduleName = std::move(moduleName);
+        n.funcName = std::move(funcName);
+        n.moduleBase = moduleBase;
+        n.funcRva = funcRva;
+
+        exportsENV[n.GetAbsolute()] = std::move(n);
+        ++okCount;
+    }
+
+    if (m_bLogRunner)
+        Log("[+] LoadIATEnv: loaded %zu entries from %s", okCount, szIATEnvFile);
+
+    return true;
+}
+
+tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
+{
+    if (bRVA) {
+        for (auto& e : exportsENV) {
+            if (e.second.funcRva == pAddr)
+                return &e.second;
+        }
+    }
+    else {
+        auto itExp = exportsENV.find(pAddr);
+        if (itExp != exportsENV.end())
+            return &itExp->second;
+    }
+    return nullptr;
+}
+
+tIEFuncNode* AsmRunner::FindIATNode(std::string funcName, std::string moduleName, bool bLowerCmp, bool bContains)
+{
+    std::string searchFunc = funcName;
+    std::string searchModule = moduleName;
+
+    if (bLowerCmp) {
+        std::transform(searchFunc.begin(), searchFunc.end(), searchFunc.begin(), ::tolower);
+        std::transform(searchModule.begin(), searchModule.end(), searchModule.begin(), ::tolower);
+    }
+
+    for (auto& e : exportsENV) {
+        std::string currentFunc = e.second.funcName;
+        std::string currentModule = e.second.moduleName;
+
+        if (bLowerCmp) {
+            std::transform(currentFunc.begin(), currentFunc.end(), currentFunc.begin(), ::tolower);
+            std::transform(currentModule.begin(), currentModule.end(), currentModule.begin(), ::tolower);
+        }
+
+        bool funcMatches = false;
+        bool moduleMatches = false;
+
+        if (bContains) {
+            funcMatches = searchFunc.empty() || currentFunc.find(searchFunc) != std::string::npos;
+            moduleMatches = searchModule.empty() || currentModule.find(searchModule) != std::string::npos;
+        }
+        else {
+            funcMatches = searchFunc.empty() || currentFunc == searchFunc;
+            moduleMatches = searchModule.empty() || currentModule == searchModule;
+        }
+
+        if (funcMatches && moduleMatches) {
+            return &e.second;
+        }
+    }
+
+    return nullptr;
+}
+
 void AsmRunner::SetIATCallCB(OnJmpCb cb, void* data)
 {
     m_cbIATCall = std::move(cb);
@@ -5126,61 +5556,6 @@ void AsmRunner::RemoveAllInsnCB()
     }
 
     m_insnHooks.clear();
-}
-
-tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
-{
-    if (bRVA) {
-        for (auto& e : exportsENV) {
-            if (e.second.funcRva == pAddr)
-                return &e.second;
-        }
-    }
-    else {
-        auto itExp = exportsENV.find(pAddr);
-        if (itExp != exportsENV.end())
-            return &itExp->second;
-    }
-    return nullptr;
-}
-
-tIEFuncNode* AsmRunner::FindIATNode(std::string funcName, std::string moduleName, bool bLowerCmp, bool bContains)
-{
-    std::string searchFunc = funcName;
-    std::string searchModule = moduleName;
-
-    if (bLowerCmp) {
-        std::transform(searchFunc.begin(), searchFunc.end(), searchFunc.begin(), ::tolower);
-        std::transform(searchModule.begin(), searchModule.end(), searchModule.begin(), ::tolower);
-    }
-
-    for (auto& e : exportsENV) {
-        std::string currentFunc = e.second.funcName;
-        std::string currentModule = e.second.moduleName;
-
-        if (bLowerCmp) {
-            std::transform(currentFunc.begin(), currentFunc.end(), currentFunc.begin(), ::tolower);
-            std::transform(currentModule.begin(), currentModule.end(), currentModule.begin(), ::tolower);
-        }
-
-        bool funcMatches = false;
-        bool moduleMatches = false;
-
-        if (bContains) {
-            funcMatches = searchFunc.empty() || currentFunc.find(searchFunc) != std::string::npos;
-            moduleMatches = searchModule.empty() || currentModule.find(searchModule) != std::string::npos;
-        }
-        else {
-            funcMatches = searchFunc.empty() || currentFunc == searchFunc;
-            moduleMatches = searchModule.empty() || currentModule == searchModule;
-        }
-
-        if (funcMatches && moduleMatches) {
-            return &e.second;
-        }
-    }
-
-    return nullptr;
 }
 
 void AsmRunner::SetCallbacks(OnOpcodeCb opcode_cb, void* opcode_data, OnMemCb mem_cb, void* mem_data, OnJmpCb jmp_cb, void* jmp_data)
@@ -5503,7 +5878,7 @@ tFuncNode AsmRunner::GetModuleExport(const char* szModule, const char* szExportN
     return empty;
 }
 
-void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset)
+void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset, uint32_t nAnyJmpMode)
 {
     if (!szPCTraceFileOutPath || !*szPCTraceFileOutPath) return;
 
@@ -5520,6 +5895,8 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, bool bRVA, uintptr_
 
     m_rttrace.aslr = pASLR;
     m_rttrace.icoffset = nICOffset;
+    m_rttrace.anyjmpmode = nAnyJmpMode;
+    m_rttrace.cb = cb;
     m_rttrace.rva = bRVA;
 
     if (m_bLogRunner) {
@@ -6641,7 +7018,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
     SetIAT(0, 0, false); // collect temp ENV
     SetAnyJmpHook(FindIATNode("VirtualAlloc", szModule)->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
             cb(FindIATNode("VirtualAlloc", szModule));
 
@@ -6710,7 +7087,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
         }, this, bBefore);
 
     SetAnyJmpHook(FindIATNode("VirtualFree", szModule)->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             cb(FindIATNode("VirtualFree", szModule));
 
@@ -6763,7 +7140,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
     // TODO: Replace with instruction-based time emulation (CalcTime) instead of caching real time (fake perfomance)
     SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             cb(FindIATNode("GetSystemTimeAsFileTime", szModule));
 
@@ -6861,7 +7238,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
         }, this, bBefore);
 
     SetAnyJmpHook(FindIATNode("Sleep", szModule)->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             cb(FindIATNode("Sleep", szModule));
 
@@ -6901,7 +7278,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
         }, this, bBefore);
 
     SetAnyJmpHook(FindIATNode("GetCurrentThreadId", szModule)->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             cb(FindIATNode("GetCurrentThreadId", szModule));
 
@@ -7134,8 +7511,12 @@ tFuncNode AsmRunner::GetSymByAddr(uintptr_t pAddr)
 
 void AsmRunner::SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data, uint32_t size)
 {
-    if (!cb)
+    if (size == 0 || !cb)
+    {
+        if (m_bLogRunner)
+            Log("[!] SetBreakpointCode: invalid args (addr=0x%p size=%u)", (void*)pAddr, size);
         return;
+    }
 
     uintptr_t existingBpAddr;
     tBpInfo* existingBp = FindBreakpoint(pAddr, true, existingBpAddr);
@@ -7162,7 +7543,11 @@ void AsmRunner::SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data, ui
 void AsmRunner::SetBreakpointRangeCode(uintptr_t pStart, uintptr_t pEnd, OnOpcodeCb cb, void* data/*, uint32_t size*/)
 {
     if (/*pStart == 0 ||*/ pEnd == 0 || pEnd <= pStart || !cb)
+    {
+        if (m_bLogRunner)
+            Log("[!] SetBreakpointRangeCode: invalid args (start=0x%p end=0x%p)", (void*)pStart, (void*)pEnd);
         return;
+    }
 
     //for (uintptr_t addr = pStart; addr <= pEnd; addr += (size ? size : 1))
     for (uintptr_t addr = pStart; addr < pEnd; ++addr)
@@ -7173,10 +7558,18 @@ void AsmRunner::SetBreakpointRangeCode(uintptr_t pStart, uintptr_t pEnd, OnOpcod
 void AsmRunner::SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, OnMemCb cb, void* data)
 {
     if (size == 0 || !cb)
+    {
+        if (m_bLogRunner)
+            Log("[!] SetBreakpointMem: invalid args (addr=0x%p size=%u)", (void*)pAddr, size);
         return;
+    }
 
     if (type != BP_MEM_READ && type != BP_MEM_WRITE && type != BP_MEM_RW)
+    {
+        if (m_bLogRunner)
+            Log("[!] SetBreakpointMem: invalid type=%u at addr=0x%p", (uint32_t)type, (void*)pAddr);
         return;
+    }
 
     uintptr_t existingBpAddr;
     tBpInfo* existingBp = FindBreakpoint(pAddr, true, existingBpAddr);
@@ -7197,7 +7590,18 @@ void AsmRunner::SetBreakpointMem(uintptr_t pAddr, uint32_t size, eBpType type, O
 void AsmRunner::SetBreakpointRangeMem(uintptr_t pStart, uintptr_t pEnd, uint32_t size, eBpType type, OnMemCb cb, void* data)
 {
     if (/*pStart == 0 ||*/ pEnd == 0 || pEnd <= pStart || size == 0 || !cb)
+    {
+        if (m_bLogRunner)
+            Log("[!] SetBreakpointRangeMem: invalid args (start=0x%p end=0x%p size=%u)", (void*)pStart, (void*)pEnd, size);
         return;
+    }
+
+    if (type != BP_MEM_READ && type != BP_MEM_WRITE && type != BP_MEM_RW)
+    {
+        if (m_bLogRunner)
+            Log("[!] SetBreakpointRangeMem: invalid type=%u (start=0x%p end=0x%p)", (uint32_t)type, (void*)pStart, (void*)pEnd);
+        return;
+    }
 
     const uintptr_t step = size ? size : 1;
     for (uintptr_t addr = pStart; addr < pEnd; addr += step)
@@ -10049,7 +10453,7 @@ void IatTestUC()
         return true;
     };
 
-    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
         printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
@@ -10113,7 +10517,7 @@ void TestStackArgs()
         return true;
     };
 
-    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
 
         printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
@@ -10209,7 +10613,7 @@ void TestInsnHookCpuid()
         return true;
     };
 
-    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto JmpCb = [](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
         printf("[JMP] from 0x%p to 0x%p\n", (void*)from, (void*)to);
         return true;
@@ -10336,8 +10740,8 @@ void VMTEST(int a1)
     uintptr_t pB64 = (uintptr_t)(_ADDR(0x60F303A0));
     uintptr_t pMd5 = (uintptr_t)(_ADDR(0x61020220));
     uintptr_t pDLLS = (uintptr_t)(_ADDR(0x60F2FA89)); // MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89
-    uintptr_t pToken = (uintptr_t)(_ADDR(0x615CDFE4));
-    uintptr_t pTokenProt = (uintptr_t)(_ADDR(0x615CDF64));
+    uintptr_t pToken = (uintptr_t)(_ADDR(0x615CDFE4)); // на момент 0x60F2FA89 MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89 готов
+    uintptr_t pTokenProt = (uintptr_t)(_ADDR(0x615CDF64)); // на момент 0x60F2FA89 MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89 не готов // копирует memcpy
 
     uintptr_t pNextAllowedTime = (uintptr_t)_ADDR(0x615CDB18);
     uintptr_t pLastRequestTime = (uintptr_t)_ADDR(0x615CDB1C);
@@ -10346,38 +10750,39 @@ void VMTEST(int a1)
 
 
     std::vector<uintptr_t> jcc = { // TestScanC
-        0x62A3F44E,
-        0x62A856A9,
-        0x62A8F8D7,
-        0x62AA2FB8,
-        0x62ABE7B8,
-        0x62B6CE83,
-        0x62B6DF05,
-        0x62BCF4C4,
-        0x62BD1A2B,
-        0x62BDCEA5,
-        //0x62BE10B5,
-        0x62CE3E24,
-        0x62D2C575,
-        0x62D355D7,
-        0x62D47D1B,
-        0x62D52E25,
-        0x62D77055,
-        0x62DD02A0,
-        //0x62E52D54,
-        0x62E55700,
-        0x62E581CC,
-    };
+        0x62A3F360, // 0x62A3F44E
+        0x62A85596, // 0x62A856A9
+        0x62A8F863, // 0x62A8F8D7
+        0x62AA2EC5, // 0x62AA2FB8
+        0x62ABE75B, // 0x62ABE7B8
+        0x62B6CD32, // 0x62B6CE83
+        0x62B6DE40, // 0x62B6DF05
+        0x62BCF3D0, // 0x62BCF4C4
+        0x62BD194B, // 0x62BD1A2B
+        0x62BDCBDB, // 0x62BDCEA5
+        //0x62BE10B5, // 0x62BE10B5
+        0x62CE3D22, // 0x62CE3E24
+        0x62D2C4B3, // 0x62D2C575
+        0x62D35399, // 0x62D355D7
+        0x62D47C1B, // 0x62D47D1B
+        0x62D52D4B, // 0x62D52E25
+        0x62D76FD9, // 0x62D77055
+        0x62DD02BB, // 0x62DD02A0
+        //0x62E52D54, // 0x62E52D54
+        0x62E55719, // 0x62E55700
+        0x62E580CE, // 0x62E581CC
+    }; // handmade adj to codeflow by AsmRunner::TestScanC results
     uintptr_t jccBpTolerance = 100; // окно вверх от паттерна &40 чтобы выйти на безусловный прямой codeflow
     auto JccBpCb = [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
         //self->AdjustBreakpointCodeRangeAt(address); // adj100 попадаем в тело if выше (bp на частичный flow)
         printf("JccBpCb: 0x%p\n", address);
-        //MboxSTD("IF COND FLOW BLOCK", "disasm"); // *possible
+        //MboxSTD("IF COND FLOW BLOCK", "disasm");
 
         return true;
     };
     for (const auto& p : jcc) {
+        runner.SetBreakpointCode((uintptr_t)_ADDR(p), JccBpCb, &runner);
         //runner.SetUsingBpCodeSizeRange(true);
         //runner.SetBreakpointCode((uintptr_t)_ADDR(p - jccBpTolerance), JccBpCb, &runner, jccBpTolerance);
         //runner.SetBreakpointRangeCode((uintptr_t)_ADDR(p - jccBpTolerance), (uintptr_t)_ADDR(p), JccBpCb, &runner);
@@ -10398,6 +10803,7 @@ void VMTEST(int a1)
         [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
             auto* self = static_cast<AsmRunner*>(user_data);
             //printf("bp: 0x%p\n", address);
+            self->MemCpy(pTokenProt, pToken, self->StrLen(pToken)); // 0x60F30363
             MboxSTD("MZ_SERIY_PARSE_IP_SERVERS_sub_60F2FA89 sucesss", "disasm");
 
             return false; // halt exit
@@ -10639,7 +11045,7 @@ void VMTEST(int a1)
         return true;
     };
 
-    auto JmpCb = [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    auto JmpCb = [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
         if (self->IsHaltAddr(to))
             return true; // actual false
@@ -10672,7 +11078,7 @@ void VMTEST(int a1)
         runner.SetIAT((uintptr_t)addrCRC(0x6137B000), (uintptr_t)addrCRC(0x6137B508), false);
     }
 
-    //runner.SetAnyJmpHook(0x12345678, [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+    //runner.SetAnyJmpHook(0x12345678, [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
     //	{
     //		auto* self = static_cast<AsmRunner*>(user_data);
     //		if (!self)
@@ -10721,7 +11127,7 @@ void VMTEST(int a1)
     runner.SetIAT(0, 0, false); // collect temp ENV
     //printf("0x%p\n", runner.FindIATNode("VirtualAlloc", "kernel32.dll")->GetAbsolute());
     runner.SetAnyJmpHook(runner.FindIATNode("VirtualAlloc", "kernel32.dll")->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -10796,7 +11202,7 @@ void VMTEST(int a1)
             return true;
         }, &runner, bBefore);
     runner.SetAnyJmpHook(runner.FindIATNode("VirtualFree", "kernel32.dll")->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -10857,7 +11263,7 @@ void VMTEST(int a1)
             return true;
         }, &runner, bBefore);
     runner.SetAnyJmpHook(runner.FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -10918,7 +11324,7 @@ void VMTEST(int a1)
             return true;
         }, &runner, bBefore);
     runner.SetAnyJmpHook(runner.FindIATNode("Sleep", "kernel32.dll")->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -10950,7 +11356,7 @@ void VMTEST(int a1)
             return true;
         }, &runner, bBefore);
     runner.SetAnyJmpHook(runner.FindIATNode("GetCurrentThreadId", "kernel32.dll")->GetAbsolute(),
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -11025,7 +11431,7 @@ void VMTEST(int a1)
     //	}, &runner);
 
     runner.SetAnyJmpHook(pPostSend,
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -11079,7 +11485,7 @@ void VMTEST(int a1)
         }, &runner, bBefore, true);
 
     runner.SetAnyJmpHook(pMalloc,
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -11143,7 +11549,7 @@ void VMTEST(int a1)
         }, &runner, bBefore, true);
 
     runner.SetAnyJmpHook(pFree,
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -11205,8 +11611,8 @@ void VMTEST(int a1)
     //runner.SetRWHistory(true);
     runner.SetDisasmRVA(true, 0x60F00000);
     runner.SetLogDisasmRawBytes(true);
-    //runner.SetPCTrace("TR1.txt", true, 0, /*9'500'000*/nCrcSumEnd);
-    //runner.SetPCTrace("TR2.txt", true, 0, /*9'500'000*/nCrcSumEnd);
+    //if (!bBrokeCRC) runner.SetPCTrace("TR3.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ok
+    //else runner.SetPCTrace("TR4.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ne ok
     runner.SetLogDisasmICNotice(500'000 * 20);
     //runner.AddDeadzoneIC(nCpyStart, nCpyEnd, false, false); // skip rep movsd
     //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd, false, false); // skip crc eax sum
