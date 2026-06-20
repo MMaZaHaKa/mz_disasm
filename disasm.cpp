@@ -10583,22 +10583,22 @@ namespace ArAsmCode
                 {
                     switch (mnemonic)
                     {
-                    case ZYDIS_MNEMONIC_ADD: if (r.bits == 8) return emitAcc(0x04, ImmWidth::I8); else return emitAcc(0x05, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_OR:  if (r.bits == 8) return emitAcc(0x0C, ImmWidth::I8); else return emitAcc(0x0D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_ADC: if (r.bits == 8) return emitAcc(0x14, ImmWidth::I8); else return emitAcc(0x15, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_SBB: if (r.bits == 8) return emitAcc(0x1C, ImmWidth::I8); else return emitAcc(0x1D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_AND: if (r.bits == 8) return emitAcc(0x24, ImmWidth::I8); else return emitAcc(0x25, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_SUB: if (r.bits == 8) return emitAcc(0x2C, ImmWidth::I8); else return emitAcc(0x2D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_XOR: if (r.bits == 8) return emitAcc(0x34, ImmWidth::I8); else return emitAcc(0x35, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_CMP: if (r.bits == 8) return emitAcc(0x3C, ImmWidth::I8); else return emitAcc(0x3D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
-                    case ZYDIS_MNEMONIC_TEST:
-                        if (r.bits == 8)  return emitAcc(0xA8, ImmWidth::I8);
-                        if (r.bits == 16) return emitAcc(0xA9, ImmWidth::I16);
-                        if (r.bits == 32) return emitAcc(0xA9, ImmWidth::I32);
-                        if (r.bits == 64) return emitAcc(0xA9, ImmWidth::I32);
-                        break;
-                    default:
-                        break;
+                        case ZYDIS_MNEMONIC_ADD: if (r.bits == 8) return emitAcc(0x04, ImmWidth::I8); else return emitAcc(0x05, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_OR:  if (r.bits == 8) return emitAcc(0x0C, ImmWidth::I8); else return emitAcc(0x0D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_ADC: if (r.bits == 8) return emitAcc(0x14, ImmWidth::I8); else return emitAcc(0x15, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_SBB: if (r.bits == 8) return emitAcc(0x1C, ImmWidth::I8); else return emitAcc(0x1D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_AND: if (r.bits == 8) return emitAcc(0x24, ImmWidth::I8); else return emitAcc(0x25, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_SUB: if (r.bits == 8) return emitAcc(0x2C, ImmWidth::I8); else return emitAcc(0x2D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_XOR: if (r.bits == 8) return emitAcc(0x34, ImmWidth::I8); else return emitAcc(0x35, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_CMP: if (r.bits == 8) return emitAcc(0x3C, ImmWidth::I8); else return emitAcc(0x3D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                        case ZYDIS_MNEMONIC_TEST:
+                            if (r.bits == 8)  return emitAcc(0xA8, ImmWidth::I8);
+                            if (r.bits == 16) return emitAcc(0xA9, ImmWidth::I16);
+                            if (r.bits == 32) return emitAcc(0xA9, ImmWidth::I32);
+                            if (r.bits == 64) return emitAcc(0xA9, ImmWidth::I32);
+                            break;
+                        default:
+                            break;
                     }
                 }
 
