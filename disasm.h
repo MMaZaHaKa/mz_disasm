@@ -244,6 +244,7 @@ public:
 	static uintptr_t CalculateOffset(uintptr_t op_addr, uintptr_t dst);
 	static uintptr_t SearchPointerByPattern(uintptr_t ptrStart, uint32_t block_size, std::string pattern);
 	static std::vector<uintptr_t> ScanPattern(uintptr_t pStart, uintptr_t pEnd, std::string pattern);
+	std::vector<uintptr_t> ScanPatternV(uintptr_t pStart, uintptr_t pEnd, std::string pattern);
 	static std::vector<uintptr_t> ScanBytes(uintptr_t pStart, uintptr_t pEnd, const std::vector<uint8_t>& bytes);
 	static uintptr_t ScanBytesBlock(uintptr_t pStart, uintptr_t pEnd, const std::vector<std::vector<uint8_t>>& bytes, bool bStartAlignPat);
 	struct tMemoryRegion
@@ -491,7 +492,7 @@ public:
 		std::vector<size_t> counts;
 	};
 	static std::vector<tScanWindowResult> ScanWindow(uintptr_t pStart, uintptr_t pEnd, std::vector<tScanPatternNode> patterns,
-		const std::vector<tScanNeed>& need, uintptr_t nWindowSize, bool bStartAlignPat, bool bDisplayProgress);
+		const std::vector<tScanNeed>& need, uintptr_t nWindowSize, bool bAdjustWindow, bool bDisplayProgress);
 
 	//static void TestScanA(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);
 	//static void TestScanB(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset);

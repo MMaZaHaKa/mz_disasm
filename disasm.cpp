@@ -3870,6 +3870,118 @@ std::vector<uintptr_t> AsmRunner::ScanPattern(uintptr_t pStart, uintptr_t pEnd, 
     return scanRes;
 }
 
+std::vector<uintptr_t> AsmRunner::ScanPatternV(uintptr_t pStart, uintptr_t pEnd, std::string pattern)
+{
+    std::vector<uintptr_t> result;
+
+    if (!m_uc || pStart == 0 || pEnd == 0 || pStart > pEnd || pattern.empty())
+        return result;
+
+    std::vector<int> pat;
+    {
+        auto hex = [](char c) -> int
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+            return -1;
+        };
+
+        std::istringstream iss(pattern);
+        std::string tok;
+        while (iss >> tok)
+        {
+            if (tok == "?" || tok == "??")
+            {
+                pat.push_back(-1);
+                continue;
+            }
+
+            if (tok.size() != 2)
+                return result;
+
+            int hi = hex(tok[0]);
+            int lo = hex(tok[1]);
+            if (hi < 0 || lo < 0)
+                return result;
+
+            pat.push_back((hi << 4) | lo);
+        }
+    }
+
+    if (pat.empty())
+        return result;
+
+    const size_t patLen = pat.size();
+    const uintptr_t scanEnd = pEnd + 1; // inclusive pEnd
+    const uintptr_t pageSize = 0x1000;
+
+    std::vector<uint8_t> tail;
+    tail.reserve(patLen > 0 ? patLen - 1 : 0);
+
+    auto matchAt = [&](const std::vector<uint8_t>& data, size_t pos) -> bool
+    {
+        for (size_t i = 0; i < patLen; ++i)
+        {
+            if (pat[i] >= 0 && data[pos + i] != (uint8_t)pat[i])
+                return false;
+        }
+        return true;
+    };
+
+    for (uintptr_t cur = pStart; cur < scanEnd; )
+    {
+        uintptr_t pageEnd = AlignUp(cur + 1, pageSize);
+        if (pageEnd > scanEnd)
+            pageEnd = scanEnd;
+
+        const size_t chunkSize = (size_t)(pageEnd - cur);
+        if (chunkSize == 0)
+            break;
+
+        std::vector<uint8_t> chunk(chunkSize);
+        if (uc_mem_read(m_uc, cur, chunk.data(), chunkSize) != UC_ERR_OK)
+        {
+            tail.clear();
+            cur = pageEnd;
+            continue;
+        }
+
+        std::vector<uint8_t> data;
+        data.reserve(tail.size() + chunk.size());
+        data.insert(data.end(), tail.begin(), tail.end());
+        data.insert(data.end(), chunk.begin(), chunk.end());
+
+        const uintptr_t baseAddr = cur - (uintptr_t)tail.size();
+
+        if (data.size() >= patLen)
+        {
+            for (size_t i = 0; i + patLen <= data.size(); ++i)
+            {
+                if (matchAt(data, i))
+                    result.push_back(baseAddr + i);
+            }
+        }
+
+        if (patLen > 1)
+        {
+            const size_t keep = patLen - 1;
+            if (data.size() >= keep)
+                tail.assign(data.end() - keep, data.end());
+            else
+                tail = data;
+        }
+        else
+        {
+            tail.clear();
+        }
+
+        cur = pageEnd;
+    }
+
+    return result;
+}
+
 std::vector<uintptr_t> AsmRunner::ScanBytes(uintptr_t pStart, uintptr_t pEnd, const std::vector<uint8_t>& bytes)
 {
     std::vector<uintptr_t> scanRes;
@@ -8913,7 +9025,7 @@ void AsmRunner::CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, b
 }
 
 std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart, uintptr_t pEnd, std::vector<AsmRunner::tScanPatternNode> patterns,
-    const std::vector<AsmRunner::tScanNeed>& need, uintptr_t nWindowSize, bool bStartAlignPat, bool bDisplayProgress)
+    const std::vector<AsmRunner::tScanNeed>& need, uintptr_t nWindowSize, bool bAdjustWindow, bool bDisplayProgress)
 {
     std::vector<tScanWindowResult> result;
 
@@ -8959,10 +9071,12 @@ std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart
     }
 
     auto ValidateWindow =
-        [&](uintptr_t ws, uintptr_t we, uintptr_t& firstHit, std::vector<size_t>& foundCounts) -> bool
+        [&](uintptr_t ws, uintptr_t we, uintptr_t& firstHit, uintptr_t& advanceTo, std::vector<size_t>& foundCounts) -> bool
     {
         foundCounts.assign(kindCount, 0);
         firstHit = 0;
+        advanceTo = ws + 1;
+
         uintptr_t minPos = std::numeric_limits<uintptr_t>::max();
 
         for (const auto& req : need)
@@ -8971,6 +9085,7 @@ std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart
                 continue;
 
             const size_t t = (size_t)req.type;
+            std::vector<uintptr_t> ends;
 
             for (const auto* pat : byType[t])
             {
@@ -8984,24 +9099,27 @@ std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart
                 {
                     if (h < minPos)
                         minPos = h;
+
+                    ends.push_back(h + pat->bytesAsm.size());
                 }
             }
-        }
 
-        for (const auto& req : need)
-        {
-            if (req.type < 0 || (size_t)req.type >= kindCount)
-                continue;
-
-            if (foundCounts[(size_t)req.type] < req.count)
+            if (foundCounts[t] < req.count)
                 return false;
+
+            std::sort(ends.begin(), ends.end());
+
+            // конец последнего обязательного совпадения для этого type
+            const uintptr_t typeAdvanceTo = ends[req.count - 1];
+            if (typeAdvanceTo > advanceTo)
+                advanceTo = typeAdvanceTo;
         }
 
         firstHit = (minPos == std::numeric_limits<uintptr_t>::max()) ? ws : minPos;
         return true;
     };
 
-    auto UpdateProgress = [](uintptr_t scanned, uintptr_t total, uintptr_t found, bool force = false)
+    auto UpdateProgress = [](uintptr_t winStart, uintptr_t scanned, uintptr_t total, uintptr_t found, bool force = false)
     {
         static uintptr_t lastUpdate = 0;
 
@@ -9026,7 +9144,7 @@ std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart
             else if (i == pos && percent < 100) printf(">");
             else printf(" ");
         }
-        printf("] %d%% (%zu / %zu windows, found: %zu)", percent, (size_t)scanned, (size_t)total, (size_t)found);
+        printf("] %d%% 0x%p (%zu / %zu windows, found: %zu)", percent, winStart, (size_t)scanned, (size_t)total, (size_t)found);
         fflush(stdout);
     };
 
@@ -9042,17 +9160,22 @@ std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart
         const uintptr_t winEnd = winStart + nWindowSize - 1;
 
         uintptr_t firstHit = 0;
+        uintptr_t advanceTo = 0;
         std::vector<size_t> foundCounts;
-        if (ValidateWindow(winStart, winEnd, firstHit, foundCounts))
+
+        if (ValidateWindow(winStart, winEnd, firstHit, advanceTo, foundCounts))
         {
             foundWindows++;
 
             tScanWindowResult r;
-            r.address = bStartAlignPat ? firstHit : winStart;
+            r.address = bAdjustWindow ? firstHit : winStart;
             r.counts = foundCounts;
             result.push_back(r);
 
-            winStart += nWindowSize;
+            if (bAdjustWindow)
+                winStart = (advanceTo > winStart) ? advanceTo : (winStart + 1);
+            else
+                winStart += nWindowSize;
         }
         else
         {
@@ -9062,17 +9185,252 @@ std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart
         scannedWindows++;
 
         if (bDisplayProgress)
-            UpdateProgress(scannedWindows, totalWindows, foundWindows);
+            UpdateProgress(winStart, scannedWindows, totalWindows, foundWindows);
     }
 
     if (bDisplayProgress)
     {
-        UpdateProgress(totalWindows, totalWindows, foundWindows, true);
+        UpdateProgress(lastStart, totalWindows, totalWindows, foundWindows, true);
         printf("\n");
     }
 
     return result;
 }
+
+#if 0 // big log
+std::vector<AsmRunner::tScanWindowResult> AsmRunner::ScanWindow(uintptr_t pStart, uintptr_t pEnd, std::vector<AsmRunner::tScanPatternNode> patterns,
+    const std::vector<AsmRunner::tScanNeed>& need, uintptr_t nWindowSize, bool bAdjustWindow, bool bDisplayProgress)
+{
+    std::vector<tScanWindowResult> result;
+
+    if (pStart == 0 || pEnd == 0 || pStart >= pEnd || nWindowSize == 0)
+        return result;
+
+    if ((pEnd - pStart + 1) < nWindowSize)
+        return result;
+
+    // Открываем файл для записи
+    std::ofstream logFile("scan_log.txt", std::ios::out | std::ios::trunc);
+    logFile << "SCAN RANGE start=0x" << std::hex << pStart
+        << " end=0x" << pEnd
+        << " size=0x" << (pEnd - pStart)
+        << " lastStart=0x" << (pEnd - nWindowSize + 1)
+        << " winSize=0x" << nWindowSize
+        << "\n";
+
+    std::sort(patterns.begin(), patterns.end(),
+        [](const tScanPatternNode& a, const tScanPatternNode& b)
+        {
+            return a.bytesAsm < b.bytesAsm;
+        });
+
+    auto last = std::unique(patterns.begin(), patterns.end(),
+        [](const tScanPatternNode& a, const tScanPatternNode& b)
+        {
+            return a.bytesAsm == b.bytesAsm;
+        });
+    patterns.erase(last, patterns.end());
+
+    size_t kindCount = 0;
+    for (const auto& p : patterns)
+    {
+        if (p.type >= 0)
+            kindCount = std::max(kindCount, (size_t)p.type + 1);
+    }
+    for (const auto& req : need)
+    {
+        if (req.type >= 0)
+            kindCount = std::max(kindCount, (size_t)req.type + 1);
+    }
+
+    if (kindCount == 0)
+        return result;
+
+    std::vector<std::vector<const tScanPatternNode*>> byType(kindCount);
+    for (const auto& p : patterns)
+    {
+        if (p.type >= 0 && (size_t)p.type < kindCount)
+            byType[(size_t)p.type].push_back(&p);
+    }
+
+    auto ValidateWindow =
+        [&](uintptr_t ws, uintptr_t we, uintptr_t& firstHit, uintptr_t& advanceTo, std::vector<size_t>& foundCounts) -> bool
+    {
+        foundCounts.assign(kindCount, 0);
+        firstHit = 0;
+        advanceTo = ws + 1;
+
+        uintptr_t minPos = std::numeric_limits<uintptr_t>::max();
+
+        for (const auto& req : need)
+        {
+            if (req.type < 0 || (size_t)req.type >= kindCount)
+                continue;
+
+            const size_t t = (size_t)req.type;
+            std::vector<uintptr_t> ends;
+
+            for (const auto* pat : byType[t])
+            {
+                auto hits = ScanBytes(ws, we, pat->bytesAsm);
+                if (hits.empty())
+                    continue;
+
+                foundCounts[t] += hits.size();
+
+                for (uintptr_t h : hits)
+                {
+                    if (h < minPos)
+                        minPos = h;
+
+                    ends.push_back(h + pat->bytesAsm.size());
+                }
+            }
+
+            if (foundCounts[t] < req.count)
+                return false;
+
+            std::sort(ends.begin(), ends.end());
+
+            // конец последнего обязательного совпадения для этого type
+            const uintptr_t typeAdvanceTo = ends[req.count - 1];
+            if (typeAdvanceTo > advanceTo)
+                advanceTo = typeAdvanceTo;
+        }
+
+        firstHit = (minPos == std::numeric_limits<uintptr_t>::max()) ? ws : minPos;
+        return true;
+    };
+
+    auto UpdateProgress = [](uintptr_t winStart, uintptr_t scanned, uintptr_t total, uintptr_t found, bool force = false)
+    {
+        static uintptr_t lastUpdate = 0;
+
+        if (total == 0)
+            return;
+
+        if (scanned < lastUpdate)
+            lastUpdate = 0;
+
+        if (!force && (scanned - lastUpdate) < 1000 && scanned < total)
+            return;
+
+        lastUpdate = scanned;
+        int percent = (int)((scanned * 100) / total);
+        int barWidth = 50;
+        int pos = (barWidth * percent) / 100;
+
+        printf("\r[");
+        for (int i = 0; i < barWidth; ++i)
+        {
+            if (i < pos) printf("=");
+            else if (i == pos && percent < 100) printf(">");
+            else printf(" ");
+        }
+        printf("] %d%% 0x%p (%zu / %zu windows, found: %zu)", percent, winStart, (size_t)scanned, (size_t)total, (size_t)found);
+        fflush(stdout);
+    };
+
+    uintptr_t totalWindows = 0;
+    uintptr_t scannedWindows = 0;
+    uintptr_t foundWindows = 0;
+
+    const uintptr_t lastStart = pEnd - nWindowSize + 1;
+    totalWindows = (lastStart - pStart + 1);
+
+    uintptr_t lastProcessedEnd = pStart;
+
+    for (uintptr_t winStart = pStart; winStart <= lastStart; )
+    {
+        const uintptr_t winEnd = winStart + nWindowSize - 1;
+
+        uintptr_t firstHit = 0;
+        uintptr_t advanceTo = 0;
+        std::vector<size_t> foundCounts;
+
+        if (ValidateWindow(winStart, winEnd, firstHit, advanceTo, foundCounts))
+        {
+            foundWindows++;
+
+            tScanWindowResult r;
+            r.address = bAdjustWindow ? firstHit : winStart;
+            r.counts = foundCounts;
+            result.push_back(r);
+
+            // Записываем найденное окно с информацией о найденных/нужных
+            if (logFile.is_open())
+            {
+                logFile << "0x" << std::hex << 0x629D5000 + (r.address - pStart) << " found (";
+                for (size_t i = 0; i < foundCounts.size(); ++i)
+                {
+                    if (i > 0) logFile << " ";
+                    // Находим сколько нужно для этого типа
+                    size_t needed = 0;
+                    for (const auto& req : need)
+                    {
+                        if (req.type >= 0 && (size_t)req.type == i)
+                        {
+                            needed = req.count;
+                            break;
+                        }
+                    }
+                    logFile << std::dec << foundCounts[i] << "/" << needed;
+                }
+                logFile << " 0x" << std::hex << winStart << "-0x" << winEnd << ")\n";
+            }
+
+            if (bAdjustWindow)
+                winStart = (advanceTo > winStart) ? advanceTo : (winStart + 1);
+            else
+                winStart += nWindowSize;
+        }
+        else
+        {
+            // Записываем пропущенное окно с инфо сколько нашли и сколько нужно
+            if (logFile.is_open())
+            {
+                logFile << "0x" << std::hex << 0x629D5000 + (winStart - pStart) << " (not found";
+                for (size_t i = 0; i < foundCounts.size(); ++i)
+                {
+                    if (i == 0) logFile << " ";
+                    // Находим сколько нужно для этого типа
+                    size_t needed = 0;
+                    for (const auto& req : need)
+                    {
+                        if (req.type >= 0 && (size_t)req.type == i)
+                        {
+                            needed = req.count;
+                            break;
+                        }
+                    }
+                    logFile << std::dec << foundCounts[i] << "/" << needed;
+                    if (i < foundCounts.size() - 1) logFile << " ";
+                }
+                logFile << ")\n";
+            }
+            ++winStart;
+        }
+
+        scannedWindows++;
+
+        if (bDisplayProgress)
+            UpdateProgress(winStart, scannedWindows, totalWindows, foundWindows);
+    }
+
+    if (logFile.is_open())
+    {
+        logFile.close();
+    }
+
+    if (bDisplayProgress)
+    {
+        UpdateProgress(lastStart, totalWindows, totalWindows, foundWindows, true);
+        printf("\n");
+    }
+
+    return result;
+}
+#endif
 
 #if 0
 // Any pair
@@ -9616,6 +9974,35 @@ std::vector<uintptr_t> AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, ui
         opts8.force_imm_width = ImmWidth::I8;
         opts16.force_imm_width = ImmWidth::I16;
         opts32.force_imm_width = ImmWidth::I32;
+        BuildOptions opts8signed;
+        opts8signed.force_imm_width = ImmWidth::I8;
+
+        // ===== accumulator-only coverage =====
+        // EAX short opcodes (this is the window you hit manually: 25 00 08 00 00)
+        if (reg.first == ZYDIS_REGISTER_EAX)
+        {
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x40),
+                AND, "v2 & 0x40 [acc 25/s32]", reg.second, opts32);
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm32(0x40),
+                AND, "v2 & 0x40 [acc 25/u32]", reg.second, opts32);
+
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm32(0x800),
+                AND_11, "v1 & 0x800) >> 11 [acc 25/s32]", reg.second, opts32);
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::UImm32(0x800),
+                AND_11, "v1 & 0x800) >> 11 [acc 25/u32]", reg.second, opts32);
+
+            // Optional 16-bit form (66 25 iw), useful when the target uses AX-style encoding.
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(ZYDIS_REGISTER_AX), Operand::Imm16(0x40),
+                AND, "v2 & 0x40 [AX 66/25]", "AX", opts16);
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(ZYDIS_REGISTER_AX), Operand::Imm16(0x800),
+                AND_11, "v1 & 0x800) >> 11 [AX 66/25]", "AX", opts16);
+
+            // Optional 8-bit accumulator form (24/0C/14 etc. if you later extend the mnemonic table)
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(ZYDIS_REGISTER_AL), Operand::Imm8(0x40),
+                AND, "v2 & 0x40 [AL 24]", "AL", opts8);
+            AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(ZYDIS_REGISTER_AL), Operand::Imm8(0x80),
+                AND_7, "v1 & 0x80) >> 7 [AL 24]", "AL", opts8);
+        }
 
         // ========== AND 0x40 (64) ==========
         // Вариант 1: 83 /0 ib (signed 8-bit)
@@ -9651,8 +10038,6 @@ std::vector<uintptr_t> AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, ui
 
 
         // ========== AND 0x80 (128) ==========
-        BuildOptions opts8signed;
-        opts8signed.force_imm_width = ImmWidth::I8;
         AddPattern(ZYDIS_MNEMONIC_AND, Operand::Reg(reg.first), Operand::Imm8(0x80),
             AND_7, "v1 & 0x80) >> 7 [83/s8-fail]", reg.second, opts8signed);
 
@@ -9691,10 +10076,10 @@ std::vector<uintptr_t> AsmRunner::TestScanC(uintptr_t pStart, uintptr_t pEnd, ui
     };
 
     uintptr_t nWindowSize = 800; // окно, максимум что встречал 597 от 11 до 7 // больше окно - дольше поиск
-    bool bStartAlignPat = true;   // true -> добавлять первый матч в окне, false -> добавлять winStart
+    bool bAdjustWindow = true;   // true -> добавлять первый матч в окне, false -> добавлять winStart
     bool bDisplayProgress = true;
 
-    std::vector<AsmRunner::tScanWindowResult> result = ScanWindow(pStart, pEnd, patterns, need, nWindowSize, bStartAlignPat, bDisplayProgress);
+    std::vector<AsmRunner::tScanWindowResult> result = ScanWindow(pStart, pEnd, patterns, need, nWindowSize, bAdjustWindow, bDisplayProgress);
 
     std::vector<uintptr_t> outRes; // you can set bp for this by (range! linear code flow not equal pWindow) to capture if branch at runtime
 
@@ -9801,7 +10186,7 @@ void AsmRunner::TestScanD(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset, s
         };
 
         uintptr_t nWindowSize = 100; // adj it
-        bool bStartAlignPat = true;
+        bool bAdjustWindow = true;
         bool bDisplayProgress = true;
 
         std::vector<AsmRunner::tScanWindowResult> result = ScanWindow(
@@ -9810,7 +10195,7 @@ void AsmRunner::TestScanD(uintptr_t pStart, uintptr_t pEnd, uintptr_t pOffset, s
             patterns,
             need,
             nWindowSize,
-            bStartAlignPat,
+            bAdjustWindow,
             bDisplayProgress);
 
         for (const auto& r : result)
@@ -10144,181 +10529,237 @@ namespace ArAsmCode
 			return true;
 		}
 
-		static bool EncodeAluImm(std::vector<uint8_t>& out,
-			ZydisMachineMode mode,
-			ZydisMnemonic mnemonic,
-			const Operand& dst,
-			const Operand::ImmOp& srcImm,
-			ImmWidth requestedWidth)
-		{
-			const ImmWidth req = NormalizeImmWidth(requestedWidth);
-			uint8_t groupExt = 0;
-			const bool isGroup1 = IsGroup1Mnemonic(mnemonic, groupExt);
-			const bool isTest = IsTestMnemonic(mnemonic);
-			if (!isGroup1 && !isTest) return false;
+        static bool EncodeAluImm(std::vector<uint8_t>& out,
+            ZydisMachineMode mode,
+            ZydisMnemonic mnemonic,
+            const Operand& dst,
+            const Operand::ImmOp& srcImm,
+            ImmWidth requestedWidth)
+        {
+            const ImmWidth req = NormalizeImmWidth(requestedWidth);
+            uint8_t groupExt = 0;
+            const bool isGroup1 = IsGroup1Mnemonic(mnemonic, groupExt);
+            const bool isTest = IsTestMnemonic(mnemonic);
+            if (!isGroup1 && !isTest)
+                return false;
 
+            if (dst.kind == Operand::Kind::Reg)
+            {
+                GpRegInfo r{};
+                if (!TryGetGpRegInfo(dst.reg, r)) return false;
+                if (mode != ZYDIS_MACHINE_MODE_LONG_64 && r.rex) return false;
 
-			if (dst.kind == Operand::Kind::Reg)
-			{
-				GpRegInfo r{};
-				if (!TryGetGpRegInfo(dst.reg, r)) return false;
-				if (mode != ZYDIS_MACHINE_MODE_LONG_64 && r.rex) return false;
+                const bool need66 = (r.bits == 16);
+                const bool needREXW = (r.bits == 64);
+                const bool needREX = (mode == ZYDIS_MACHINE_MODE_LONG_64 && r.rex);
+                if (r.high8 && (mode == ZYDIS_MACHINE_MODE_LONG_64 && needREX)) return false;
 
-				const bool need66 = (r.bits == 16);
-				const bool needREXW = (r.bits == 64);
-				const bool needREX = (mode == ZYDIS_MACHINE_MODE_LONG_64 && r.rex);
-				if (r.high8 && (mode == ZYDIS_MACHINE_MODE_LONG_64 && needREX)) return false;
+                auto emitAcc = [&](uint8_t opcode, ImmWidth immW) -> bool
+                {
+                    if (!CanEmitImmWidth(srcImm, immW)) return false;
+                    if (immW == ImmWidth::I64) return false;
 
-				uint8_t opcode = 0;
-				ImmWidth immWidth = ImmWidth::Auto;
+                    out.clear();
+                    if (need66) EmitU8(out, 0x66);
+                    if (mode == ZYDIS_MACHINE_MODE_LONG_64 && (needREXW || needREX))
+                    {
+                        uint8_t rex = 0x40;
+                        if (needREXW) rex |= 0x08;
+                        if (needREX)  rex |= 0x01;
+                        EmitU8(out, rex);
+                    }
+                    EmitU8(out, opcode);
+                    EmitImmediate(out, srcImm, immW);
+                    return true;
+                };
 
-				if (isTest)
-				{
-					if (r.bits == 8) { opcode = 0xF6; immWidth = ImmWidth::I8; }
-					else if (r.bits == 16) { opcode = 0xF7; immWidth = ImmWidth::I16; }
-					else if (r.bits == 32) { opcode = 0xF7; immWidth = ImmWidth::I32; }
-					else if (r.bits == 64) { opcode = 0xF7; immWidth = ImmWidth::I32; }
-					else return false;
+                // AL / AX / EAX / RAX accumulator forms.
+                // Prefer them when the width is explicitly requested or when the immediate does not fit imm8.
+                const bool wantAcc =
+                    (r.code == 0) &&
+                    (isTest || req != ImmWidth::Auto || !FitsSigned8(ImmAsSigned(srcImm)) || r.bits == 8);
 
-					if (req != ImmWidth::Auto)
-						immWidth = req == ImmWidth::I64 ? ImmWidth::I32 : req;
+                if (wantAcc)
+                {
+                    switch (mnemonic)
+                    {
+                    case ZYDIS_MNEMONIC_ADD: if (r.bits == 8) return emitAcc(0x04, ImmWidth::I8); else return emitAcc(0x05, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_OR:  if (r.bits == 8) return emitAcc(0x0C, ImmWidth::I8); else return emitAcc(0x0D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_ADC: if (r.bits == 8) return emitAcc(0x14, ImmWidth::I8); else return emitAcc(0x15, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_SBB: if (r.bits == 8) return emitAcc(0x1C, ImmWidth::I8); else return emitAcc(0x1D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_AND: if (r.bits == 8) return emitAcc(0x24, ImmWidth::I8); else return emitAcc(0x25, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_SUB: if (r.bits == 8) return emitAcc(0x2C, ImmWidth::I8); else return emitAcc(0x2D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_XOR: if (r.bits == 8) return emitAcc(0x34, ImmWidth::I8); else return emitAcc(0x35, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_CMP: if (r.bits == 8) return emitAcc(0x3C, ImmWidth::I8); else return emitAcc(0x3D, (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32);
+                    case ZYDIS_MNEMONIC_TEST:
+                        if (r.bits == 8)  return emitAcc(0xA8, ImmWidth::I8);
+                        if (r.bits == 16) return emitAcc(0xA9, ImmWidth::I16);
+                        if (r.bits == 32) return emitAcc(0xA9, ImmWidth::I32);
+                        if (r.bits == 64) return emitAcc(0xA9, ImmWidth::I32);
+                        break;
+                    default:
+                        break;
+                    }
+                }
 
-					if (!CanEmitImmWidth(srcImm, immWidth)) return false;
-					if (immWidth == ImmWidth::I64) return false;
+                // Existing ModRM form (unchanged semantics).
+                uint8_t opcode = 0;
+                ImmWidth immWidth = ImmWidth::Auto;
 
-					out.clear();
-					if (need66) EmitU8(out, 0x66);
-					if (mode == ZYDIS_MACHINE_MODE_LONG_64 && (needREXW || needREX))
-					{
-						uint8_t rex = 0x40;
-						if (needREXW) rex |= 0x08;
-						if (needREX) rex |= 0x01;
-						EmitU8(out, rex);
-					}
-					EmitU8(out, opcode);
-					EmitU8(out, static_cast<uint8_t>(0xC0 | (0 << 3) | (r.code & 7)));
-					EmitImmediate(out, srcImm, immWidth);
-					return true;
-				}
+                if (isTest)
+                {
+                    if (r.bits == 8) { opcode = 0xF6; immWidth = ImmWidth::I8; }
+                    else if (r.bits == 16) { opcode = 0xF7; immWidth = ImmWidth::I16; }
+                    else if (r.bits == 32) { opcode = 0xF7; immWidth = ImmWidth::I32; }
+                    else if (r.bits == 64) { opcode = 0xF7; immWidth = ImmWidth::I32; }
+                    else return false;
 
-				if (r.bits == 8)
-				{
-					opcode = 0x80;
-					immWidth = ImmWidth::I8;
-					if (req == ImmWidth::I16 || req == ImmWidth::I32 || req == ImmWidth::I64) return false;
-				}
-				else
-				{
-					if (req == ImmWidth::I8)
-					{
-						opcode = 0x83;
-						immWidth = ImmWidth::I8;
-					}
-					else if (req == ImmWidth::I16)
-					{
-						if (r.bits != 16) return false;
-						opcode = 0x81;
-						immWidth = ImmWidth::I16;
-					}
-					else if (req == ImmWidth::I32)
-					{
-						if (r.bits == 16) return false;
-						opcode = 0x81;
-						immWidth = ImmWidth::I32;
-					}
-					else if (req == ImmWidth::I64)
-					{
-						if (r.bits != 64) return false;
-						opcode = 0x81;
-						immWidth = ImmWidth::I32;
-					}
-					else
-					{
-						const ZyanI64 v = ImmAsSigned(srcImm);
-						if (FitsSigned8(v)) { opcode = 0x83; immWidth = ImmWidth::I8; }
-						else { opcode = 0x81; immWidth = (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32; }
-					}
-				}
+                    if (req != ImmWidth::Auto)
+                        immWidth = (req == ImmWidth::I64) ? ImmWidth::I32 : req;
 
-				if (!CanEmitImmWidth(srcImm, immWidth)) return false;
+                    if (!CanEmitImmWidth(srcImm, immWidth) || immWidth == ImmWidth::I64) return false;
 
-				out.clear();
-				if (need66) EmitU8(out, 0x66);
-				if (mode == ZYDIS_MACHINE_MODE_LONG_64 && (needREXW || needREX))
-				{
-					uint8_t rex = 0x40;
-					if (needREXW) rex |= 0x08;
-					if (needREX) rex |= 0x01;
-					EmitU8(out, rex);
-				}
-				EmitU8(out, opcode);
-				EmitU8(out, static_cast<uint8_t>(0xC0 | ((groupExt & 7) << 3) | (r.code & 7)));
-				EmitImmediate(out, srcImm, immWidth);
-				return true;
-			}
+                    out.clear();
+                    if (need66) EmitU8(out, 0x66);
+                    if (mode == ZYDIS_MACHINE_MODE_LONG_64 && (needREXW || needREX))
+                    {
+                        uint8_t rex = 0x40;
+                        if (needREXW) rex |= 0x08;
+                        if (needREX)  rex |= 0x01;
+                        EmitU8(out, rex);
+                    }
+                    EmitU8(out, opcode);
+                    EmitU8(out, static_cast<uint8_t>(0xC0 | (0 << 3) | (r.code & 7)));
+                    EmitImmediate(out, srcImm, immWidth);
+                    return true;
+                }
 
-			if (dst.kind == Operand::Kind::Mem)
-			{
-				if (dst.mem.size != 1 && dst.mem.size != 2 && dst.mem.size != 4 && dst.mem.size != 8) return false;
+                if (r.bits == 8)
+                {
+                    opcode = 0x80;
+                    immWidth = ImmWidth::I8;
+                    if (req == ImmWidth::I16 || req == ImmWidth::I32 || req == ImmWidth::I64) return false;
+                }
+                else
+                {
+                    if (req == ImmWidth::I8)
+                    {
+                        opcode = 0x83;
+                        immWidth = ImmWidth::I8;
+                    }
+                    else if (req == ImmWidth::I16)
+                    {
+                        if (r.bits != 16) return false;
+                        opcode = 0x81;
+                        immWidth = ImmWidth::I16;
+                    }
+                    else if (req == ImmWidth::I32)
+                    {
+                        if (r.bits == 16) return false;
+                        opcode = 0x81;
+                        immWidth = ImmWidth::I32;
+                    }
+                    else if (req == ImmWidth::I64)
+                    {
+                        if (r.bits != 64) return false;
+                        opcode = 0x81;
+                        immWidth = ImmWidth::I32;
+                    }
+                    else
+                    {
+                        const ZyanI64 v = ImmAsSigned(srcImm);
+                        if (FitsSigned8(v))
+                        {
+                            opcode = 0x83;
+                            immWidth = ImmWidth::I8;
+                        }
+                        else
+                        {
+                            opcode = 0x81;
+                            immWidth = (r.bits == 16) ? ImmWidth::I16 : ImmWidth::I32;
+                        }
+                    }
+                }
 
-				uint8_t opcode = 0;
-				ImmWidth immWidth = ImmWidth::Auto;
-				if (isTest)
-				{
-					opcode = (dst.mem.size == 1) ? 0xF6 : 0xF7;
-					immWidth = (dst.mem.size == 1) ? ImmWidth::I8 : (dst.mem.size == 2) ? ImmWidth::I16 : ImmWidth::I32;
-					if (req != ImmWidth::Auto) immWidth = (req == ImmWidth::I64) ? ImmWidth::I32 : req;
-				}
-				else
-				{
-					if (dst.mem.size == 1)
-					{
-						opcode = 0x80;
-						immWidth = ImmWidth::I8;
-					}
-					else if (req == ImmWidth::I16)
-					{
-						if (dst.mem.size != 2) return false;
-						opcode = 0x81;
-						immWidth = ImmWidth::I16;
-					}
-					else if (req == ImmWidth::I32 || req == ImmWidth::I64)
-					{
-						if (dst.mem.size == 2) return false;
-						opcode = 0x81;
-						immWidth = ImmWidth::I32;
-					}
-					else
-					{
-						const ZyanI64 v = ImmAsSigned(srcImm);
-						if (FitsSigned8(v)) { opcode = 0x83; immWidth = ImmWidth::I8; }
-						else { opcode = 0x81; immWidth = (dst.mem.size == 2) ? ImmWidth::I16 : ImmWidth::I32; }
-					}
-				}
+                if (!CanEmitImmWidth(srcImm, immWidth)) return false;
 
-				if (!CanEmitImmWidth(srcImm, immWidth)) return false;
+                out.clear();
+                if (need66) EmitU8(out, 0x66);
+                if (mode == ZYDIS_MACHINE_MODE_LONG_64 && (needREXW || needREX))
+                {
+                    uint8_t rex = 0x40;
+                    if (needREXW) rex |= 0x08;
+                    if (needREX)  rex |= 0x01;
+                    EmitU8(out, rex);
+                }
+                EmitU8(out, opcode);
+                EmitU8(out, static_cast<uint8_t>(0xC0 | ((groupExt & 7) << 3) | (r.code & 7)));
+                EmitImmediate(out, srcImm, immWidth);
+                return true;
+            }
 
-				out.clear();
-				if (dst.mem.size == 2) EmitU8(out, 0x66);
+            if (dst.kind == Operand::Kind::Mem)
+            {
+                if (dst.mem.size != 1 && dst.mem.size != 2 && dst.mem.size != 4 && dst.mem.size != 8) return false;
 
-				std::vector<uint8_t> tail;
-				uint8_t rex = 0;
-				if (!EncodeModRmSibDisp(tail, mode, dst.mem, isTest ? 0 : groupExt, rex)) return false;
+                uint8_t opcode = 0;
+                ImmWidth immWidth = ImmWidth::Auto;
+                if (isTest)
+                {
+                    opcode = (dst.mem.size == 1) ? 0xF6 : 0xF7;
+                    immWidth = (dst.mem.size == 1) ? ImmWidth::I8 : (dst.mem.size == 2) ? ImmWidth::I16 : ImmWidth::I32;
+                    if (req != ImmWidth::Auto) immWidth = (req == ImmWidth::I64) ? ImmWidth::I32 : req;
+                }
+                else
+                {
+                    if (dst.mem.size == 1)
+                    {
+                        opcode = 0x80;
+                        immWidth = ImmWidth::I8;
+                    }
+                    else if (req == ImmWidth::I16)
+                    {
+                        if (dst.mem.size != 2) return false;
+                        opcode = 0x81;
+                        immWidth = ImmWidth::I16;
+                    }
+                    else if (req == ImmWidth::I32 || req == ImmWidth::I64)
+                    {
+                        if (dst.mem.size == 2) return false;
+                        opcode = 0x81;
+                        immWidth = ImmWidth::I32;
+                    }
+                    else
+                    {
+                        const ZyanI64 v = ImmAsSigned(srcImm);
+                        if (FitsSigned8(v)) { opcode = 0x83; immWidth = ImmWidth::I8; }
+                        else { opcode = 0x81; immWidth = (dst.mem.size == 2) ? ImmWidth::I16 : ImmWidth::I32; }
+                    }
+                }
 
-				if (dst.mem.size == 8)
-					rex |= 0x08;
+                if (!CanEmitImmWidth(srcImm, immWidth)) return false;
 
-				if (mode == ZYDIS_MACHINE_MODE_LONG_64 && rex != 0)
-					EmitU8(out, static_cast<uint8_t>(0x40 | rex));
+                out.clear();
+                if (dst.mem.size == 2) EmitU8(out, 0x66);
 
-				EmitU8(out, opcode);
-				out.insert(out.end(), tail.begin(), tail.end());
-				EmitImmediate(out, srcImm, immWidth);
-				return true;
-			}
+                std::vector<uint8_t> tail;
+                uint8_t rex = 0;
+                if (!EncodeModRmSibDisp(tail, mode, dst.mem, isTest ? 0 : groupExt, rex)) return false;
 
-			return false;
-		}
+                if (dst.mem.size == 8)
+                    rex |= 0x08;
+
+                if (mode == ZYDIS_MACHINE_MODE_LONG_64 && rex != 0)
+                    EmitU8(out, static_cast<uint8_t>(0x40 | rex));
+
+                EmitU8(out, opcode);
+                out.insert(out.end(), tail.begin(), tail.end());
+                EmitImmediate(out, srcImm, immWidth);
+                return true;
+            }
+
+            return false;
+        }
 
 		static bool TryExactEncodeLegacyImm(std::vector<uint8_t>& out,
 			ZydisMachineMode mode,
@@ -10850,7 +11291,7 @@ void VMTEST(int a1)
     void* pEntryArg = _ADDR(0x615CDB58);
 
     uintptr_t pThemidaStart = (uintptr_t)(_ADDR(0x629D5000));
-    uintptr_t pThemidaEnd = (uintptr_t)(_ADDR(0x630DD000));
+    uintptr_t pThemidaEnd = (uintptr_t)(_ADDR(0x630DD000)); // size: 0x708000
     uintptr_t p4Ex = (uintptr_t)(_ADDR(0x62A35968));
     uintptr_t pCRC = (uintptr_t)(_ADDR(0x60F0101D));
     uintptr_t pPostSend = (uintptr_t)(_ADDR(0x60F2D910));
@@ -10871,17 +11312,21 @@ void VMTEST(int a1)
     std::vector<uintptr_t> jcc = { // TestScanC
         0x62A3F360, // 0x62A3F44E
         0x62A85596, // 0x62A856A9
-        0x62A8F863, // 0x62A8F8D7
+        0x62A8F81F, // 0x62A8F8D7
         0x62AA2EC5, // 0x62AA2FB8
-        0x62ABE75B, // 0x62ABE7B8
+        0x62ABE6E6, // 0x62ABE7B8
+        0x62AEF4B8, // 0x62AEF674
         0x62B6CD32, // 0x62B6CE83
         0x62B6DE40, // 0x62B6DF05
+        0x62BCDE12, // 0x62BCDEE2
         0x62BCF3D0, // 0x62BCF4C4
         0x62BD194B, // 0x62BD1A2B
         0x62BDCBDB, // 0x62BDCEA5
-        //0x62BE10B5, // 0x62BE10B5
+        0x62BE0FFE, // 0x62BE10B5
+        0x62C4EE38, // 0x62C4EF57
         0x62CE3D22, // 0x62CE3E24
-        0x62D2C4B3, // 0x62D2C575
+        0x62D1C626, // 0x62D1C691
+        0x62D2C485, // 0x62D2C575
         0x62D35399, // 0x62D355D7
         0x62D47C1B, // 0x62D47D1B
         0x62D52D4B, // 0x62D52E25
@@ -10932,7 +11377,7 @@ void VMTEST(int a1)
         //MboxSTD("hook call " + pNode->GetAbsoluteName(), "hook");
     };
 
-    //std::vector<uintptr_t> possibleJcc = AsmRunner::TestScanC(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000);
+    std::vector<uintptr_t> possibleJcc = AsmRunner::TestScanC(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000);
     std::vector<uintptr_t> outVMEntries;
     std::vector<uintptr_t> outVMExits;
     //AsmRunner::TestScanD(pThemidaStart, pThemidaEnd, (uintptr_t)(_ADDR(0x60F00000)) - 0x60F00000, outVMEntries, outVMExits);
@@ -11732,9 +12177,9 @@ void VMTEST(int a1)
     //runner.SetRWHistory(true);
     runner.SetDisasmRVA(true, 0x60F00000);
     runner.SetLogDisasmRawBytes(true);
-    if (!bBrokeCRC) runner.SetPCTrace("TR3.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ok
-    else runner.SetPCTrace("TR4.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ne ok
-    //runner.SetPCTrace("TR5.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // def
+    //if (!bBrokeCRC) runner.SetPCTrace("TR3.txt", nullptr, true, 0x60F00000, /*9'500'000*/nCrcSumEnd, 3); // ok
+    //else runner.SetPCTrace("TR4.txt", nullptr, true, 0x60F00000, /*9'500'000*/nCrcSumEnd, 3); // ne ok
+    //runner.SetPCTrace("TR5.txt", nullptr, true, 0x60F00000, /*9'500'000*/nCrcSumEnd, 3); // def
     runner.SetLogDisasmICNotice(500'000 * 20);
     //runner.AddDeadzoneIC(nCpyStart, nCpyEnd, false, false); // skip rep movsd
     //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd, false, false); // skip crc eax sum
