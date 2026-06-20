@@ -335,7 +335,7 @@ public:
 	uint32_t GetTebLastError() const;
 
 	// callbacks / execution
-	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false); // !moduleHook for new dummy region
+	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false, std::string sFuncName = ""); // !moduleHook for new dummy region
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	bool SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv = true);
 	bool LoadIATEnv(const char* szIATEnvFile);
@@ -587,6 +587,7 @@ private:
 		OnJmpCb cb = nullptr;
 		void* data = nullptr;
 		bool before = false; // true - call when next op our pAddr, false when pc == pAddr (avoid ExtractAnyIpTransferReturn)
+		std::string funcname = "";
 		struct tJmpCBArgs
 		{
 			uintptr_t from = 0;

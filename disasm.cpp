@@ -2348,10 +2348,18 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                 outTo = to - m_modStart + m_rttrace.aslr;
             }
 
-            if(m_rttrace.anyjmpmode == 1) // from
-                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
-            else if (m_rttrace.anyjmpmode == 2) // to
-                m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << '\n';
+            if (m_rttrace.anyjmpmode == 1) { // from
+                if (IsInAddr(from, GetModStart(), GetModEnd()))
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+                else
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << from << '\n'; // skip wrong module rva
+            }
+            else if (m_rttrace.anyjmpmode == 2) { // to
+                if (IsInAddr(to, GetModStart(), GetModEnd()))
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << '\n';
+                else
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << to << '\n'; // skip wrong module rva
+            }
             else { // full
                 std::string condStr = "";
                 if (bIsCondMn) {
@@ -2360,8 +2368,59 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                     else
                         condStr = std::string(" [cond=") + (bCond ? "true" : "false") + "]";
                 }
+            
+                const bool bFromInMdl = IsInAddr(from, GetModStart(), GetModEnd());
+                const bool bToInMdl = IsInAddr(to, GetModStart(), GetModEnd());
+                if (bFromInMdl && bToInMdl) { // in module
+                    m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+                }
+                else { // кто то не в модуле, нужно найти ему описание
+                    if (exportsENV.empty()) { // lazy env init
+                        CollectAllExports(exportsENV);
+                        if (m_bLogRunner)
+                            Log("[*] _OnAnyJmp: %zu exports", exportsENV.size());
+                    }
 
-                m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+                    tIEFuncNode* pFromIATNode = FindIATNode(from);
+                    tIEFuncNode* pToIATNode = FindIATNode(to);
+                    tAnyJmpHookNode* pFromHNode = nullptr;
+                    tAnyJmpHookNode* pToHNode = nullptr;
+
+                    for (auto& h : m_anyJmpHooks)
+                    {
+                        if (h.pAddr == from)
+                            pFromHNode = &h;
+                        if (h.pAddr == to)
+                            pToHNode = &h;
+                        if (pFromHNode && pToHNode)
+                            break;
+                    }
+
+                    // Base
+                    m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr;
+
+                    // From
+                    if (!bFromInMdl && (pFromIATNode || pFromHNode)) { // !bFromInMdl, fake rva
+                        if(pFromIATNode)
+                            m_rttrace.file << " F 0x" << std::hex << std::uppercase << from << " I(" << pFromIATNode->GetAbsoluteName() << ")";
+                        else
+                            m_rttrace.file << " F 0x" << std::hex << std::uppercase << from << " H(" << pFromHNode->funcname << ")";
+                    }
+                    else // default or cant find node info
+                        m_rttrace.file << " F 0x" << std::hex << std::uppercase << (bFromInMdl ? outPc : from);
+
+                    // To
+                    if (!bToInMdl && (pToIATNode || pToHNode)) { // !bToInMdl, fake rva
+                        if (pToIATNode)
+                            m_rttrace.file << " T 0x" << std::hex << std::uppercase << to << " I(" << pToIATNode->GetAbsoluteName() << ")";
+                        else
+                            m_rttrace.file << " T 0x" << std::hex << std::uppercase << to << " H(" << pToHNode->funcname << ")";
+                    }
+                    else // default or cant find node info
+                        m_rttrace.file << " T 0x" << std::hex << std::uppercase << (bToInMdl ? outTo : to);
+
+                    m_rttrace.file << '\n';
+                }
             }
 
             if (m_rttrace.cb)
@@ -2393,10 +2452,18 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
             outTo = to - m_modStart + m_rttrace.aslr;
         }
 
-        if (m_rttrace.anyjmpmode == 1) // from
-            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
-        else if (m_rttrace.anyjmpmode == 2) // to
-            m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << '\n';
+        if (m_rttrace.anyjmpmode == 1) { // from
+            if (IsInAddr(from, GetModStart(), GetModEnd()))
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+            else
+                m_rttrace.file << "0x" << std::hex << std::uppercase << from << '\n'; // skip wrong module rva
+        }
+        else if (m_rttrace.anyjmpmode == 2) { // to
+            if (IsInAddr(to, GetModStart(), GetModEnd()))
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << '\n';
+            else
+                m_rttrace.file << "0x" << std::hex << std::uppercase << to << '\n'; // skip wrong module rva
+        }
         else { // full
             std::string condStr = "";
             if (bIsCondMn) {
@@ -2406,9 +2473,60 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                     condStr = std::string(" [cond=") + (bCond ? "true" : "false") + "]";
             }
 
-            m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+            const bool bFromInMdl = IsInAddr(from, GetModStart(), GetModEnd());
+            const bool bToInMdl = IsInAddr(to, GetModStart(), GetModEnd());
+            if (bFromInMdl && bToInMdl) { // in module
+                m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+            }
+            else { // кто то не в модуле, нужно найти ему описание
+                if (exportsENV.empty()) { // lazy env init
+                    CollectAllExports(exportsENV);
+                    if (m_bLogRunner)
+                        Log("[*] _OnAnyJmp: %zu exports", exportsENV.size());
+                }
+
+                tIEFuncNode* pFromIATNode = FindIATNode(from);
+                tIEFuncNode* pToIATNode = FindIATNode(to);
+                tAnyJmpHookNode* pFromHNode = nullptr;
+                tAnyJmpHookNode* pToHNode = nullptr;
+
+                for (auto& h : m_anyJmpHooks)
+                {
+                    if (h.pAddr == from)
+                        pFromHNode = &h;
+                    if (h.pAddr == to)
+                        pToHNode = &h;
+                    if (pFromHNode && pToHNode)
+                        break;
+                }
+
+                // Base
+                m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr;
+
+                // From
+                if (!bFromInMdl && (pFromIATNode || pFromHNode)) { // !bFromInMdl, fake rva
+                    if (pFromIATNode)
+                        m_rttrace.file << " F 0x" << std::hex << std::uppercase << from << " I(" << pFromIATNode->GetAbsoluteName() << ")";
+                    else
+                        m_rttrace.file << " F 0x" << std::hex << std::uppercase << from << " H(" << pFromHNode->funcname << ")";
+                }
+                else // default or cant find node info
+                    m_rttrace.file << " F 0x" << std::hex << std::uppercase << (bFromInMdl ? outPc : from);
+
+                // To
+                if (!bToInMdl && (pToIATNode || pToHNode)) { // !bToInMdl, fake rva
+                    if (pToIATNode)
+                        m_rttrace.file << " T 0x" << std::hex << std::uppercase << to << " I(" << pToIATNode->GetAbsoluteName() << ")";
+                    else
+                        m_rttrace.file << " T 0x" << std::hex << std::uppercase << to << " H(" << pToHNode->funcname << ")";
+                }
+                else // default or cant find node info
+                    m_rttrace.file << " T 0x" << std::hex << std::uppercase << (bToInMdl ? outTo : to);
+
+                m_rttrace.file << '\n';
+            }
         }
-    
+
         if (m_rttrace.cb)
         {
             if (!m_rttrace.cb(uc, from, size, mnemonic, user_data)) {
@@ -4975,7 +5093,7 @@ uint32_t AsmRunner::GetTebLastError() const
     return static_cast<uint32_t>(ReadTebValue(offset));
 }
 
-void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool callBefore, bool moduleHook)
+void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool callBefore, bool moduleHook, std::string sFuncName)
 {
     if (!pAddr)
         return;
@@ -4996,7 +5114,7 @@ void AsmRunner::SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data, bool call
         }
     }
 
-    m_anyJmpHooks.push_back({ pAddr, std::move(cb), data, callBefore, tAnyJmpHookNode::tJmpCBArgs() });
+    m_anyJmpHooks.push_back({ pAddr, std::move(cb), data, callBefore, sFuncName, tAnyJmpHookNode::tJmpCBArgs() });
 
     if (!callBefore && !moduleHook) {
         if (!m_uc)
@@ -7085,7 +7203,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore);
+        }, this, bBefore, false, FindIATNode("VirtualAlloc", szModule)->GetAbsoluteName());
 
     SetAnyJmpHook(FindIATNode("VirtualFree", szModule)->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
@@ -7137,7 +7255,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore);
+        }, this, bBefore, false, FindIATNode("VirtualFree", szModule)->GetAbsoluteName());
 
     // TODO: Replace with instruction-based time emulation (CalcTime) instead of caching real time (fake perfomance)
     SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsolute(),
@@ -7236,7 +7354,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore);
+        }, this, bBefore, false, FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsoluteName());
 
     SetAnyJmpHook(FindIATNode("Sleep", szModule)->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
@@ -7276,7 +7394,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore);
+        }, this, bBefore, false, FindIATNode("Sleep", szModule)->GetAbsoluteName());
 
     SetAnyJmpHook(FindIATNode("GetCurrentThreadId", szModule)->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
@@ -7309,7 +7427,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore);
+        }, this, bBefore, false, FindIATNode("GetCurrentThreadId", szModule)->GetAbsoluteName());
 
     // TODO: GetLastError SetLastError RtlDecodePointer EncodePointer
     // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
