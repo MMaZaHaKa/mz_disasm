@@ -11027,18 +11027,22 @@ void VMTEST(int a1)
             self->SetLogDisasm(false);
         }
 
-        //if (self->GetInstructionCount() > 142'917'282)
-        //{
-        //	printf("size=%u mnemonic=%u pc=0x%p\n", (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+        if (self->GetInstructionCount() > 143'353'261) //0-142'917'282 //id-143'353'281
+        {
+            printf("size=%u mnemonic=%u pc=0x%p\n", (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
 
-        //	self->SetLogDisasm(true);
-        //	self->SetDisasmAfterCB(false);
-        //	self->DumpRegisters();
-        //	//self->DumpFlags();
-        //	//self->DumpSegmentRegisters();
-        //	self->DumpStack(7);
-        //	MboxSTD("apply this opcode", "disasm");
-        //}
+            self->SetRWHistory(true);
+            self->DumpRWHistory();
+            //self->DumpRWHistory(0, false, true, true, true, true, true, true);
+
+            self->SetLogDisasm(true);
+            self->SetDisasmAfterCB(false);
+            self->DumpRegisters();
+            //self->DumpFlags();
+            //self->DumpSegmentRegisters();
+            self->DumpStack(7);
+            MboxSTD("apply this opcode", "disasm");
+        }
 
 
         // VA 153415
@@ -11174,9 +11178,7 @@ void VMTEST(int a1)
         //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsPCNormal(to)) {
-            tIEFuncNode* pNode = nullptr;
-            if (self->FindIATNode(to))
-                pNode = self->FindIATNode(to);
+            tIEFuncNode* pNode = self->FindIATNode(to); // nullable
 
             printf("JmpCb 0x%p %d %s\n", (void*)to, mnemonic, pNode ? pNode->GetAbsoluteName().c_str() : "");
             MboxSTD("module escape", "asm runner");
@@ -11319,7 +11321,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore);
+        }, &runner, bBefore, false, runner.FindIATNode("VirtualAlloc", "kernel32.dll")->GetAbsoluteName());
     runner.SetAnyJmpHook(runner.FindIATNode("VirtualFree", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
@@ -11380,7 +11382,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore);
+        }, &runner, bBefore, false, runner.FindIATNode("VirtualFree", "kernel32.dll")->GetAbsoluteName());
     runner.SetAnyJmpHook(runner.FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
@@ -11441,7 +11443,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore);
+        }, &runner, bBefore, false, runner.FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsoluteName());
     runner.SetAnyJmpHook(runner.FindIATNode("Sleep", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
@@ -11473,7 +11475,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore);
+        }, &runner, bBefore, false, runner.FindIATNode("Sleep", "kernel32.dll")->GetAbsoluteName());
     runner.SetAnyJmpHook(runner.FindIATNode("GetCurrentThreadId", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
@@ -11505,7 +11507,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore);
+        }, &runner, bBefore, false, runner.FindIATNode("GetCurrentThreadId", "kernel32.dll")->GetAbsoluteName());
     //GetCurrentThreadId
 
     //WSAStartup WS2_32.dll
@@ -11601,7 +11603,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore, true);
+        }, &runner, bBefore, true, "POST SENDER");
 
     runner.SetAnyJmpHook(pMalloc,
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
@@ -11665,7 +11667,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore, true);
+        }, &runner, bBefore, true, "malloc");
 
     runner.SetAnyJmpHook(pFree,
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
@@ -11716,7 +11718,7 @@ void VMTEST(int a1)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, &runner, bBefore, true);
+        }, &runner, bBefore, true, "free");
 
     // Themida: читает из какой то памяти вне модуля crc посчитанную в boot
     // MZ_VM_conditional_jump_handler___virtual_machine_jcc_handler_if_branch_  
@@ -11730,8 +11732,9 @@ void VMTEST(int a1)
     //runner.SetRWHistory(true);
     runner.SetDisasmRVA(true, 0x60F00000);
     runner.SetLogDisasmRawBytes(true);
-    //if (!bBrokeCRC) runner.SetPCTrace("TR3.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ok
-    //else runner.SetPCTrace("TR4.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ne ok
+    if (!bBrokeCRC) runner.SetPCTrace("TR3.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ok
+    else runner.SetPCTrace("TR4.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // ne ok
+    //runner.SetPCTrace("TR5.txt", nullptr, true, 0, /*9'500'000*/nCrcSumEnd, 3); // def
     runner.SetLogDisasmICNotice(500'000 * 20);
     //runner.AddDeadzoneIC(nCpyStart, nCpyEnd, false, false); // skip rep movsd
     //runner.AddDeadzoneIC(nCpyEnd, nCrcSumEnd, false, false); // skip crc eax sum
