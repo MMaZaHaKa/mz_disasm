@@ -1322,6 +1322,7 @@ void AsmRunner::Shutdown()
     }
     m_rttrace.aslr = 0;
     m_rttrace.icoffset = 0;
+    m_rttrace.lastanyjmpinstrcount = 0;
     m_rttrace.anyjmpmode = 0;
     m_rttrace.cb = nullptr;
     m_rttrace.rva = false;
@@ -2371,8 +2372,11 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
             
                 const bool bFromInMdl = IsInAddr(from, GetModStart(), GetModEnd());
                 const bool bToInMdl = IsInAddr(to, GetModStart(), GetModEnd());
+                const bool bCurrTransitJmp = (m_rttrace.lastanyjmpinstrcount + 1 == GetInstructionCount());
+                std::string sTransit = ((bCurrTransitJmp && bFromInMdl && bToInMdl) ? (bIsCondMn ? " (COND TRANSIT)" : " (TRANSIT)") : "");
                 if (bFromInMdl && bToInMdl) { // in module
-                    m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+                    m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr;
+                    m_rttrace.file << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << sTransit << '\n';
                 }
                 else { // кто то не в модуле, нужно найти ему описание
                     if (exportsENV.empty()) { // lazy env init
@@ -2419,7 +2423,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                     else // default or cant find node info
                         m_rttrace.file << " T 0x" << std::hex << std::uppercase << (bToInMdl ? outTo : to);
 
-                    m_rttrace.file << '\n';
+                    m_rttrace.file << sTransit << '\n';
                 }
             }
 
@@ -2433,6 +2437,8 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                 if (ShouldStopCB(false)) // clear in call side
                     return true; // prevent notice in cb with old pc opcode
             }
+
+            m_rttrace.lastanyjmpinstrcount = GetInstructionCount();
         }
 
         return true;
@@ -2475,8 +2481,11 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
 
             const bool bFromInMdl = IsInAddr(from, GetModStart(), GetModEnd());
             const bool bToInMdl = IsInAddr(to, GetModStart(), GetModEnd());
+            const bool bCurrTransitJmp = (m_rttrace.lastanyjmpinstrcount + 1 == GetInstructionCount());
+            std::string sTransit = ((bCurrTransitJmp && bFromInMdl && bToInMdl) ? (bIsCondMn ? " (COND TRANSIT)" : " (TRANSIT)") : "");
             if (bFromInMdl && bToInMdl) { // in module
-                m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << '\n';
+                m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr;
+                m_rttrace.file << " F 0x" << std::hex << std::uppercase << outPc << " T 0x" << outTo << sTransit << '\n';
             }
             else { // кто то не в модуле, нужно найти ему описание
                 if (exportsENV.empty()) { // lazy env init
@@ -2523,7 +2532,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                 else // default or cant find node info
                     m_rttrace.file << " T 0x" << std::hex << std::uppercase << (bToInMdl ? outTo : to);
 
-                m_rttrace.file << '\n';
+                m_rttrace.file << sTransit << '\n';
             }
         }
 
@@ -2537,6 +2546,8 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
             if (ShouldStopCB(false)) // clear in call side
                 return true; // prevent notice in cb with old pc opcode
         }
+
+        m_rttrace.lastanyjmpinstrcount = GetInstructionCount();
     }
 
     if (m_bLogAnyJmp)

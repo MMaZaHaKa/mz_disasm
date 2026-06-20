@@ -613,6 +613,7 @@ private:
 		std::ofstream file;
 		uintptr_t aslr;
 		uintptr_t icoffset;
+		uintptr_t lastanyjmpinstrcount;
 		uint32_t anyjmpmode; // 0 disable, 1 from, 2 to, 3 full
 		OnOpcodeCb cb;
 		bool rva;
