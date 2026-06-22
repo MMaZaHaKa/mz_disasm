@@ -5885,8 +5885,8 @@ bool AsmRunner::CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
         return false;
     }
 
-    m_modStart = pFrom;
-    m_modEnd = pFrom + nSize;
+    m_modStart = pVTo;
+    m_modEnd = pVTo + nSize;
 
     if (m_bLogRunner)
     {
