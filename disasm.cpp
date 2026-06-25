@@ -3064,7 +3064,7 @@ bool AsmRunner::DumpModuleToFile(uintptr_t pAddr, const char* fileName)
         return false;
     }
 
-    // Проверяем NT заголовок и получаем размер образа
+    // Проверяем NT заголовок
     PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pAddr + pDos->e_lfanew);
     if (pNt->Signature != IMAGE_NT_SIGNATURE) {
         printf("ERROR: Invalid NT header\n");
@@ -3077,8 +3077,66 @@ bool AsmRunner::DumpModuleToFile(uintptr_t pAddr, const char* fileName)
         return false;
     }
 
-    printf("Dumping module at 0x%p, size: %zu bytes to '%s'\n",
-        (void*)pAddr, imageSize, fileName);
+    printf("Dumping module at 0x%p, size: %zu bytes to '%s'\n", (void*)pAddr, imageSize, fileName);
+
+    // Выделяем буфер для выровненного образа
+    std::vector<BYTE> buffer(imageSize, 0); // Инициализируем нулями
+
+    // Копируем заголовки (DOS + NT + Section headers)
+    SIZE_T headersSize = pNt->OptionalHeader.SizeOfHeaders;
+    if (headersSize > 0 && headersSize <= imageSize) {
+        // Проверяем доступность памяти для заголовков
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPCVOID)pAddr, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_COMMIT) {
+                SIZE_T copySize = std::min(headersSize, mbi.RegionSize);
+                memcpy(buffer.data(), (LPCVOID)pAddr, copySize);
+            }
+        }
+    }
+
+    // Копируем секции
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+    for (WORD i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
+        DWORD va = pSection[i].VirtualAddress;
+        DWORD size = pSection[i].SizeOfRawData;
+
+        if (size > 0 && va + size <= imageSize) {
+            uintptr_t sectionAddr = pAddr + va;
+
+            // Проверяем доступность каждой страницы секции
+            bool sectionValid = true;
+            SIZE_T bytesChecked = 0;
+
+            while (bytesChecked < size) {
+                MEMORY_BASIC_INFORMATION mbi;
+                if (!VirtualQuery((LPCVOID)(sectionAddr + bytesChecked), &mbi, sizeof(mbi))) {
+                    sectionValid = false;
+                    break;
+                }
+
+                if (mbi.State != MEM_COMMIT) {
+                    sectionValid = false;
+                    break;
+                }
+
+                bytesChecked += mbi.RegionSize;
+                if (bytesChecked > size) bytesChecked = size;
+            }
+
+            if (sectionValid) {
+                // Копируем валидную секцию
+                memcpy(buffer.data() + va, (LPCVOID)sectionAddr, size);
+                printf("  Copied section '%s' (VA: 0x%X, size: %d bytes)\n",
+                    pSection[i].Name, va, size);
+            }
+            else {
+                printf("  WARNING: Section '%s' has unaccessible memory, filled with zeros\n",
+                    pSection[i].Name);
+                // Секция останется нулевой (уже инициализирована)
+            }
+        }
+    }
 
     // Открываем файл
     HANDLE hFile = CreateFileA(fileName, GENERIC_WRITE, 0, NULL,
@@ -3088,23 +3146,9 @@ bool AsmRunner::DumpModuleToFile(uintptr_t pAddr, const char* fileName)
         return false;
     }
 
-    // Меняем защиту памяти для чтения
-    DWORD oldProtect;
-    if (!VirtualProtect((LPVOID)pAddr, imageSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        printf("ERROR: VirtualProtect failed, error=%d\n", GetLastError());
-        CloseHandle(hFile);
-        DeleteFileA(fileName);
-        return false;
-    }
-
-    // Пишем весь образ целиком
+    // Пишем буфер целиком
     DWORD bytesWritten;
-    BOOL success = WriteFile(hFile, (LPCVOID)pAddr, (DWORD)imageSize, &bytesWritten, NULL);
-
-    // Восстанавливаем защиту
-    VirtualProtect((LPVOID)pAddr, imageSize, oldProtect, &oldProtect);
-
-    // Закрываем файл
+    BOOL success = WriteFile(hFile, buffer.data(), (DWORD)imageSize, &bytesWritten, NULL);
     CloseHandle(hFile);
 
     if (!success || bytesWritten != imageSize) {
