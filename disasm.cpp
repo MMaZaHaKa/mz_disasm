@@ -1204,6 +1204,20 @@ AsmRunner::tDeadzoneIC* AsmRunner::GetCurrentDeadzoneIC()
     return &m_deadzonesIC[idx];
 }
 
+uintptr_t AsmRunner::GetFlsValue(size_t index) {
+    if (index < m_FlsSlots.size()) {
+        return m_FlsSlots[index];
+    }
+    return 0;
+}
+
+void AsmRunner::SetFlsValue(size_t index, uintptr_t value) {
+    if (index >= m_FlsSlots.size()) {
+        m_FlsSlots.resize(index + 1, 0);
+    }
+    m_FlsSlots[index] = value;
+}
+
 void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC)
 {
     m_bLogDisasm = bLogDisasm;
@@ -1305,6 +1319,7 @@ void AsmRunner::Shutdown()
     m_bDisasmRVA = false;
     m_DisasmCustomASLR = 0;
     m_DisasmICNotice = 0;
+    m_DisasmSepGroup = 0;
     m_anyJmpHooks.clear();
     m_iat.clear();
     exportsENV.clear();
@@ -1339,6 +1354,7 @@ void AsmRunner::Shutdown()
     m_gstftInited = false;
     m_insnHooks.clear();
     m_sections.clear();
+    m_FlsSlots.clear();
 }
 
 void AsmRunner::ShutdownByCallback(uc_engine* uc)
@@ -1782,7 +1798,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             }
 
             std::ostringstream oss;
-            oss << "[" << m_instrCount << "] [IN DEAD ZONE " << m_currentDeadzoneICIndex << "] ";
+            oss << "[" << formatWithSeparator(m_instrCount, m_DisasmSepGroup) << "] [IN DEAD ZONE " << m_currentDeadzoneICIndex << "] ";
             if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
                 oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
             else if (m_bDisasmRVA)
@@ -1953,7 +1969,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
     if (!m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm)) {
         std::ostringstream oss;
-        oss << "[" << m_instrCount << "] ";
+        oss << "[" << formatWithSeparator(m_instrCount, m_DisasmSepGroup) << "] ";
         if(m_bDisasmAfterCB)
             oss << "AFCB ";
         else
@@ -2069,7 +2085,7 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 
     if (m_bDisasmAfterCB && ((m_DisasmICNotice != 0 && (m_instrCount % m_DisasmICNotice == 0)) || m_bLogDisasm)) {
         std::ostringstream oss;
-        oss << "[" << m_instrCount << "] ";
+        oss << "[" << formatWithSeparator(m_instrCount, m_DisasmSepGroup) << "] ";
         if (m_bDisasmAfterCB)
             oss << "AFCB "; // -
         else
@@ -7651,12 +7667,75 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             return true;
         }, this, bBefore, false, FindIATNode("GetCurrentThreadId", szModule)->GetAbsoluteName());
 
-    // TODO: GetLastError SetLastError RtlDecodePointer EncodePointer
+    SetAnyJmpHook(FindIATNode("GetProcessHeap", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("GetProcessHeap", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            // Один глобальный heap для процесса.
+            static constexpr uintptr_t kFakeProcessHeap = 0x13370000;
+
+            printf("[GetProcessHeap] returning 0x%p ret=0x%p\n",
+                (void*)kFakeProcessHeap,
+                (void*)retaddr);
+
+            self->SetRegister(self->AxReg(), kFakeProcessHeap);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("GetProcessHeap", szModule)->GetAbsoluteName());
+
+    SetAnyJmpHook(FindIATNode("GetLastError", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("GetLastError", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+            {
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            }
+            else if (!self->StackPop(retaddr))
+            {
+                return false;
+            }
+            //uintptr_t err = self->m_LastError;
+            uintptr_t err = 0;
+            printf("[GetLastError] -> %u (0x%08X)\n", err, err);
+
+            self->SetRegister(self->AxReg(), err);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("GetLastError", szModule)->GetAbsoluteName());
+
+    // TODO: GetLastError SetLastError RtlDecodePointer RtlEncodePointer
     // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
+
+
 
     // ntdll.dll
     szModule = "ntdll.dll";
     LoadLibraryA(szModule);
+    SetIAT(0, 0, false); // collect temp ENV
 
     SetAnyJmpHook(FindIATNode("RtlInitializeCriticalSection", szModule)->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
@@ -7863,6 +7942,198 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
             return true;
         }, this, bBefore, false, FindIATNode("RtlLeaveCriticalSection", szModule)->GetAbsoluteName());
+
+
+    SetAnyJmpHook(FindIATNode("RtlAllocateHeap", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlAllocateHeap", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t hHeap = 0;
+            uintptr_t dwFlags = 0;
+            uintptr_t dwBytes = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+            {
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            }
+            else if (!self->StackPop(retaddr))
+            {
+                return false;
+            }
+
+            if (!self->StackGetArg(hHeap, 0, bShouldPopArgs_NoCdecl))   return false;
+            if (!self->StackGetArg(dwFlags, 1, bShouldPopArgs_NoCdecl)) return false;
+            if (!self->StackGetArg(dwBytes, 2, bShouldPopArgs_NoCdecl)) return false;
+
+            printf("[RtlAllocateHeap] Heap=0x%p Flags=0x%p Size=0x%p ret=0x%p\n",
+                (void*)hHeap,
+                (void*)dwFlags,
+                (void*)dwBytes,
+                (void*)retaddr);
+
+            uintptr_t result = 0;
+
+            if (dwBytes != 0)
+            {
+                result = self->AddMemory(dwBytes, UC_PROT_ALL);
+
+                if ((dwFlags & HEAP_ZERO_MEMORY) && result)
+                {
+                    std::vector<uint8_t> zero(dwBytes, 0);
+                    self->CopyMemory(result, (uintptr_t)zero.data(), zero.size());
+                }
+
+                printf("[RtlAllocateHeap] Allocated %zu bytes -> 0x%p\n",
+                    (size_t)dwBytes,
+                    (void*)result);
+            }
+
+            self->SetRegister(self->AxReg(), result);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlAllocateHeap", szModule)->GetAbsoluteName());
+
+    SetAnyJmpHook(FindIATNode("RtlFreeHeap", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlFreeHeap", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t hHeap = 0;
+            uintptr_t dwFlags = 0;
+            uintptr_t lpMem = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+            {
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            }
+            else if (!self->StackPop(retaddr))
+            {
+                return false;
+            }
+
+            if (!self->StackGetArg(hHeap, 0, bShouldPopArgs_NoCdecl))   return false;
+            if (!self->StackGetArg(dwFlags, 1, bShouldPopArgs_NoCdecl)) return false;
+            if (!self->StackGetArg(lpMem, 2, bShouldPopArgs_NoCdecl))   return false;
+
+            printf("[RtlFreeHeap] Heap=0x%p Flags=0x%p Mem=0x%p ret=0x%p\n",
+                (void*)hHeap,
+                (void*)dwFlags,
+                (void*)lpMem,
+                (void*)retaddr);
+
+            BOOLEAN result = TRUE;
+
+            if (lpMem)
+            {
+                self->FreeMemory(lpMem);
+                printf("[RtlFreeHeap] Freed 0x%p\n", (void*)lpMem);
+            }
+
+            self->SetRegister(self->AxReg(), result);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlFreeHeap", szModule)->GetAbsoluteName());
+
+
+
+    // kernelbase.dll
+    szModule = "kernelbase.dll";
+    LoadLibraryA(szModule);
+    SetIAT(0, 0, false); // collect temp ENV
+
+    SetAnyJmpHook(FindIATNode("FlsGetValue", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("FlsGetValue", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t dwFlsIndex = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(dwFlsIndex, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            uintptr_t value = self->GetFlsValue(dwFlsIndex);
+
+            printf("[FlsGetValue] Index=%u -> 0x%p\n",
+                (DWORD)dwFlsIndex,
+                (void*)value);
+
+            self->SetRegister(self->AxReg(), value);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("FlsGetValue", szModule)->GetAbsoluteName());
+
+    SetAnyJmpHook(FindIATNode("FlsSetValue", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("FlsSetValue", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t dwFlsIndex = 0;
+            uintptr_t lpFlsData = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(dwFlsIndex, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            if (!self->StackGetArg(lpFlsData, 1, bShouldPopArgs_NoCdecl))
+                return false;
+
+            self->SetFlsValue(static_cast<size_t>(dwFlsIndex), lpFlsData);
+
+            printf("[FlsSetValue] Index=%u Value=0x%p\n",
+                (DWORD)dwFlsIndex,
+                (void*)lpFlsData);
+
+            self->SetRegister(self->AxReg(), TRUE);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("FlsSetValue", szModule)->GetAbsoluteName());
+
 
 
     // Insn

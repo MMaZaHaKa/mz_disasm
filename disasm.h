@@ -163,6 +163,8 @@ public:
 	void SetDisasmRVA(bool enabled, uintptr_t disasmCustomASLR = 0) { m_bDisasmRVA = enabled; m_DisasmCustomASLR = disasmCustomASLR; }
 	bool IsDisasmRVA() const { return m_bDisasmRVA; }
 	uintptr_t GetDisasmCASLR() const { return m_DisasmCustomASLR; }
+	void SetDisasmSepGroup(uintptr_t disasmSepGroup) { m_DisasmSepGroup = disasmSepGroup; }
+	bool IsDisasmSepGroup() const { return m_DisasmSepGroup; }
 	uintptr_t CalcWithCASLR(uintptr_t p) const { return p - GetModStart() + GetDisasmCASLR(); }
 	void SetLogDisasm(bool enabled) { m_bLogDisasm = enabled; }
 	bool IsLogDisasm() const { return m_bLogDisasm; }
@@ -194,6 +196,8 @@ public:
 	uintptr_t GetFSTIDEnd() const { return m_fsBase + m_fsSize; }
 	uint64_t GetInstructionsPerSecond() const { return m_instructionsPerSecond; }
 	uint64_t GetFiletimeUnitsPerSecond() const { return m_filetimeUnitsPerSecond; }
+	void SetFlsValue(uintptr_t index, uintptr_t value);
+	uintptr_t GetFlsValue(uintptr_t index);
 
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
@@ -565,6 +569,25 @@ public:
 		return false;
 	}
 
+	template<typename T>
+	static std::string formatWithSeparator(T value, size_t group = 0)
+	{
+		static_assert(std::is_integral<T>::value, "formatWithSeparator requires integral type");
+
+		std::string s = std::to_string(value);
+
+		if (group == 0)
+			return s;
+
+		const bool neg = !s.empty() && s[0] == '-';
+		size_t begin = neg ? 1 : 0;
+
+		for (size_t i = s.length(); i > begin + group; i -= group)
+			s.insert(i - group, 1, '\'');
+
+		return s;
+	}
+
 private:
 	// состояние трасировки Tenet
 	struct tTraceState
@@ -703,6 +726,7 @@ private:
 	bool m_bDisasmRVA = false;
 	uintptr_t m_DisasmCustomASLR = 0;
 	uintptr_t m_DisasmICNotice = 0;
+	uintptr_t m_DisasmSepGroup = 0;
 	bool m_bInitIAT = false;
 	bool m_bSkipCBCallsWithNewPC = false;
 
@@ -719,6 +743,7 @@ private:
 	bool m_bRWHistory = false;
 	std::vector<tInsnHookNode> m_insnHooks;
 	std::vector<tSection> m_sections;
+	std::vector<uintptr_t> m_FlsSlots;
 
 	uintptr_t m_iatStart = 0;
 	uintptr_t m_iatEnd = 0;
