@@ -1204,14 +1204,14 @@ AsmRunner::tDeadzoneIC* AsmRunner::GetCurrentDeadzoneIC()
     return &m_deadzonesIC[idx];
 }
 
-uintptr_t AsmRunner::GetFlsValue(size_t index) {
+uintptr_t AsmRunner::GetFlsValue(uintptr_t index) {
     if (index < m_FlsSlots.size()) {
         return m_FlsSlots[index];
     }
     return 0;
 }
 
-void AsmRunner::SetFlsValue(size_t index, uintptr_t value) {
+void AsmRunner::SetFlsValue(uintptr_t index, uintptr_t value) {
     if (index >= m_FlsSlots.size()) {
         m_FlsSlots.resize(index + 1, 0);
     }
@@ -8122,7 +8122,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             if (!self->StackGetArg(lpFlsData, 1, bShouldPopArgs_NoCdecl))
                 return false;
 
-            self->SetFlsValue(static_cast<size_t>(dwFlsIndex), lpFlsData);
+            self->SetFlsValue(dwFlsIndex, lpFlsData);
 
             printf("[FlsSetValue] Index=%u Value=0x%p\n",
                 (DWORD)dwFlsIndex,
