@@ -7654,6 +7654,218 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
     // TODO: GetLastError SetLastError RtlDecodePointer EncodePointer
     // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
 
+    // ntdll.dll
+    szModule = "ntdll.dll";
+    LoadLibraryA(szModule);
+
+    SetAnyJmpHook(FindIATNode("RtlInitializeCriticalSection", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlInitializeCriticalSection", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t pCs = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(pCs, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            printf("[RtlInitializeCriticalSection] CriticalSection=0x%p ret=0x%p\n",
+                (void*)pCs, (void*)retaddr);
+
+            self->WriteMemory<uint32_t>(pCs + 0x0, 0);
+            self->WriteMemory<int32_t>(pCs + 0x4, -1);
+            self->WriteMemory<int32_t>(pCs + 0x8, 0);
+            self->WriteMemory<uint32_t>(pCs + 0xC, 0);
+
+            self->SetRegister(self->AxReg(), 0);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlInitializeCriticalSection", szModule)->GetAbsoluteName());
+
+
+    SetAnyJmpHook(FindIATNode("RtlTryEnterCriticalSection", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlTryEnterCriticalSection", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t pCs = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(pCs, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            DWORD tid = GetCurrentThreadId();
+
+            int32_t lockCount = self->ReadMemory<int32_t>(pCs + 4);
+            uint32_t owner = self->ReadMemory<uint32_t>(pCs + 12);
+
+            BOOL result = FALSE;
+
+            if (lockCount == -1)
+            {
+                self->WriteMemory<int32_t>(pCs + 4, 0);
+                self->WriteMemory<int32_t>(pCs + 8, 1);
+                self->WriteMemory<uint32_t>(pCs + 12, tid);
+                result = TRUE;
+            }
+            else if (owner == tid)
+            {
+                auto rec = self->ReadMemory<int32_t>(pCs + 8);
+                self->WriteMemory<int32_t>(pCs + 8, rec + 1);
+                result = TRUE;
+            }
+
+            printf("[RtlTryEnterCriticalSection] CriticalSection=0x%p lock=%d owner=0x%X tid=0x%X result=%d ret=0x%p\n",
+                (void*)pCs,
+                lockCount,
+                owner,
+                tid,
+                result,
+                (void*)retaddr);
+
+            self->SetRegister(self->AxReg(), result);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlTryEnterCriticalSection", szModule)->GetAbsoluteName());
+
+
+    SetAnyJmpHook(FindIATNode("RtlEnterCriticalSection", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlEnterCriticalSection", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t pCs = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(pCs, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            DWORD tid = GetCurrentThreadId();
+
+            int32_t lockCount = self->ReadMemory<int32_t>(pCs + 4);
+            uint32_t owner = self->ReadMemory<uint32_t>(pCs + 12);
+
+            if (lockCount == -1)
+            {
+                self->WriteMemory<int32_t>(pCs + 4, 0);
+                self->WriteMemory<int32_t>(pCs + 8, 1);
+                self->WriteMemory<uint32_t>(pCs + 12, tid);
+            }
+            else if (owner == tid)
+            {
+                auto rec = self->ReadMemory<int32_t>(pCs + 8);
+                self->WriteMemory<int32_t>(pCs + 8, rec + 1);
+            }
+            else
+            {
+                printf("[RtlEnterCriticalSection] contention detected, forcing ownership\n");
+
+                self->WriteMemory<int32_t>(pCs + 4, 0);
+                self->WriteMemory<int32_t>(pCs + 8, 1);
+                self->WriteMemory<uint32_t>(pCs + 12, tid);
+            }
+
+            printf("[RtlEnterCriticalSection] CriticalSection=0x%p lock=%d owner=0x%X tid=0x%X ret=0x%p\n",
+                (void*)pCs,
+                lockCount,
+                owner,
+                tid,
+                (void*)retaddr);
+
+            self->SetRegister(self->AxReg(), 0);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlEnterCriticalSection", szModule)->GetAbsoluteName());
+
+
+    SetAnyJmpHook(FindIATNode("RtlLeaveCriticalSection", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlLeaveCriticalSection", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t pCs = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(pCs, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            int32_t rec = self->ReadMemory<int32_t>(pCs + 8);
+
+            printf("[RtlLeaveCriticalSection] CriticalSection=0x%p RecursionCount=%d ret=0x%p\n",
+                (void*)pCs,
+                rec,
+                (void*)retaddr);
+
+            if (rec > 1)
+            {
+                self->WriteMemory<int32_t>(pCs + 8, rec - 1);
+            }
+            else
+            {
+                self->WriteMemory<int32_t>(pCs + 8, 0);
+                self->WriteMemory<uint32_t>(pCs + 12, 0);
+                self->WriteMemory<int32_t>(pCs + 4, -1);
+            }
+
+            self->SetRegister(self->AxReg(), 0);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlLeaveCriticalSection", szModule)->GetAbsoluteName());
+
+
+    // Insn
     SetInsnCB(UC_X86_INS_CPUID,
         [&](uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data) -> bool
         {
