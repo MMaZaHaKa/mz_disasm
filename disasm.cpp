@@ -1257,7 +1257,7 @@ void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, boo
         CopyNTSeh();
         CopyNTStack();
 #else
-        SetFakeSehTid();
+        SetFakeSehTeb();
         SetStack();
 #endif
     }
@@ -5030,9 +5030,9 @@ void AsmRunner::SetStackArgEbpIndex(uint32_t nArgIdx, uintptr_t arg)
     StackSetValue(arg, false, static_cast<int32_t>(nArgIdx) + 1);
 }
 
-//TID TB FS SEH MSR_FS_BASE MSR IRP etc https://github.com/thpatch/thcrap/blob/af5b5e190493887258a64affba7ec220c892e7a6/thcrap/src/ntdll.h
+//TEB TB FS SEH PEB MSR_FS_BASE MSR IRP etc https://github.com/thpatch/thcrap/blob/af5b5e190493887258a64affba7ec220c892e7a6/thcrap/src/ntdll.h
 #if 1 // temp hack avoid fakin skip write UC_X86_REG_FS_BASE in SetTebBase
-void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
+void AsmRunner::SetFakeSehTeb(uintptr_t pAddr, uintptr_t nSize)
 {
     assert(m_bInitedSehFS == false);
     if (!m_uc) return;
@@ -5065,7 +5065,7 @@ void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
     m_bInitedSehFS = true;
 }
 #else
-void AsmRunner::SetFakeSehTid(uintptr_t pAddr, uintptr_t nSize)
+void AsmRunner::SetFakeSehTeb(uintptr_t pAddr, uintptr_t nSize)
 {
     assert(m_bInitedSehFS == false);
     if (!m_uc) return;
@@ -7717,8 +7717,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             {
                 return false;
             }
-            //uintptr_t err = self->m_LastError;
-            uintptr_t err = 0;
+            uintptr_t err = self->GetFSTEBLastError();
             printf("[GetLastError] -> %u (0x%08X)\n", err, err);
 
             self->SetRegister(self->AxReg(), err);
@@ -7727,7 +7726,84 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             return true;
         }, this, bBefore, false, FindIATNode("GetLastError", szModule)->GetAbsoluteName());
 
-    // TODO: GetLastError SetLastError RtlDecodePointer RtlEncodePointer
+    SetAnyJmpHook(FindIATNode("SetLastError", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("SetLastError", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t dwErrCode = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(dwErrCode, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            self->SetTebLastError(dwErrCode);
+
+            printf("[SetLastError] Error=%u (0x%08X)\n", self->GetTebLastError(), self->GetTebLastError());
+
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("SetLastError", szModule)->GetAbsoluteName());
+
+    SetAnyJmpHook(FindIATNode("HeapFree", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("HeapFree", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t hHeap = 0;
+            uintptr_t dwFlags = 0;
+            uintptr_t lpMem = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(hHeap, 0, bShouldPopArgs_NoCdecl))   return false;
+            if (!self->StackGetArg(dwFlags, 1, bShouldPopArgs_NoCdecl)) return false;
+            if (!self->StackGetArg(lpMem, 2, bShouldPopArgs_NoCdecl))   return false;
+
+            printf("[HeapFree] Heap=0x%p Flags=0x%p Mem=0x%p ret=0x%p\n",
+                (void*)hHeap,
+                (void*)dwFlags,
+                (void*)lpMem,
+                (void*)retaddr);
+
+            BOOL result = TRUE;
+
+            if (lpMem)
+            {
+                self->FreeMemory(lpMem);
+                printf("[HeapFree] Freed 0x%p\n", (void*)lpMem);
+            }
+
+            self->SetRegister(self->AxReg(), result);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("HeapFree", szModule)->GetAbsoluteName());
+
     // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
 
 
@@ -8003,6 +8079,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             return true;
         }, this, bBefore, false, FindIATNode("RtlAllocateHeap", szModule)->GetAbsoluteName());
 
+
     SetAnyJmpHook(FindIATNode("RtlFreeHeap", szModule)->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
@@ -8052,6 +8129,88 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
             return true;
         }, this, bBefore, false, FindIATNode("RtlFreeHeap", szModule)->GetAbsoluteName());
+
+
+    SetAnyJmpHook(FindIATNode("RtlEncodePointer", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlEncodePointer", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t ptr = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(ptr, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            static auto RtlEncodePointer = reinterpret_cast<PVOID(*)(PVOID)>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlEncodePointer"));
+            uintptr_t encoded = ptr;
+            if (RtlEncodePointer)
+            {
+                encoded = reinterpret_cast<uintptr_t>(RtlEncodePointer(reinterpret_cast<PVOID>(ptr)));
+                printf("[RtlEncodePointer] Ptr=0x%p -> 0x%p\n", (void*)ptr, (void*)encoded);
+            }
+            else {
+                printf("[RtlEncodePointer] Function not found, leaving ptr=0x%p\n", (void*)ptr);
+            }
+
+            self->SetRegister(self->AxReg(), encoded);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlEncodePointer", szModule)->GetAbsoluteName());
+
+
+    SetAnyJmpHook(FindIATNode("RtlDecodePointer", szModule)->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("RtlDecodePointer", szModule));
+
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            const bool bShouldPopArgs_NoCdecl = true;
+
+            uintptr_t ptr = 0;
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+            if (!self->StackGetArg(ptr, 0, bShouldPopArgs_NoCdecl))
+                return false;
+
+            static auto RtlDecodePointer = reinterpret_cast<PVOID(*)(PVOID)>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlDecodePointer"));
+            uintptr_t decoded = ptr;
+            if (RtlDecodePointer)
+            {
+                decoded = reinterpret_cast<uintptr_t>(RtlDecodePointer(reinterpret_cast<PVOID>(ptr)));
+                printf("[RtlDecodePointer] Ptr=0x%p -> 0x%p\n", (void*)ptr, (void*)decoded);
+            }
+            else {
+                printf("[RtlDecodePointer] Function not found, leaving ptr=0x%p\n", (void*)ptr);
+            }
+
+            self->SetRegister(self->AxReg(), decoded);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("RtlDecodePointer", szModule)->GetAbsoluteName());
 
 
 

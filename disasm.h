@@ -192,8 +192,10 @@ public:
 	uintptr_t GetModEnd() const { return m_modEnd; }
 	uintptr_t GetStackStart() const { return m_stackBase; } // ebp
 	uintptr_t GetStackEnd() const { return m_stackBase + m_stackSize; } // esp
-	uintptr_t GetFSTIDStart() const { return m_fsBase; }
-	uintptr_t GetFSTIDEnd() const { return m_fsBase + m_fsSize; }
+	uintptr_t GetFSTEBStart() const { return m_fsBase; }
+	uintptr_t GetFSTEBEnd() const { return m_fsBase + m_fsSize; }
+	void SetFSTEBLastError(uintptr_t lastError) { m_fsLastError = lastError; }
+	uintptr_t GetFSTEBLastError() const { return m_fsLastError; }
 	uint64_t GetInstructionsPerSecond() const { return m_instructionsPerSecond; }
 	uint64_t GetFiletimeUnitsPerSecond() const { return m_filetimeUnitsPerSecond; }
 	void SetFlsValue(uintptr_t index, uintptr_t value);
@@ -330,7 +332,7 @@ public:
 	// вызывать StackGetArg после call перед эпилогом, после stackpop return address
 	bool StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl); // true=stdcall pop like, false=cdecl peek
 	uintptr_t ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size);
-	void SetFakeSehTid(uintptr_t pAddr = 0, uintptr_t nSize = 0);
+	void SetFakeSehTeb(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	void CopyNTSeh(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	bool SetTebBase(uintptr_t base);
 	uintptr_t GetTebBase() const;
@@ -760,8 +762,9 @@ private:
 	uintptr_t m_stackEPSize = 0x100; // m_bX64 ? 0x20 : 8
 	uintptr_t m_allocBase = 0x20000000;
 	uintptr_t m_allocCursor = 0x20000000;
-	uintptr_t m_fsBase = 0; // 0x7FFDF000 TEB normal when?? fs:/MSR
+	uintptr_t m_fsBase = 0; // 0x7FFDF000 TEB normal when?? fs:/MSR TEB TB FS SEH PEB MSR_FS_BASE MSR IRP
 	uintptr_t m_fsSize = 0;
+	uintptr_t m_fsLastError = ERROR_SUCCESS; // TODO: move into fs:teb
 	uintptr_t m_halt = 0x0; // 0x0 0x13371337 0xDEADBEEF
 	uintptr_t m_lastPC = 0;
 
