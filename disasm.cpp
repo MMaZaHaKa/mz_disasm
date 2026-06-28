@@ -4581,6 +4581,22 @@ void AsmRunner::DumpMemory(uintptr_t pStart, uintptr_t nSize)
     Log("%s", out.c_str());
 }
 
+void AsmRunner::DumpMemoryNT(uintptr_t pStart, uintptr_t nSize)
+{
+    if (!pStart || !nSize) return;
+    std::string out;
+    DataToHexString(0, pStart, (uint8_t*)pStart, nSize, &out);
+    Log("%s", out.c_str());
+}
+
+void AsmRunner::DumpMemoryVal(uintptr_t nVal, uintptr_t nSize)
+{
+    if (!nSize) return;
+    std::string out;
+    DataToHexString(0, 0, (uint8_t*)&nVal, nSize, &out);
+    Log("%s", out.c_str());
+}
+
 void AsmRunner::DumpMemory(uintptr_t pNativeStart, uintptr_t pVTStart, uintptr_t nSize)
 {
     if (!m_uc || !pNativeStart || !pVTStart || !nSize) return;
@@ -4617,6 +4633,31 @@ uintptr_t AsmRunner::DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize)
         return 0;
     }
     return addr;
+}
+
+void AsmRunner::WaitBuff(uintptr_t pVaddr, uintptr_t size)
+{
+    if (!pVaddr || !size)
+        return;
+
+    void* buff = VirtualAlloc(nullptr,
+        size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE);
+
+    if (!buff)
+        return;
+
+    DumpMemory((uintptr_t)buff, pVaddr, size);
+
+    MessageBoxA(nullptr,
+        "Buffer is copied into native memory.\n"
+        "You can inspect it in the debugger.\n"
+        "Press OK to free it.",
+        "WaitBuff",
+        MB_OK);
+
+    VirtualFree(buff, 0, MEM_RELEASE);
 }
 
 bool AsmRunner::IsModuleAddr(uintptr_t pAddr)
@@ -4712,6 +4753,66 @@ uintptr_t AsmRunner::GetRegister(uint32_t nRegister)
     uc_reg_read(m_uc, nRegister, &v);
     if (!m_bX64) v = static_cast<uint32_t>(v);
     return v;
+}
+
+bool AsmRunner::IsAnyReg(uintptr_t value, uintptr_t& outReg, std::string& outName)
+{
+    struct REG_INFO {
+        uintptr_t reg;
+        const char* name;
+    };
+
+    static const REG_INFO regs32[] =
+    {
+        { UC_X86_REG_EAX, "EAX" },
+        { UC_X86_REG_EBX, "EBX" },
+        { UC_X86_REG_ECX, "ECX" },
+        { UC_X86_REG_EDX, "EDX" },
+        { UC_X86_REG_ESI, "ESI" },
+        { UC_X86_REG_EDI, "EDI" },
+        { UC_X86_REG_EBP, "EBP" },
+        { UC_X86_REG_ESP, "ESP" },
+        { UC_X86_REG_EIP, "EIP" },
+    };
+
+    static const REG_INFO regs64[] =
+    {
+        { UC_X86_REG_RAX, "RAX" },
+        { UC_X86_REG_RBX, "RBX" },
+        { UC_X86_REG_RCX, "RCX" },
+        { UC_X86_REG_RDX, "RDX" },
+        { UC_X86_REG_RSI, "RSI" },
+        { UC_X86_REG_RDI, "RDI" },
+        { UC_X86_REG_RBP, "RBP" },
+        { UC_X86_REG_RSP, "RSP" },
+        { UC_X86_REG_R8,  "R8"  },
+        { UC_X86_REG_R9,  "R9"  },
+        { UC_X86_REG_R10, "R10" },
+        { UC_X86_REG_R11, "R11" },
+        { UC_X86_REG_R12, "R12" },
+        { UC_X86_REG_R13, "R13" },
+        { UC_X86_REG_R14, "R14" },
+        { UC_X86_REG_R15, "R15" },
+        { UC_X86_REG_RIP, "RIP" },
+    };
+
+    const REG_INFO* regs = m_bX64 ? regs64 : regs32;
+    const size_t count = m_bX64 ? std::size(regs64) : std::size(regs32);
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        uintptr_t regValue = GetRegister(regs[i].reg);
+        if (regValue == value)
+        {
+            outReg = regs[i].reg;
+            outName = regs[i].name;
+            return true;
+        }
+    }
+
+    outReg = UC_X86_REG_INVALID;
+    outName.clear();
+    return false;
 }
 
 void AsmRunner::SetStack(uintptr_t pStack, uintptr_t nSize)
@@ -7370,14 +7471,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
     const bool bBefore = false;
 
     // kernel32.dll
-    const char* szModule = "kernel32.dll";
-    LoadLibraryA(szModule);
-
+    LoadLibraryA("kernel32.dll");
     SetIAT(0, 0, false); // collect temp ENV
-    SetAnyJmpHook(FindIATNode("VirtualAlloc", szModule)->GetAbsolute(),
+
+    SetAnyJmpHook(FindIATNode("VirtualAlloc", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         { // LPVOID __stdcall VirtualAllocStub(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect) // b+8 b+C b+10 b+14
-            cb(FindIATNode("VirtualAlloc", szModule));
+            cb(FindIATNode("VirtualAlloc", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7441,12 +7541,12 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("VirtualAlloc", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("VirtualAlloc", "kernel32.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("VirtualFree", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("VirtualFree", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("VirtualFree", szModule));
+            cb(FindIATNode("VirtualFree", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7493,13 +7593,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("VirtualFree", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("VirtualFree", "kernel32.dll")->GetAbsoluteName());
 
     // TODO: Replace with instruction-based time emulation (CalcTime) instead of caching real time (fake perfomance)
-    SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("GetSystemTimeAsFileTime", szModule));
+            cb(FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7592,12 +7692,12 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("GetSystemTimeAsFileTime", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("Sleep", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("Sleep", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("Sleep", szModule));
+            cb(FindIATNode("Sleep", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7632,12 +7732,12 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("Sleep", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("Sleep", "kernel32.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("GetCurrentThreadId", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("GetCurrentThreadId", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("GetCurrentThreadId", szModule));
+            cb(FindIATNode("GetCurrentThreadId", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7665,13 +7765,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("GetCurrentThreadId", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("GetCurrentThreadId", "kernel32.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("GetProcessHeap", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("GetProcessHeap", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("GetProcessHeap", szModule));
+            cb(FindIATNode("GetProcessHeap", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7695,13 +7795,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("GetProcessHeap", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("GetProcessHeap", "kernel32.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("GetLastError", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("GetLastError", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("GetLastError", szModule));
+            cb(FindIATNode("GetLastError", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7724,13 +7824,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("GetLastError", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("GetLastError", "kernel32.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("SetLastError", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("SetLastError", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("SetLastError", szModule));
+            cb(FindIATNode("SetLastError", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7756,13 +7856,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("SetLastError", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("SetLastError", "kernel32.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("HeapFree", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("HeapFree", "kernel32.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("HeapFree", szModule));
+            cb(FindIATNode("HeapFree", "kernel32.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7802,22 +7902,21 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("HeapFree", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("HeapFree", "kernel32.dll")->GetAbsoluteName());
 
     // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
 
 
 
     // ntdll.dll
-    szModule = "ntdll.dll";
-    LoadLibraryA(szModule);
+    LoadLibraryA("ntdll.dll");
     SetIAT(0, 0, false); // collect temp ENV
 
-    SetAnyJmpHook(FindIATNode("RtlInitializeCriticalSection", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlInitializeCriticalSection", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlInitializeCriticalSection", szModule));
+            cb(FindIATNode("RtlInitializeCriticalSection", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7848,14 +7947,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlInitializeCriticalSection", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlInitializeCriticalSection", "ntdll.dll")->GetAbsoluteName());
 
 
-    SetAnyJmpHook(FindIATNode("RtlTryEnterCriticalSection", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlTryEnterCriticalSection", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlTryEnterCriticalSection", szModule));
+            cb(FindIATNode("RtlTryEnterCriticalSection", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7907,14 +8006,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlTryEnterCriticalSection", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlTryEnterCriticalSection", "ntdll.dll")->GetAbsoluteName());
 
 
-    SetAnyJmpHook(FindIATNode("RtlEnterCriticalSection", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlEnterCriticalSection", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlEnterCriticalSection", szModule));
+            cb(FindIATNode("RtlEnterCriticalSection", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -7969,14 +8068,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlEnterCriticalSection", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlEnterCriticalSection", "ntdll.dll")->GetAbsoluteName());
 
 
-    SetAnyJmpHook(FindIATNode("RtlLeaveCriticalSection", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlLeaveCriticalSection", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlLeaveCriticalSection", szModule));
+            cb(FindIATNode("RtlLeaveCriticalSection", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -8017,14 +8116,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlLeaveCriticalSection", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlLeaveCriticalSection", "ntdll.dll")->GetAbsoluteName());
 
 
-    SetAnyJmpHook(FindIATNode("RtlAllocateHeap", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlAllocateHeap", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlAllocateHeap", szModule));
+            cb(FindIATNode("RtlAllocateHeap", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -8077,14 +8176,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlAllocateHeap", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlAllocateHeap", "ntdll.dll")->GetAbsoluteName());
 
 
-    SetAnyJmpHook(FindIATNode("RtlFreeHeap", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlFreeHeap", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlFreeHeap", szModule));
+            cb(FindIATNode("RtlFreeHeap", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -8128,14 +8227,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlFreeHeap", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlFreeHeap", "ntdll.dll")->GetAbsoluteName());
 
 
-    SetAnyJmpHook(FindIATNode("RtlEncodePointer", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlEncodePointer", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlEncodePointer", szModule));
+            cb(FindIATNode("RtlEncodePointer", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -8169,14 +8268,14 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlEncodePointer", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlEncodePointer", "ntdll.dll")->GetAbsoluteName());
 
 
-    SetAnyJmpHook(FindIATNode("RtlDecodePointer", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("RtlDecodePointer", "ntdll.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("RtlDecodePointer", szModule));
+            cb(FindIATNode("RtlDecodePointer", "ntdll.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -8210,20 +8309,19 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("RtlDecodePointer", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("RtlDecodePointer", "ntdll.dll")->GetAbsoluteName());
 
 
 
     // kernelbase.dll
-    szModule = "kernelbase.dll";
-    LoadLibraryA(szModule);
+    LoadLibraryA("kernelbase.dll");
     SetIAT(0, 0, false); // collect temp ENV
 
-    SetAnyJmpHook(FindIATNode("FlsGetValue", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("FlsGetValue", "kernelbase.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("FlsGetValue", szModule));
+            cb(FindIATNode("FlsGetValue", "kernelbase.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -8252,13 +8350,13 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("FlsGetValue", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("FlsGetValue", "kernelbase.dll")->GetAbsoluteName());
 
-    SetAnyJmpHook(FindIATNode("FlsSetValue", szModule)->GetAbsolute(),
+    SetAnyJmpHook(FindIATNode("FlsSetValue", "kernelbase.dll")->GetAbsolute(),
         [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
             ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
         {
-            cb(FindIATNode("FlsSetValue", szModule));
+            cb(FindIATNode("FlsSetValue", "kernelbase.dll"));
 
             auto* self = static_cast<AsmRunner*>(user_data);
             if (!self)
@@ -8291,7 +8389,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             self->UpdatePC(retaddr, true);
 
             return true;
-        }, this, bBefore, false, FindIATNode("FlsSetValue", szModule)->GetAbsoluteName());
+        }, this, bBefore, false, FindIATNode("FlsSetValue", "kernelbase.dll")->GetAbsoluteName());
 
 
 

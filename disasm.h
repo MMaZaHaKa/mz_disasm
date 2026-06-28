@@ -276,9 +276,12 @@ public:
 	bool ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
 	void DumpMemory(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
+	void DumpMemoryNT(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
+	void DumpMemoryVal(uintptr_t nVal, uintptr_t nSize); // to console DataToHexString
 	void DumpMemory(uintptr_t pNativeStart, uintptr_t pVTStart, uintptr_t nSize);
 	uintptr_t DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize);
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
+	void WaitBuff(uintptr_t pVaddr, uintptr_t size);
 	bool IsModuleAddr(uintptr_t pAddr);
 	bool IsHaltAddr(uintptr_t pAddr);
 	bool InExtraRegion(uintptr_t pAddr);
@@ -287,7 +290,7 @@ public:
 	void CapturePC();
 	bool IsPCChanged();
 	bool ShouldStopCB(bool bReset);
-	static bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd);
+	static bool IsInAddr(uintptr_t pAddr, uintptr_t pStart, uintptr_t pEnd); // [s, e)
 
 	// asm / registers / stack
 	uint32_t PcReg() const { return m_bX64 ? UC_X86_REG_RIP : UC_X86_REG_EIP; }
@@ -316,6 +319,7 @@ public:
 	void SetStackArgEbpIndex(uint32_t nArgIdx, uintptr_t arg); // ebp+4 +8 +C ...  // bLogRunner log st ptr // custom stack arg // 4=ebpdefault 0arg?
 	void SetRegister(uint32_t nRegister, uintptr_t arg); // todo unicorn types?
 	uintptr_t GetRegister(uint32_t nRegister);
+	bool IsAnyReg(uintptr_t value, uintptr_t& outReg, std::string& outName);
 	void SetStack(uintptr_t pStack, uintptr_t nSize); // if bLogRunner log stack
 	void CopyNTStack(uintptr_t pStack = 0, uintptr_t nSize = 0);
 	void SetStack(); // if bLogRunner log stack
