@@ -16,6 +16,7 @@
 #endif
 
 #define AR_SNAME ("AsmRunner")
+#define AR_MAX_FSIZE (0xF0'00)
 //#define AR_SYSCALL_JUMP_CB
 //#define AR_DEBUG
 #define AR_IDA_WS
@@ -103,19 +104,13 @@ enum eIoplLevel : uint32_t
 	LEVEL_3 = 3 << 12,
 };
 
-struct tFuncNode //tmp, use tIEFuncNode
-{
-	uintptr_t rva = 0;
-	size_t size = 0;
-	std::string name;
-};
-
-struct tIEFuncNode
+struct tFuncNode
 {
 	std::string moduleName;
 	std::string funcName;
 	uintptr_t moduleBase;
 	uintptr_t funcRva;
+	uintptr_t funcSize;
 
 	inline uintptr_t GetAbsolute() { return moduleBase + funcRva; }
 	inline std::string GetAbsoluteName() { return funcName + " " + moduleName; }
@@ -150,7 +145,7 @@ public:
 	// UC_HOOK_INSN - UC_X86_INS_CPUID
 	using OnInsnCb = std::function<bool(uc_engine* uc, uintptr_t address, uint32_t size, uintptr_t nUcInsn, ZydisMnemonic mnemonic, void* user_data)>;
 
-	using HookNotifyCb = std::function<void(tIEFuncNode* pNode)>;
+	using HookNotifyCb = std::function<void(tFuncNode* pNode)>;
 
 
 	AsmRunner(bool bX64 = false);
@@ -218,7 +213,7 @@ public:
 	static void DumpTime(std::chrono::steady_clock::time_point start, const char* label = nullptr);
 	static void DumpDeltaTime(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b, const char* label = nullptr);
 	static std::string PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec = false, bool bDecBracket = true);
-	static std::string PrintHexOnly(uintptr_t v, bool bDec = false);
+	static std::string PrintValue(uintptr_t v, bool bDec = false);
 	static uintptr_t DumpModule(uintptr_t pAddr);
 	static uintptr_t DumpModule(const char* moduleName, bool bLoadLib);
 	static bool DumpModuleToFile(uintptr_t pAddr, const char* fileName);
@@ -236,8 +231,8 @@ public:
 	bool GetMappedModuleBounds(LPCSTR moduleName, uintptr_t& pOutStart, uintptr_t& pOutEnd, uintptr_t& nOutSize);
 	std::string GetProcessName();
 	std::string GetModuleName(HMODULE hMod);
-	void AddExportsFromModule(HMODULE hMod, std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo);
-	void CollectAllExports(std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo);
+	void AddExportsFromModule(HMODULE hMod, std::map<uintptr_t, tFuncNode>& addrToInfo, uintptr_t nMaxSize = AR_MAX_FSIZE);
+	void CollectAllExports(std::map<uintptr_t, tFuncNode>& addrToInfo, uintptr_t nMaxSize = AR_MAX_FSIZE);
 	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output);
 	static void DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, const uint16_t* byteColors, const uint16_t* asciiColors);
 	static void SetConsoleColor(int32_t mode);
@@ -264,10 +259,10 @@ public:
 	static bool IsNTMemoryReadable(uintptr_t address, uintptr_t size = 1);
 
 	// Mem
-	uintptr_t AddMemory(uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/);
-	uintptr_t AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/);
-	bool AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
-	bool AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL);
+	uintptr_t AddMemory(uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/, bool bAlign /*= true*/);
+	uintptr_t AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/, bool bAlign /*= true*/);
+	bool AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType = UC_PROT_ALL, bool bAlign = true);
+	bool AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL, bool bAlign = true);
 	void CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
 	uintptr_t MemSet(uintptr_t pAddr, int32_t nVal, uintptr_t nSize);
 	uintptr_t MemCpy(uintptr_t pVTo, uintptr_t pVFrom, uintptr_t nSize);
@@ -346,12 +341,22 @@ public:
 	uint32_t GetTebLastError() const;
 
 	// callbacks / execution
+	struct tRWHistory
+	{
+		uintptr_t pc; // who
+		uintptr_t addr; // when
+		uintptr_t value; // res
+		uintptr_t size;
+		uintptr_t ic;
+		bool bRead;
+		std::string disasm;
+	};
 	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false, std::string sFuncName = ""); // !moduleHook for new dummy region
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	bool SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv = true);
-	bool LoadIATEnv(const char* szIATEnvFile);
-	tIEFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
-	tIEFuncNode* FindIATNode(std::string funcName, std::string moduleName = "", bool bLowerCmp = true, bool bContains = false);
+	bool LoadIATEnv(const char* szIATEnvFile, uintptr_t nMaxSize = AR_MAX_FSIZE);
+	tFuncNode* FindIATNode(uintptr_t pAddr, bool bRVA = false);
+	tFuncNode* FindIATNode(std::string funcName, std::string moduleName = "", bool bLowerCmp = true, bool bContains = false);
 	void SetIATCallCB(OnJmpCb cb, void* data = nullptr);
 	void SetSysCallCB(OnOpcodeCb cb, void* data = nullptr);
 	void SetInsnCB(uintptr_t nInsn, OnInsnCb cb, void* data = nullptr); // UC_X86_INS_CPUID warn!!! check IsInsnAllowed
@@ -363,8 +368,8 @@ public:
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
 	void SetICCallback(uintptr_t nIC, OnOpcodeCb opcode_cb, void* opcode_data);
 	uintptr_t CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename)
-	bool CopyModule(uintptr_t pFrom, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
-	bool CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize);
+	bool CopyModule(uintptr_t pFrom, uintptr_t nSize = 0, std::string sModName = ""); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
+	bool CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, std::string sModName = "");
 	void LoadModule(const char* szModule); // mz pe? (exe+dll)
 	void ResolveIATModule();
 	uintptr_t GetRandomEntryPoint();
@@ -372,6 +377,8 @@ public:
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
 	void SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0);
+	void SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0,
+		bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bSym = true, bool bShortFmt = false, bool bDisasm = true);
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
 	void Pause();
@@ -385,8 +392,9 @@ public:
 	bool GetFlag(eFlags flag);
 	void SetFlag(eFlags flag, bool value);
 	void DumpStack(intptr_t nCount = -1, bool bValNotice = true);
-	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
-	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false);
+	std::string FormatRWHistoryLine(const tRWHistory& h, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt, bool bDisasm);
+	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false, bool bDisasm = true);
+	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false, bool bDisasm = true);
 	void ClearRWHistory();
 	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC = true, bool showEnterMessage = true, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true, bool skipTrace = true, bool skipHistory = true);
 	void InstallDefaultHooks(HookNotifyCb cb);
@@ -394,12 +402,12 @@ public:
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
-	const tFuncNode* FindSymbolByRuntime(uintptr_t rtAddr) const;
-	std::string GetSectionNameByRuntimeAddress(uintptr_t rtAddr) const;
-	tFuncNode GetSymByName(const char* szName);
-	tFuncNode GetSymByAddr(uintptr_t pAddr);
-	void DisassembleWithZydis();
-	void DisassembleWithCapstone();
+	tFuncNode* FindSymbolByRuntime(uintptr_t rtAddr);
+	std::string GetSectionNameByRuntimeAddress(uintptr_t rtAddr);
+	tFuncNode* GetSymByName(const char* szName);
+	tFuncNode* GetSymByAddr(uintptr_t pAddr);
+	std::string DisassembleWithZydis(bool bLog = false);
+	std::string DisassembleWithCapstone(bool bLog = false);
 
 	// точки останова: addr info
 	struct tBpInfo
@@ -594,7 +602,7 @@ public:
 		return s;
 	}
 
-private:
+	private:
 	// состояние трасировки Tenet
 	struct tTraceState
 	{
@@ -643,10 +651,21 @@ private:
 		uintptr_t aslr;
 		uintptr_t icoffset;
 		uintptr_t lastanyjmpinstrcount;
-		uint32_t anyjmpmode; // 0 disable, 1 from, 2 to, 3 full
+		uint32_t anyjmpmode; // 0 disable(default full trace), 1 ajfrom, 2 ajto, 3 ajfull
 		OnOpcodeCb cb;
 		bool rva;
 		bool inited;
+
+		struct tRWHistoryArgs
+		{
+			bool bUseRWHistory;
+			bool bRead;
+			bool bWrite;
+			bool bValNotice;
+			bool bSym;
+			bool bShortFmt;
+			bool bDisasm;
+		} rwhistory;
 	};
 
 	struct tICNode
@@ -683,16 +702,6 @@ private:
 		bool wsa_started;
 	};
 
-	struct tRWHistory
-	{
-		uintptr_t pc; // who
-		uintptr_t addr; // when
-		uintptr_t value; // res
-		uintptr_t size;
-		uintptr_t ic;
-		bool bRead;
-	};
-
 	struct tInsnHookNode
 	{
 		uintptr_t nInsn = 0;
@@ -716,6 +725,7 @@ private:
 		bool executable = false;
 	};
 
+
 	uc_engine* m_uc = nullptr;
 	bool m_bInitialised = false;
 	bool m_bLogEnabled = true;
@@ -738,9 +748,9 @@ private:
 
 	std::vector<tFuncNode> m_sym;
 	std::vector<tAnyJmpHookNode> m_anyJmpHooks; // when any call smth from here
-	std::vector<tIEFuncNode> m_iat;
+	std::vector<tFuncNode> m_iat;
 	std::vector<tExecRegion> m_execRegions; // extra allowed no halt regions for execute
-	std::unordered_map<uintptr_t, tIEFuncNode> exportsENV;
+	std::map<uintptr_t, tFuncNode> exportsENV; // not unordered_map FindSymbolByRuntime upper_bound
 	std::vector<tICNode> m_icHooks;
 	std::vector<tDeadzoneIC> m_deadzonesIC;
 	bool m_bInDeadzoneIC = false;
@@ -758,6 +768,7 @@ private:
 	OnOpcodeCb m_cbSysCall; // syscall, int, ud2, etc
 	void* m_cbSysCallData = nullptr;
 
+	std::string m_modName = "";
 	uintptr_t m_modStart = 0;
 	uintptr_t m_modEnd = 0;
 
@@ -843,9 +854,8 @@ private:
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
 
 	// symbol helpers
-	std::string FormatRuntimeAddress(uintptr_t rtAddr) const;
-	std::string FormatRuntimeAddressWithSymbol(uintptr_t rtAddr) const;
-	std::string FormatCurrentSymbolSuffix(uintptr_t rtAddr) const;
+	std::string FormatRuntimeAddressWithSymbol(uintptr_t rtAddr);
+	std::string FormatCurrentSymbolSuffix(uintptr_t rtAddr);
 
 	// more helpers
 	bool ReadBytes(uc_engine* uc, uint64_t address, uint32_t size, std::vector<uint8_t>& out) const;

@@ -1342,6 +1342,13 @@ void AsmRunner::Shutdown()
     m_rttrace.cb = nullptr;
     m_rttrace.rva = false;
     m_rttrace.inited = false;
+    m_rttrace.rwhistory.bUseRWHistory = false;
+    m_rttrace.rwhistory.bRead = false;
+    m_rttrace.rwhistory.bWrite = false;
+    m_rttrace.rwhistory.bValNotice = false;
+    m_rttrace.rwhistory.bSym = false;
+    m_rttrace.rwhistory.bShortFmt = false;
+    m_rttrace.rwhistory.bDisasm = false;
     m_icHooks.clear();
     m_deadzonesIC.clear();
     m_bInDeadzoneIC = false;
@@ -1415,75 +1422,122 @@ uintptr_t AsmRunner::CurrentSp(uc_engine* uc) const
 
 std::string AsmRunner::RegName(uint32_t reg) const
 {
-    switch (reg) {
-    case UC_X86_REG_EAX: return m_bX64 ? "RAX" : "EAX";
-    case UC_X86_REG_EBX: return m_bX64 ? "RBX" : "EBX";
-    case UC_X86_REG_ECX: return m_bX64 ? "RCX" : "ECX";
-    case UC_X86_REG_EDX: return m_bX64 ? "RDX" : "EDX";
-    case UC_X86_REG_ESI: return m_bX64 ? "RSI" : "ESI";
-    case UC_X86_REG_EDI: return m_bX64 ? "RDI" : "EDI";
-    case UC_X86_REG_ESP: return m_bX64 ? "RSP" : "ESP";
-    case UC_X86_REG_EBP: return m_bX64 ? "RBP" : "EBP";
-    case UC_X86_REG_EIP: return m_bX64 ? "RIP" : "EIP";
-    case UC_X86_REG_RAX: return "RAX";
-    case UC_X86_REG_RBX: return "RBX";
-    case UC_X86_REG_RCX: return "RCX";
-    case UC_X86_REG_RDX: return "RDX";
-    case UC_X86_REG_RSI: return "RSI";
-    case UC_X86_REG_RDI: return "RDI";
-    case UC_X86_REG_RSP: return "RSP";
-    case UC_X86_REG_RBP: return "RBP";
-    case UC_X86_REG_RIP: return "RIP";
-    default: break;
+    switch (reg)
+    {
+        case UC_X86_REG_EAX: return m_bX64 ? "RAX" : "EAX";
+        case UC_X86_REG_EBX: return m_bX64 ? "RBX" : "EBX";
+        case UC_X86_REG_ECX: return m_bX64 ? "RCX" : "ECX";
+        case UC_X86_REG_EDX: return m_bX64 ? "RDX" : "EDX";
+        case UC_X86_REG_ESI: return m_bX64 ? "RSI" : "ESI";
+        case UC_X86_REG_EDI: return m_bX64 ? "RDI" : "EDI";
+        case UC_X86_REG_ESP: return m_bX64 ? "RSP" : "ESP";
+        case UC_X86_REG_EBP: return m_bX64 ? "RBP" : "EBP";
+        case UC_X86_REG_EIP: return m_bX64 ? "RIP" : "EIP";
+        case UC_X86_REG_RAX: return "RAX";
+        case UC_X86_REG_RBX: return "RBX";
+        case UC_X86_REG_RCX: return "RCX";
+        case UC_X86_REG_RDX: return "RDX";
+        case UC_X86_REG_RSI: return "RSI";
+        case UC_X86_REG_RDI: return "RDI";
+        case UC_X86_REG_RSP: return "RSP";
+        case UC_X86_REG_RBP: return "RBP";
+        case UC_X86_REG_RIP: return "RIP";
+        default: break;
     }
     return "REG";
 }
 
-std::string AsmRunner::FormatRuntimeAddress(uintptr_t rtAddr) const
+tFuncNode* AsmRunner::FindSymbolByRuntime(uintptr_t rtAddr)
 {
-    std::ostringstream oss;
-    oss << "0x" << std::hex << std::uppercase << rtAddr;
-    return oss.str();
-}
+    if (!m_sym.empty())
+    {
+        uintptr_t rel = rtAddr;
+        if (m_modStart != 0 && rtAddr >= m_modStart) {
+            rel = rtAddr - m_modStart;
+        }
 
-const tFuncNode* AsmRunner::FindSymbolByRuntime(uintptr_t rtAddr) const
-{
-    if (m_sym.empty()) return nullptr;
+        auto it = std::upper_bound(
+            m_sym.begin(), m_sym.end(), rel,
+            [](uintptr_t value, const tFuncNode& e) { return value < e.funcRva; });
 
-    uintptr_t rel = rtAddr;
-    if (m_modStart != 0 && rtAddr >= m_modStart) {
-        rel = rtAddr - m_modStart;
+        if (it != m_sym.begin())
+        {
+            --it;
+            if (it->funcSize != 0) {
+                if (rel >= it->funcRva && rel < it->funcRva + it->funcSize) return &(*it);
+            }
+            else {
+                if (rel == it->funcRva) return &(*it);
+            }
+        }
+
+        //if (IsInAddr(rtAddr, GetModStart(), GetModEnd()))
+        //    return nullptr; // dont show export self
     }
 
-    auto it = std::upper_bound(
-        m_sym.begin(), m_sym.end(), rel,
-        [](uintptr_t value, const tFuncNode& e) { return value < e.rva; });
+    // try search in iat env
+    if (exportsENV.empty())
+        CollectAllExports(exportsENV);
 
-    if (it == m_sym.begin()) return nullptr;
-    --it;
+    if (!exportsENV.empty())
+    {
+        auto it2 = exportsENV.upper_bound(rtAddr);
+        if (it2 != exportsENV.begin())
+        {
+            --it2;
+            uintptr_t absAddr = it2->second.GetAbsolute();
+            if (rtAddr >= absAddr && rtAddr < absAddr + it2->second.funcSize) return &(it2->second);
 
-    if (it->size != 0) {
-        if (rel >= it->rva && rel < it->rva + it->size) return &(*it);
+            //if (it->funcSize != 0) {
+            //    if (rel >= it->funcRva && rel < it->funcRva + it->funcSize) return &(*it);
+            //}
+            //else {
+            //    if (rel == it->funcRva) return &(*it);
+            //}
+        }
     }
-    else {
-        if (rel == it->rva) return &(*it);
-    }
-
-    //uintptr_t start = it->rva;
-    //uintptr_t end = UINTPTR_MAX;
-    //auto next = std::next(it);
-    //if (next != m_sym.end())
-    //    end = next->rva;
-    //else if (it->size != 0)
-    //    end = start + it->size;
-
-    //if (rel >= start && rel < end)
-    //    return &(*it);
 
     return nullptr;
 }
 
-std::string AsmRunner::GetSectionNameByRuntimeAddress(uintptr_t addr) const
+//tFuncNode* AsmRunner::FindSymbolByRuntime(uintptr_t rtAddr)
+//{
+//    if (m_sym.empty()) return nullptr;
+//
+//    uintptr_t rel = rtAddr;
+//    if (m_modStart != 0 && rtAddr >= m_modStart) {
+//        rel = rtAddr - m_modStart;
+//    }
+//
+//    auto it = std::upper_bound(
+//        m_sym.begin(), m_sym.end(), rel,
+//        [](uintptr_t value, const tFuncNode& e) { return value < e.funcRva; });
+//
+//    if (it == m_sym.begin()) return nullptr;
+//    --it;
+//
+//    if (it->funcSize != 0) {
+//        if (rel >= it->funcRva && rel < it->funcRva + it->funcSize) return &(*it);
+//    }
+//    else {
+//        if (rel == it->funcRva) return &(*it);
+//    }
+//
+//    //uintptr_t start = it->rva;
+//    //uintptr_t end = UINTPTR_MAX;
+//    //auto next = std::next(it);
+//    //if (next != m_sym.end())
+//    //    end = next->rva;
+//    //else if (it->size != 0)
+//    //    end = start + it->size;
+//
+//    //if (rel >= start && rel < end)
+//    //    return &(*it);
+//
+//    return nullptr;
+//}
+
+std::string AsmRunner::GetSectionNameByRuntimeAddress(uintptr_t addr)
 {
     if (m_sections.empty() || m_modStart == 0)
         return {};
@@ -1509,40 +1563,36 @@ std::string AsmRunner::GetSectionNameByRuntimeAddress(uintptr_t addr) const
     return {};
 }
 
-std::string AsmRunner::FormatRuntimeAddressWithSymbol(uintptr_t rtAddr) const
+std::string AsmRunner::FormatRuntimeAddressWithSymbol(uintptr_t rtAddr)
 {
     std::ostringstream oss;
     oss << "0x" << std::hex << std::uppercase << rtAddr;
 
-    const tFuncNode* sym = FindSymbolByRuntime(rtAddr);
+    tFuncNode* sym = FindSymbolByRuntime(rtAddr);
     if (sym) {
-        uintptr_t rel = rtAddr;
-        if (m_modStart != 0 && rtAddr >= m_modStart)
-            rel = rtAddr - m_modStart;
+        uintptr_t rel = rtAddr - sym->moduleBase;
 
-        oss << " (" << sym->name;
-        if (rel > sym->rva)
-            oss << "+0x" << std::hex << std::uppercase << (rel - sym->rva);
+        oss << " (" << sym->funcName;
+        if (rel >= sym->funcRva)
+            oss << "+0x" << std::hex << std::uppercase << (rel - sym->funcRva);
         oss << ")";
     }
 
     return oss.str();
 }
 
-std::string AsmRunner::FormatCurrentSymbolSuffix(uintptr_t rtAddr) const
+std::string AsmRunner::FormatCurrentSymbolSuffix(uintptr_t rtAddr)
 {
-    const tFuncNode* sym = FindSymbolByRuntime(rtAddr);
+    tFuncNode* sym = FindSymbolByRuntime(rtAddr);
     if (!sym)
         return std::string();
 
-    uintptr_t rel = rtAddr;
-    if (m_modStart != 0 && rtAddr >= m_modStart)
-        rel = rtAddr - m_modStart;
+    uintptr_t rel = rtAddr - sym->moduleBase;
 
     std::ostringstream oss;
-    oss << sym->name;
-    if (rel > sym->rva)
-        oss << "+0x" << std::hex << std::uppercase << (rel - sym->rva);
+    oss << sym->funcName;
+    if (rel >= sym->funcRva)
+        oss << "+0x" << std::hex << std::uppercase << (rel - sym->funcRva);
 
     return oss.str();
 }
@@ -1639,27 +1689,111 @@ bool AsmRunner::DecodeOpcode(const uint8_t* bytes, size_t size, ZydisDecodedInst
     return true;
 }
 
-void AsmRunner::DisassembleWithZydis()
+std::string AsmRunner::DisassembleWithZydis(bool bLog)
 {
-    if (!m_uc) return;
+    if (!m_uc) return "???";
 
-    uintptr_t pc = CurrentPc(m_uc);
-    std::array<uint8_t, 16> bytes{};
-    if (uc_mem_read(m_uc, pc, bytes.data(), bytes.size()) != UC_ERR_OK) {
-        Log("[DISASM] 0x%p: [READ ERROR]", (void*)(m_bDisasmRVA ? (pc - m_modStart + m_DisasmCustomASLR) : pc));
-        return;
-    }
+    uintptr_t curPc = CurrentPc(m_uc);
+    if (!m_bX64)
+        curPc = static_cast<uint32_t>(curPc);
 
     ZydisDecodedInstruction instr{};
     ////ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE]{}; // invalid
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
     bool bDecodeOK = false;
 
-    std::string s = MakeDisasmLine(bytes.data(), bytes.size(), pc, &instr, operands, bDecodeOK);
-    Log("[DISASM] 0x%p (%s): %s", (void*)(m_bDisasmRVA ? (pc - m_modStart + m_DisasmCustomASLR) : pc), FormatRuntimeAddressWithSymbol(pc).c_str(), s.c_str());
+    std::vector<uint8_t> bytes;
+    bool bReadOk = ReadBytes(m_uc, curPc, 16, bytes);
+
+    std::string disasm = bReadOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, &instr, operands, bDecodeOK) : "[READ ERROR]";
+    std::string curSym = FormatCurrentSymbolSuffix(curPc);
+    bytes.resize(instr.length);
+
+    if (!bReadOk || !bDecodeOK) {
+        MboxSTD("Error 1 (DisassembleWithZydis)", AR_SNAME);
+        return "???";
+    }
+
+    bool bOutCondMn = false; // is cond mn
+    bool bOutInvMn = false; // is inversed mn
+    const bool bCond = ResolveFlagsConditional(instr.mnemonic, bOutCondMn, bOutInvMn);
+
+    bool bPrefix = false;
+    if (bOutCondMn) {
+        bPrefix = true;
+        if (bOutInvMn)
+            disasm += std::string(" ; (inv cond=") + (bCond ? "true" : "false") + ")";
+        else
+            disasm += std::string(" ; (cond=") + (bCond ? "true" : "false") + ")";
+    }
+
+    if (m_bLogDisasmRawBytes && bReadOk && !bytes.empty()) {
+        std::ostringstream bb;
+        if (!bPrefix) {
+            bb << " ; [";
+            bPrefix = true;
+        }
+        else
+            bb << " [";
+        for (size_t i = 0; i < bytes.size(); ++i)
+        {
+            if (i != 0)
+                bb << ' ';
+            bb << "0x" << std::hex << std::uppercase
+                << std::setw(2) << std::setfill('0')
+                << static_cast<unsigned>(bytes[i]);
+        }
+        bb << "]";
+        disasm += bb.str();
+    }
+
+    if (m_bLogDisasmSection) {
+        const std::string secName = GetSectionNameByRuntimeAddress(curPc);
+        if (!secName.empty()) {
+            if (!bPrefix) {
+                disasm += " ; (" + secName + ")";
+                bPrefix = true;
+            }
+            else
+                disasm += " (" + secName + ")";
+        }
+    }
+
+
+    std::ostringstream oss;
+    oss << "[" << formatWithSeparator(m_instrCount, m_DisasmSepGroup) << "] ";
+    //if (m_bDisasmAfterCB)
+    //    oss << "AFCB ";
+    //else
+    //    oss << "BFCB "; // -
+    if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+        oss << "0x" << std::hex << std::uppercase << (curPc - m_modStart);
+    else if (m_bDisasmRVA)
+        oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(curPc) << " ( +0x" << (curPc - m_modStart) << ")";
+    else
+        oss << "0x" << std::hex << std::uppercase << curPc;
+    oss << ": " << disasm;
+
+    std::string line = oss.str();
+
+    constexpr size_t kSymbolColumn = 70;
+    if (line.size() < kSymbolColumn) {
+        line += std::string(kSymbolColumn - line.size(), ' ');
+    }
+    else {
+        line += "  ";
+    }
+
+    if (!curSym.empty())
+        line += "; " + curSym;
+
+    if(bLog)
+        Log("%s", line.c_str());
+
+    return line;
 }
 
-void AsmRunner::DisassembleWithCapstone()
+std::string AsmRunner::DisassembleWithCapstone(bool bLog)
 {
 #ifdef CAPSTONE
     if (!m_uc) return;
@@ -1682,6 +1816,7 @@ void AsmRunner::DisassembleWithCapstone()
 #else
     Log("[DISASM] Capstone not compiled in");
 #endif
+    return "";
 }
 
 // unallocated halt can only be caught in TryResolveIpTransfer target==halt or memcb when pc==halt and UC_ERR_FETCH_UNMAPPED/UC_ERR_FETCH_PROT
@@ -2132,6 +2267,9 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
     bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
     bool isAnyFetch = (type == UC_MEM_FETCH || type == UC_MEM_FETCH_UNMAPPED || type == UC_MEM_FETCH_PROT); // code read
 
+    uintptr_t addr = static_cast<uintptr_t>(address);
+    uintptr_t sz = static_cast<uintptr_t>(size);
+
 #ifndef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
@@ -2149,6 +2287,38 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
     }
 #endif
 
+    auto makeRWHistory = [&]() -> tRWHistory
+    {
+        uintptr_t pc = CurrentPc(uc);
+        uintptr_t histVal = 0;
+
+        if (isWrite)
+        {
+            histVal = static_cast<uintptr_t>(value);
+            if (!m_bX64)
+                histVal = static_cast<uint32_t>(histVal);
+        }
+        else if (isRead)
+        {
+            // пробуем зафиксировать фактически прочитанное значение
+            // (если память доступна; если нет — останется 0)
+            (void)uc_mem_read(uc, addr, &histVal, static_cast<size_t>(sz));
+            if (!m_bX64)
+                histVal = static_cast<uint32_t>(histVal);
+        }
+
+        tRWHistory h;
+        h.pc = pc;
+        h.addr = addr;
+        h.value = histVal;
+        h.size = sz;
+        h.ic = m_instrCount;
+        h.bRead = isRead;
+        h.disasm = DisassembleWithZydis();
+
+        return h;
+    };
+
     const tDeadzoneIC* dz = GetCurrentDeadzoneIC();
     if (dz && (dz->skipAll || dz->skipMem))
     {
@@ -2163,30 +2333,29 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
         }
 
         // history
-        if (!dz->skipHistory && m_bRWHistory)
+        if (!dz->skipHistory && m_bRWHistory) {
+            m_RWHistory.push_back(makeRWHistory());
+        }
+
+        // dz trace
+        if (!dz->skipTrace && m_rttrace.inited && m_rttrace.rwhistory.bUseRWHistory)
         {
-            uintptr_t addr = static_cast<uintptr_t>(address);
-            uintptr_t sz = static_cast<uintptr_t>(size);
+            tRWHistory h = makeRWHistory();
 
-            uintptr_t pc = CurrentPc(uc);
-            uintptr_t histVal = 0;
+            m_rttrace.file << FormatRWHistoryLine(h, m_rttrace.rwhistory.bValNotice, m_rttrace.rva, m_rttrace.rwhistory.bSym, m_rttrace.rwhistory.bShortFmt, m_rttrace.rwhistory.bDisasm) << '\n';
+            if (m_rttrace.rwhistory.bDisasm && !h.disasm.empty())
+                m_rttrace.file << '\n';
 
-            if (isWrite)
+            if (m_rttrace.cb)
             {
-                histVal = static_cast<uintptr_t>(value);
-                if (!m_bX64)
-                    histVal = static_cast<uint32_t>(histVal);
+                if (!m_rttrace.cb(uc, address, size, ZYDIS_MNEMONIC_INVALID, user_data)) { // temp fast ZYDIS_MNEMONIC_INVALID, todo
+                    ShutdownByCallback(uc);
+                    return false;
+                }
+                if (ShouldStopCB(true)) {
+                    return true; // prevent notice in cb with old pc opcode
+                }
             }
-            else if (isRead)
-            {
-                // пробуем зафиксировать фактически прочитанное значение
-                // (если память доступна; если нет — останется 0)
-                (void)uc_mem_read(uc, addr, &histVal, static_cast<size_t>(sz));
-                if (!m_bX64)
-                    histVal = static_cast<uint32_t>(histVal);
-            }
-
-            m_RWHistory.push_back({ pc, addr, histVal, sz, m_instrCount, isRead });
         }
 
         return true; // dz
@@ -2219,30 +2388,30 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
         return false;
     }
 
-    uintptr_t addr = static_cast<uintptr_t>(address);
-    uintptr_t sz = static_cast<uintptr_t>(size);
+    // RW History
+    if (m_bRWHistory) {
+        m_RWHistory.push_back(makeRWHistory());
+    }
 
-    if (m_bRWHistory)
+    // Trace
+    if (m_rttrace.inited && m_rttrace.rwhistory.bUseRWHistory)
     {
-        uintptr_t pc = CurrentPc(uc);
-        uintptr_t histVal = 0;
+        tRWHistory h = makeRWHistory();
 
-        if (isWrite)
-        {
-            histVal = static_cast<uintptr_t>(value);
-            if (!m_bX64)
-                histVal = static_cast<uint32_t>(histVal);
-        }
-        else if (isRead)
-        {
-            // пробуем зафиксировать фактически прочитанное значение
-            // (если память доступна; если нет — останется 0)
-            (void)uc_mem_read(uc, addr, &histVal, static_cast<size_t>(sz));
-            if (!m_bX64)
-                histVal = static_cast<uint32_t>(histVal);
-        }
+        m_rttrace.file << FormatRWHistoryLine(h, m_rttrace.rwhistory.bValNotice, m_rttrace.rva, m_rttrace.rwhistory.bSym, m_rttrace.rwhistory.bShortFmt, m_rttrace.rwhistory.bDisasm) << '\n';
+        if (m_rttrace.rwhistory.bDisasm && !h.disasm.empty())
+            m_rttrace.file << '\n';
 
-        m_RWHistory.push_back({pc, addr, histVal, sz, m_instrCount, isRead });
+        if (m_rttrace.cb)
+        {
+            if (!m_rttrace.cb(uc, address, size, ZYDIS_MNEMONIC_INVALID, user_data)) { // temp fast ZYDIS_MNEMONIC_INVALID, todo
+                ShutdownByCallback(uc);
+                return false;
+            }
+            if (ShouldStopCB(true)) {
+                return true; // prevent notice in cb with old pc opcode
+            }
+        }
     }
 
     if (m_bLogMemRW) {
@@ -2401,8 +2570,8 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                             Log("[*] _OnAnyJmp: %zu exports", exportsENV.size());
                     }
 
-                    tIEFuncNode* pFromIATNode = FindIATNode(from);
-                    tIEFuncNode* pToIATNode = FindIATNode(to);
+                    tFuncNode* pFromIATNode = FindIATNode(from);
+                    tFuncNode* pToIATNode = FindIATNode(to);
                     tAnyJmpHookNode* pFromHNode = nullptr;
                     tAnyJmpHookNode* pToHNode = nullptr;
 
@@ -2510,8 +2679,8 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                         Log("[*] _OnAnyJmp: %zu exports", exportsENV.size());
                 }
 
-                tIEFuncNode* pFromIATNode = FindIATNode(from);
-                tIEFuncNode* pToIATNode = FindIATNode(to);
+                tFuncNode* pFromIATNode = FindIATNode(from);
+                tFuncNode* pToIATNode = FindIATNode(to);
                 tAnyJmpHookNode* pFromHNode = nullptr;
                 tAnyJmpHookNode* pToHNode = nullptr;
 
@@ -2697,8 +2866,8 @@ void AsmRunner::_OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz)
     if (sym) {
         uintptr_t rel = address;
         if (m_modStart != 0 && address >= m_modStart) rel = address - m_modStart;
-        oss << " ; " << sym->name;
-        if (rel > sym->rva) oss << "+0x" << (rel - sym->rva);
+        oss << " ; " << sym->funcName;
+        if (rel > sym->funcRva) oss << "+0x" << (rel - sym->funcRva);
     }
 
     oss << " ; sz=" << std::dec << sz;
@@ -2779,7 +2948,7 @@ std::string AsmRunner::PrintPtrAsciiTag(uintptr_t v, size_t width, bool bDec, bo
     return oss.str();
 }
 
-std::string AsmRunner::PrintHexOnly(uintptr_t v, bool bDec)
+std::string AsmRunner::PrintValue(uintptr_t v, bool bDec)
 {
     std::ostringstream oss;
     if (bDec)
@@ -3654,7 +3823,7 @@ std::string AsmRunner::GetModuleName(HMODULE hMod)
     return std::string(path);
 }
 
-void AsmRunner::AddExportsFromModule(HMODULE hMod, std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo)
+void AsmRunner::AddExportsFromModule(HMODULE hMod, std::map<uintptr_t, tFuncNode>& addrToInfo, uintptr_t nMaxSize)
 {
     MODULEINFO mi = { 0 };
     if (!GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi)))
@@ -3721,12 +3890,42 @@ void AsmRunner::AddExportsFromModule(HMODULE hMod, std::unordered_map<uintptr_t,
 
         if (addrToInfo.find(addr) == addrToInfo.end())
         {
-            addrToInfo[addr] = { moduleName, funcName, moduleBase, rva };
+            tFuncNode n;
+            n.moduleName = moduleName;
+            n.funcName = funcName;
+            n.moduleBase = moduleBase;
+            n.funcRva = rva;
+            n.funcSize = 0;
+            addrToInfo[addr] = std::move(n);
+            //addrToInfo.emplace(addr, std::move(n));
         }
+    }
+
+    std::vector<uintptr_t> sortedAddrs;
+    sortedAddrs.reserve(exp->NumberOfFunctions);
+
+    for (const auto& pair : addrToInfo)
+    {
+        if (pair.second.moduleBase == moduleBase)
+            sortedAddrs.push_back(pair.first);
+    }
+
+    std::sort(sortedAddrs.begin(), sortedAddrs.end());
+
+    for (size_t i = 0; i < sortedAddrs.size(); ++i)
+    {
+        uintptr_t currAddr = sortedAddrs[i];
+
+        if (i + 1 < sortedAddrs.size())
+            addrToInfo[currAddr].funcSize = sortedAddrs[i + 1] - currAddr;
+        else
+            addrToInfo[currAddr].funcSize = (moduleBase + mi.SizeOfImage) - currAddr;
+        if (nMaxSize > 0 && addrToInfo[currAddr].funcSize > nMaxSize)
+            addrToInfo[currAddr].funcSize = nMaxSize;
     }
 }
 
-void AsmRunner::CollectAllExports(std::unordered_map<uintptr_t, tIEFuncNode>& addrToInfo)
+void AsmRunner::CollectAllExports(std::map<uintptr_t, tFuncNode>& addrToInfo, uintptr_t nMaxSize)
 {
     HMODULE mods[1024] = { 0 };
     DWORD needed = 0;
@@ -3736,7 +3935,7 @@ void AsmRunner::CollectAllExports(std::unordered_map<uintptr_t, tIEFuncNode>& ad
 
     size_t count = needed / sizeof(HMODULE);
     for (size_t i = 0; i < count; ++i)
-        AddExportsFromModule(mods[i], addrToInfo);
+        AddExportsFromModule(mods[i], addrToInfo, nMaxSize);
 }
 
 void AsmRunner::DataToHexString(int indent, uintptr_t startAddr, const uint8_t* data, size_t size, std::string* output)
@@ -4425,35 +4624,35 @@ bool AsmRunner::IsNTMemoryReadable(uintptr_t address, uintptr_t size)
     return false;
 }
 
-uintptr_t AsmRunner::AddMemory(uintptr_t nSize, uint32_t nType)
+uintptr_t AsmRunner::AddMemory(uintptr_t nSize, uint32_t nType, bool bAlign)
 {
     if (!m_uc || nSize == 0) return 0;
-    uintptr_t sz = AlignUp(nSize, 0x1000);
-    uintptr_t addr = AlignUp(m_allocCursor, 0x1000);
+    uintptr_t sz = bAlign ? AlignUp(nSize, 0x1000) : nSize;
+    uintptr_t addr = bAlign ? AlignUp(m_allocCursor, 0x1000) : m_allocCursor;
     if (uc_mem_map(m_uc, addr, sz, nType) != UC_ERR_OK) return 0;
     m_allocCursor = addr + sz;
     return addr;
 }
 
-uintptr_t AsmRunner::AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType)
+uintptr_t AsmRunner::AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType, bool bAlign)
 {
-    uintptr_t addr = AddMemory(nSize, nType);
+    uintptr_t addr = AddMemory(nSize, nType, bAlign);
     if (addr && nSize) {
         uc_mem_write(m_uc, addr, reinterpret_cast<void*>(pFrom), nSize);
     }
     return addr;
 }
 
-bool AsmRunner::AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType)
+bool AsmRunner::AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType, bool bAlign)
 {
     if (!m_uc || !pVTo || !nSize) return false;
 #if 1
-    uintptr_t mapSize = AlignUp(nSize, 0x1000);
+    uintptr_t mapSize = bAlign ? AlignUp(nSize, 0x1000) : nSize;
     uc_mem_map(m_uc, pVTo, mapSize, nType);
 #else
     const uintptr_t pageSize = 0x1000;
-    const uintptr_t base = AlignDown(pVTo, pageSize);
-    const uintptr_t end = AlignUp(pVTo + nSize, pageSize);
+    const uintptr_t base = bAlign ? AlignDown(pVTo, pageSize) : pVTo;
+    const uintptr_t end = bAlign ? AlignUp(pVTo + nSize, pageSize) : (pVTo + nSize);
     const uintptr_t mapSize = end - base;
 
     uc_err err = uc_mem_map(m_uc, base, mapSize, nType);
@@ -4468,12 +4667,12 @@ bool AsmRunner::AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType)
     return true;
 }
 
-bool AsmRunner::AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType)
+bool AsmRunner::AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType, bool bAlign)
 {
     if (!m_uc || !pVTo || !pFrom || !nSize) return false;
-    //uintptr_t mapSize = AlignUp(nSize, 0x1000);
+    //uintptr_t mapSize = bAlign ? AlignUp(nSize, 0x1000) : nSize;
     //uc_mem_map(m_uc, pVTo, mapSize, nType);
-    bool bRes = AddMemoryTo(pVTo, nSize, nType);
+    bool bRes = AddMemoryTo(pVTo, nSize, nType, bAlign);
     if(bRes)
         uc_mem_write(m_uc, pVTo, reinterpret_cast<void*>(pFrom), nSize);
     return bRes;
@@ -4626,7 +4825,7 @@ uintptr_t AsmRunner::DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize)
 uintptr_t AsmRunner::DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize)
 {
     if (!m_uc || !pStart || !nSize) return 0;
-    uintptr_t addr = AddMemory(nSize, UC_PROT_ALL);
+    uintptr_t addr = AddMemory(nSize, UC_PROT_ALL, true);
     if (!addr) return 0;
     if (uc_mem_write(m_uc, addr, reinterpret_cast<void*>(pStart), nSize) != UC_ERR_OK) {
         uc_mem_unmap(m_uc, addr, AlignUp(nSize, 0x1000));
@@ -5624,7 +5823,7 @@ void AsmRunner::SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModul
                 {
                     if (bRIMEscapeHook)
                     {
-                        tIEFuncNode fakeWrapperNode;
+                        tFuncNode fakeWrapperNode;
                         fakeWrapperNode.moduleName = GetModuleName((HMODULE)m_modStart);
                         fakeWrapperNode.funcName = "fake_" + itEsc->second.funcName;
                         fakeWrapperNode.moduleBase = m_modStart;
@@ -5703,7 +5902,7 @@ bool AsmRunner::SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv)
         return false;
     }
 
-    std::unordered_map<uintptr_t, tIEFuncNode> localExports;
+    std::map<uintptr_t, tFuncNode> localExports;
     CollectAllExports(localExports);
 
     if (bRecaptureEnv)
@@ -5722,24 +5921,25 @@ bool AsmRunner::SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv)
         return false;
     }
 
-    std::vector<std::pair<uintptr_t, tIEFuncNode>> items;
+    std::vector<std::pair<uintptr_t, tFuncNode>> items;
     items.reserve(localExports.size());
 
     for (const auto& kv : localExports)
         items.push_back(kv);
 
     std::sort(items.begin(), items.end(),
-        [](const std::pair<uintptr_t, tIEFuncNode>& a, const std::pair<uintptr_t, tIEFuncNode>& b)
+        [](const std::pair<uintptr_t, tFuncNode>& a, const std::pair<uintptr_t, tFuncNode>& b)
         {
             return a.first < b.first;
         });
 
     for (const auto& kv : items)
     {
-        const tIEFuncNode& n = kv.second;
+        const tFuncNode& n = kv.second;
 
         f << "0x" << std::hex << std::uppercase << static_cast<uintptr_t>(n.moduleBase)
             << " 0x" << std::hex << std::uppercase << static_cast<uintptr_t>(n.funcRva)
+            << " 0x" << std::hex << std::uppercase << static_cast<uintptr_t>(n.funcSize)
             << " " << n.funcName
             << " " << n.moduleName
             << "\n";
@@ -5760,7 +5960,7 @@ bool AsmRunner::SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv)
     return true;
 }
 
-bool AsmRunner::LoadIATEnv(const char* szIATEnvFile)
+bool AsmRunner::LoadIATEnv(const char* szIATEnvFile, uintptr_t nMaxSize)
 {
     if (!szIATEnvFile || !*szIATEnvFile)
     {
@@ -5794,9 +5994,9 @@ bool AsmRunner::LoadIATEnv(const char* szIATEnvFile)
             continue;
 
         std::istringstream iss(line);
-        std::string sBase, sRva;
+        std::string sBase, sRva, sSize;
 
-        if (!(iss >> sBase >> sRva))
+        if (!(iss >> sBase >> sRva >> sSize))
             continue;
 
         std::vector<std::string> tail;
@@ -5819,18 +6019,26 @@ bool AsmRunner::LoadIATEnv(const char* szIATEnvFile)
 
         uintptr_t moduleBase = 0;
         uintptr_t funcRva = 0;
+        uintptr_t funcSize = 0;
 
-        if (!ParseHexPtr(sBase, moduleBase) || !ParseHexPtr(sRva, funcRva))
+        if (!ParseHexPtr(sBase, moduleBase) || !ParseHexPtr(sRva, funcRva) || !ParseHexPtr(sSize, funcSize))
             continue;
 
         if (funcName.empty() || moduleName.empty())
             continue;
 
-        tIEFuncNode n;
+        tFuncNode n;
         n.moduleName = std::move(moduleName);
         n.funcName = std::move(funcName);
         n.moduleBase = moduleBase;
         n.funcRva = funcRva;
+        n.funcSize = funcSize;
+        if (nMaxSize > 0 && funcSize > nMaxSize) {
+            n.funcSize = nMaxSize;
+
+            if (m_bLogRunner)
+                Log("[*] LoadIATEnv Limit: %s from 0x%p to 0x%p", n.GetAbsoluteName().c_str(), funcSize, nMaxSize);
+        }
 
         exportsENV[n.GetAbsolute()] = std::move(n);
         ++okCount;
@@ -5842,7 +6050,7 @@ bool AsmRunner::LoadIATEnv(const char* szIATEnvFile)
     return true;
 }
 
-tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
+tFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
 {
     if (bRVA) {
         for (auto& e : exportsENV) {
@@ -5858,7 +6066,7 @@ tIEFuncNode* AsmRunner::FindIATNode(uintptr_t pAddr, bool bRVA)
     return nullptr;
 }
 
-tIEFuncNode* AsmRunner::FindIATNode(std::string funcName, std::string moduleName, bool bLowerCmp, bool bContains)
+tFuncNode* AsmRunner::FindIATNode(std::string funcName, std::string moduleName, bool bLowerCmp, bool bContains)
 {
     std::string searchFunc = funcName;
     std::string searchModule = moduleName;
@@ -6059,14 +6267,14 @@ uintptr_t AsmRunner::CopyModule(const char* szModule, uintptr_t nSize)
         Log("[%s] base=0x%p end=0x%p size=0x%zx", szModule, (void*)pStart, (void*)pEnd, (size_t)iSize);
 
     uintptr_t copySize = (nSize == 0) ? iSize : nSize;
-    if (!CopyModule(pStart, pStart, copySize)) { // emuTo, ntFrom, size
+    if (!CopyModule(pStart, pStart, copySize, std::string(szModule))) { // emuTo, ntFrom, size
         return 0;
     }
 
     return pStart;
 }
 
-bool AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize) // pFrom as hModule
+bool AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize, std::string sModName) // pFrom as hModule
 {
     if (!pFrom || nSize == 0) {
         if (m_bLogRunner)
@@ -6082,10 +6290,10 @@ bool AsmRunner::CopyModule(uintptr_t pFrom, uintptr_t nSize) // pFrom as hModule
             Log("IMAGE_NT_HEADERS: 0x%zx", nSize);
     }
 
-    return CopyModule(pFrom, pFrom, nSize); // emuTo, ntFrom, size
+    return CopyModule(pFrom, pFrom, nSize, sModName); // emuTo, ntFrom, size
 }
 
-bool AsmRunner::CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
+bool AsmRunner::CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, std::string sModName)
 {
     if (!pVTo || !pFrom || nSize == 0) {
         if (m_bLogRunner)
@@ -6101,8 +6309,14 @@ bool AsmRunner::CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
         return false;
     }
 
+    m_modName = sModName;
     m_modStart = pVTo;
     m_modEnd = pVTo + nSize;
+
+    for (tFuncNode& node : m_sym) {
+        node.moduleName = m_modName;
+        node.moduleBase = m_modStart; // when sym was loaded before module
+    }
 
     if (m_bLogRunner)
     {
@@ -6115,7 +6329,7 @@ bool AsmRunner::CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize)
     return true;
 }
 
-void AsmRunner::LoadModule(const char* szModule)
+void AsmRunner::LoadModule(const char* szModule) // wrapper
 {
     CopyModule(szModule, 0);
 }
@@ -6291,15 +6505,17 @@ bool AsmRunner::LoadExportsFromBase(uintptr_t base, std::vector<tFuncNode>& out)
             if (!nm || !*nm) continue;
 
             tFuncNode n;
-            n.rva = static_cast<uintptr_t>(rva);
-            n.size = 0;
-            n.name = nm;
+            n.funcRva = static_cast<uintptr_t>(rva);
+            n.funcSize = 0;
+            n.funcName = nm;
+            n.moduleBase = m_modStart;
+            n.moduleName = "";
             out.push_back(n);
         }
     }
     //__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 
-    std::sort(out.begin(), out.end(), [](const tFuncNode& a, const tFuncNode& b) { return a.rva < b.rva; });
+    std::sort(out.begin(), out.end(), [](const tFuncNode& a, const tFuncNode& b) { return a.funcRva < b.funcRva; });
     return !out.empty();
 }
 
@@ -6328,7 +6544,7 @@ tFuncNode AsmRunner::GetModuleExport(const char* szModule, const char* szExportN
     if (!LoadExportsFromBase(base, exps)) return empty;
 
     for (size_t i = 0; i < exps.size(); ++i) {
-        if (_stricmp(exps[i].name.c_str(), szExportName) == 0) {
+        if (_stricmp(exps[i].funcName.c_str(), szExportName) == 0) {
             return exps[i];
         }
     }
@@ -6357,10 +6573,47 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool
     m_rttrace.cb = cb;
     m_rttrace.rva = bRVA;
 
+    m_rttrace.rwhistory.bUseRWHistory = false;
+    m_rttrace.rwhistory.bRead = false;
+    m_rttrace.rwhistory.bWrite = false;
+    m_rttrace.rwhistory.bValNotice = false;
+    m_rttrace.rwhistory.bSym = false;
+    m_rttrace.rwhistory.bShortFmt = false;
+    m_rttrace.rwhistory.bDisasm = false;
+
     if (m_bLogRunner) {
         Log("[*] PC trace opened: %s", szPCTraceFileOutPath);
         Log("[*] PC trace mode: %s%s", bRVA ? "RVA" : "PC", (bRVA && pASLR) ? " + custom ASLR" : "");
     }
+
+    m_rttrace.inited = true;
+}
+
+//AsmRunner::SetPCTraceFull(
+//    "trace.log",           // szPCTraceFileOutPath
+//    nullptr,               // cb - OnOpcodeCb // \default/
+//    true,                  // bRVA
+//    0,                     // pASLR
+//    0,                     // nICOffset
+//    0,                     // nAnyJmpMode
+//    true,                  // bRead
+//    true,                  // bWrite
+//    true,                  // bValNotice
+//    true,                  // bSym
+//    false,                 // bShortFmt
+//    true                   // bDisasm
+//);
+void AsmRunner::SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset, uint32_t nAnyJmpMode,
+    bool bRead, bool bWrite, bool bValNotice, bool bSym, bool bShortFmt, bool bDisasm)
+{
+    SetPCTrace(szPCTraceFileOutPath, cb, bRVA, pASLR, nICOffset, nAnyJmpMode);
+    m_rttrace.rwhistory.bUseRWHistory = true;
+    m_rttrace.rwhistory.bRead = bRead;
+    m_rttrace.rwhistory.bWrite = bWrite;
+    m_rttrace.rwhistory.bValNotice = bValNotice;
+    m_rttrace.rwhistory.bSym = bSym;
+    m_rttrace.rwhistory.bShortFmt = bShortFmt;
+    m_rttrace.rwhistory.bDisasm = bDisasm;
 
     m_rttrace.inited = true;
 }
@@ -6815,15 +7068,19 @@ void AsmRunner::DumpRegisters(bool bFull)
         const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000); // 0x00200000
         const bool isStack = IsInAddr(v, stackLow, stackHigh);
         const bool hasDref = readPtr(v, dref);
+        tFuncNode* sym = FindSymbolByRuntime(v); // iat and symmap
 
-        if (FindIATNode(v)) { // can have dummy memory for hooks in uc
+        /*if (FindIATNode(v)) { // can have dummy memory for hooks in uc
             printf(" <- regptr iat %s", FindIATNode(v)->GetAbsoluteName().c_str());
         }
-        else if (isStack && hasDref) {
+        else*/ if (isStack && hasDref) {
             printf(" <- regptr to stack %s", valueTag(dref, true).c_str());
         }
         else if (isStack && !hasDref) { // when is it? can't read value at stack range?
             printf(" <- regptr to stack [ERROR]");
+        }
+        else if (sym) { // can have dummy memory for hooks in uc
+            printf(" <- regptr sym %s", sym->GetAbsoluteName().c_str());
         }
         else if (hasDref) {
             printf(" <- regptr to mem %s", valueTag(dref, true).c_str());
@@ -6849,9 +7106,9 @@ void AsmRunner::DumpRegisters(bool bFull)
         printReg(m_bX64 ? "RIP" : "EIP", pc);
     } else { // short fmt
         printf("=== REGISTERS ===\n");
-        printf("EAX/RAX=%s EBX/RBX=%s ECX/RCX=%s EDX/RDX=%s\n", PrintHexOnly(ax).c_str(), PrintHexOnly(bx).c_str(), PrintHexOnly(cx).c_str(), PrintHexOnly(dx).c_str());
-        printf("ESI/RSI=%s EDI/RDI=%s ESP/RSP=%s EBP/RBP=%s\n", PrintHexOnly(si).c_str(), PrintHexOnly(di).c_str(), PrintHexOnly(sp).c_str(), PrintHexOnly(bp).c_str());
-        printf("%s=%s\n", m_bX64 ? "RIP" : "EIP", PrintHexOnly(pc).c_str());
+        printf("EAX/RAX=%s EBX/RBX=%s ECX/RCX=%s EDX/RDX=%s\n", PrintValue(ax).c_str(), PrintValue(bx).c_str(), PrintValue(cx).c_str(), PrintValue(dx).c_str());
+        printf("ESI/RSI=%s EDI/RDI=%s ESP/RSP=%s EBP/RBP=%s\n", PrintValue(si).c_str(), PrintValue(di).c_str(), PrintValue(sp).c_str(), PrintValue(bp).c_str());
+        printf("%s=%s\n", m_bX64 ? "RIP" : "EIP", PrintValue(pc).c_str());
     }
 }
 
@@ -7032,15 +7289,19 @@ void AsmRunner::DumpStack(intptr_t nCount, bool bValNotice)
             uintptr_t dref = 0;
             const bool isStack = IsInAddr(val, stackLow, stackHigh);
             const bool hasDref = readPtr(val, dref);
+            tFuncNode* sym = FindSymbolByRuntime(val); // iat and symmap
 
-            if (FindIATNode(val)) { // can have dummy memory for hooks in uc
+            /*if (FindIATNode(val)) { // can have dummy memory for hooks in uc
                 printf(" <- valptr iat %s", FindIATNode(val)->GetAbsoluteName().c_str());
             }
-            else if (isStack && hasDref) {
+            else*/ if (isStack && hasDref) {
                 printf(" <- valptr to stack %s", valueTag(dref, true).c_str());
             }
             else if (isStack && !hasDref) { // when is it? can't read value at stack range?
                 printf(" <- valptr to stack [ERROR]");
+            }
+            else if (sym) { // can have dummy memory for hooks in uc
+                printf(" <- valptr sym %s", sym->GetAbsoluteName().c_str());
             }
             else if (hasDref) {
                 //printf(" <- possible memptr %s", valueTag(dref, true).c_str());
@@ -7058,7 +7319,160 @@ void AsmRunner::DumpStack(intptr_t nCount, bool bValNotice)
     }
 }
 
-void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt)
+std::string AsmRunner::FormatRWHistoryLine(const AsmRunner::tRWHistory& h, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt, bool bDisasm)
+{
+    const uintptr_t stackLow = m_stackBase;
+    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
+
+    auto valueTag = [&](uintptr_t v, bool bDec) -> std::string
+    {
+        std::ostringstream s;
+        s << "[value " << PrintPtrAsciiTag(v, PointerSize(), bDec) << "]";
+        return s.str();
+    };
+
+    auto readPtr = [&](uintptr_t addr, uintptr_t& out) -> bool
+    {
+        out = 0;
+        if (!m_uc)
+            return false;
+
+        if (IsInAddr(addr, m_fsBase, m_fsBase + m_fsSize)) // skip fake tid
+            return false;
+
+        if (uc_mem_read(m_uc, addr, &out, static_cast<size_t>(PointerSize())) != UC_ERR_OK)
+            return false;
+
+        if (!m_bX64)
+            out = static_cast<uint32_t>(out);
+
+        return true;
+    };
+
+    uintptr_t adref = 0;
+    uintptr_t vdref = 0;
+
+    //tFuncNode* pVIatNode = FindIATNode(h.value);
+    const bool isStackAddr = IsInAddr(h.addr, stackLow, stackHigh); // isStack операнд лежит в стеке
+    const bool isStackValueAddr = IsInAddr(h.value, stackLow, stackHigh); // isStack операнд указывает на стеке
+    const bool bIsMemPtr = (!isStackValueAddr && m_uc && h.size == PointerSize() && readPtr(h.value, vdref));
+    tFuncNode* SymAddr = FindSymbolByRuntime(h.addr); // iat and symmap
+    tFuncNode* SymVal = FindSymbolByRuntime(h.value); // iat and symmap
+
+    // h.addr указатель, возможно на стек // то что где мы читали писали
+    // h.value операнд истории, возможно указатель на стек или на память если читается
+
+    std::ostringstream oss;
+
+    if (bShortFmt)
+    {
+        // 10 77777777 W 0x17854123 0x123   0x233564546 0x10 16 '.' 1  // N IC RW PC PCRVA DATAPTR DATA16 DATA10 DATAASCII SIZE10
+        // 12 93017871 R 0x629FA0B1 0x1AFA0B1 0x1EBE64  0x20000000 536870912 '... ' 4
+        //oss << n << " " << h.ic << " " << (h.bRead ? 'R' : 'W') << " ";
+        //oss << n << " " << formatWithSeparator(h.ic, m_DisasmSepGroup) << " " << (h.bRead ? 'R' : 'W') << " ";
+        oss << formatWithSeparator(h.ic, m_DisasmSepGroup) << " " << (h.bRead ? 'R' : 'W') << " ";
+
+        if (bRVA)
+        {
+            if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                oss << "0x" << std::hex << std::uppercase << (h.pc - m_modStart) << " ";
+            else if (m_bDisasmRVA)
+                oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " 0x" << (h.pc - m_modStart) << " ";
+            else
+                oss << "0x" << std::hex << std::uppercase << h.pc << " ";
+        }
+        else
+            oss << "0x" << std::hex << std::uppercase << h.pc << " ";
+
+        oss << "0x" << std::hex << std::uppercase << h.addr << " ";
+
+        if (/*pVIatNode ||*/ SymVal || isStackValueAddr || bIsMemPtr)
+            oss << PrintValue(h.value) << " "; // don't print dec and ascii for pointers
+        else
+            oss << PrintPtrAsciiTag(h.value, PointerSize(), true, false) << " ";
+
+        oss << std::dec << h.size;
+    }
+    else
+    {
+        if (bDisasm && !h.disasm.empty())
+            oss << h.disasm << "\n";
+
+        //oss << "[" << n << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
+        //oss << "[" << n << "] [" << formatWithSeparator(h.ic, m_DisasmSepGroup) << "] " << (h.bRead ? 'R' : 'W') << "  ";
+        oss << "[" << formatWithSeparator(h.ic, m_DisasmSepGroup) << "] " << (h.bRead ? 'R' : 'W') << "  ";
+
+        if (bRVA)
+        {
+            if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
+                oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
+            else if (m_bDisasmRVA)
+                oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
+            else
+                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+        }
+        else
+            oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
+
+        oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
+
+        if (/*pVIatNode ||*/ SymVal || isStackValueAddr || bIsMemPtr)
+            oss << " value " << PrintValue(h.value); // don't print dec and ascii for pointers
+        else
+            oss << " value " << PrintPtrAsciiTag(h.value, PointerSize(), true);
+
+        oss << " size: " << std::dec << h.size;
+
+        if (bValNotice)
+        {
+            // метка характеристики где лежали данные
+            if (isStackAddr) {
+                //if (readPtr(h.addr, adref))
+                //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
+                //else // when is it? error
+                oss << " <- haddr to stack"; // h.addr просто лежит в стеке
+            }
+            else if (SymAddr) { // can have dummy memory for hooks in uc
+                oss << " <- haddr sym " << SymAddr->GetAbsoluteName();
+            }
+            else {
+                //oss << " <- haddr to mem"; // и так работаем с памятью в history
+            }
+
+            // метка характеристики самих данных которые читали
+            /*if (pVIatNode) { // can have dummy memory for hooks in uc
+                oss << " <- hvalptr iat " << pVIatNode->GetAbsoluteName();
+            }
+            else*/ if (isStackValueAddr) {
+            //uintptr_t vdref = 0;
+            //if (readPtr(h.value, vdref))
+            //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
+            //else // when is it? error
+                oss << " <- hvalptr to stack";
+            }
+            else if (SymVal) { // can have dummy memory for hooks in uc
+                oss << " <- hvalptr sym " << SymVal->GetAbsoluteName();
+            }
+            else if (bIsMemPtr) { // не в диапазоне стека, возможно указатель на память
+                oss << " <- hvalptr to mem, now its" << valueTag(vdref, true);
+            }
+            else {
+                //oss << " <- data"; // и так лог памяти, по умолчанию data
+            }
+
+            // символ pc
+            if (bSym && IsSymMapInitialised()) {
+                std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
+                if (!sAddr.empty())
+                    oss << " (PC " << sAddr << ")";
+            }
+        }
+    }
+
+    return oss.str();
+}
+
+void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt, bool bDisasm)
 {
     if (m_RWHistory.empty())
     {
@@ -7083,34 +7497,6 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
             end = total;
         }
     }
-
-    const uintptr_t stackLow = m_stackBase;
-    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
-
-    auto valueTag = [&](uintptr_t v, bool bDec) -> std::string
-    {
-        std::ostringstream s;
-        s << "[value " << PrintPtrAsciiTag(v, PointerSize(), bDec) << "]";
-        return s.str();
-    };
-
-    auto readPtr = [&](uintptr_t addr, uintptr_t& out) -> bool
-    {
-        out = 0;
-        if (!m_uc)
-            return false;
-
-        if(IsInAddr(addr, m_fsBase, m_fsBase + m_fsSize)) // skip fake tid
-            return false;
-
-        if (uc_mem_read(m_uc, addr, &out, static_cast<size_t>(PointerSize())) != UC_ERR_OK)
-            return false;
-
-        if (!m_bX64)
-            out = static_cast<uint32_t>(out);
-
-        return true;
-    };
 
 #ifdef _WIN32
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -7145,104 +7531,6 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
         if ((h.bRead && !bRead) || (!h.bRead && !bWrite))
             continue;
 
-        uintptr_t adref = 0;
-        uintptr_t vdref = 0;
-
-        tIEFuncNode* pVIatNode = FindIATNode(h.value);
-        const bool isStackAddr = IsInAddr(h.addr, stackLow, stackHigh); // isStack операнд лежит в стеке
-        const bool isStackValueAddr = IsInAddr(h.value, stackLow, stackHigh); // isStack операнд указывает на стеке
-        const bool bIsMemPtr = (!isStackValueAddr && m_uc && h.size == PointerSize() && readPtr(h.value, vdref));
-
-        // h.addr указатель, возможно на стек // то что где мы читали писали
-        // h.value операнд истории, возможно указатель на стек или на память если читается
-
-        std::ostringstream oss;
-        if (bShortFmt)
-        {
-            // 10 77777777 W 0x17854123 0x123   0x233564546 0x10 16 '.' 1  // N IC RW PC PCRVA DATAPTR DATA16 DATA10 DATAASCII SIZE10
-            // 12 93017871 R 0x629FA0B1 0x1AFA0B1 0x1EBE64  0x20000000 536870912 '... ' 4
-            oss << i << " " << h.ic << " " << (h.bRead ? 'R' : 'W') << " ";
-            if (bRVA)
-            {
-                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
-                    oss << "0x" << std::hex << std::uppercase << (h.pc - m_modStart) << " ";
-                else if (m_bDisasmRVA)
-                    oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " 0x" << (h.pc - m_modStart) << " ";
-                else
-                    oss << "0x" << std::hex << std::uppercase << h.pc << " ";
-            }
-            else
-                oss << "0x" << std::hex << std::uppercase << h.pc << " ";
-
-            oss << "0x" << std::hex << std::uppercase << h.addr << " ";
-            if (pVIatNode || isStackValueAddr || bIsMemPtr)
-                oss << PrintHexOnly(h.value) << " "; // don't print dec and ascii for pointers
-            else
-                oss << PrintPtrAsciiTag(h.value, PointerSize(), true, false) << " ";
-            oss << std::dec << h.size;
-        }
-        else
-        {
-            oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
-            if (bRVA)
-            {
-                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
-                    oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
-                else if (m_bDisasmRVA)
-                    oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
-                else
-                    oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
-            }
-            else
-                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
-
-            oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
-            if (pVIatNode || isStackValueAddr || bIsMemPtr)
-                oss << " value " << PrintHexOnly(h.value); // don't print dec and ascii for pointers
-            else
-                oss << " value " << PrintPtrAsciiTag(h.value, PointerSize(), true);
-            oss << " size: " << std::dec << h.size;
-
-            if (bValNotice)
-            {
-                // метка характеристики где лежали данные
-                if (isStackAddr) {
-                    //if (readPtr(h.addr, adref))
-                    //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
-                    //else // when is it? error
-                    oss << " <- haddr to stack"; // h.addr просто лежит в стеке
-                }
-                else {
-                    //oss << " <- haddr to mem"; // и так работаем с памятью в history
-                }
-
-                // метка характеристики самих данных которые читали
-                if (pVIatNode) { // can have dummy memory for hooks in uc
-                    oss << " <- hvalptr iat " << pVIatNode->GetAbsoluteName();
-                }
-                else if (isStackValueAddr) {
-                    //uintptr_t vdref = 0;
-                    //if (readPtr(h.value, vdref))
-                    //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
-                    //else // when is it? error
-                    oss << " <- hvalptr to stack";
-                }
-                else if (bIsMemPtr) { // не в диапазоне стека, возможно указатель на память
-                    oss << " <- hvalptr to mem, now its" << valueTag(vdref, true);
-                }
-                else {
-                    //oss << " <- data"; // и так лог памяти, по умолчанию data
-                }
-
-                // символ pc
-                if (bSym && IsSymMapInitialised()) {
-                    std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
-                    if (!sAddr.empty())
-                        oss << " (PC " << sAddr << ")";
-                }
-            }
-        }
-
 #ifdef _WIN32
         if (h.bRead)
         {
@@ -7258,14 +7546,16 @@ void AsmRunner::DumpRWHistory(uintptr_t nLimSize, bool bStartLim, bool bRead, bo
         }
 #endif
 
-        Log("%s", oss.str().c_str());
+        Log("[%d] %s", i, FormatRWHistoryLine(h, bValNotice, bRVA, bSym, bShortFmt, bDisasm).c_str());
+        if (bDisasm && !h.disasm.empty())
+            Log(""); // \n
         resetColor();
     }
 
     resetColor();
 }
 
-void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt)
+void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bStartLim, bool bRead, bool bWrite, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt, bool bDisasm)
 {
     if (m_RWHistory.empty())
     {
@@ -7308,139 +7598,15 @@ void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bS
         }
     }
 
-    const uintptr_t stackLow = m_stackBase;
-    const uintptr_t stackHigh = m_stackBase + AlignUp(m_stackSize, 0x1000);
-
-    auto valueTag = [&](uintptr_t v, bool bDec) -> std::string
-    {
-        std::ostringstream s;
-        s << "[value " << PrintPtrAsciiTag(v, PointerSize(), bDec) << "]";
-        return s.str();
-    };
-
-    auto readPtr = [&](uintptr_t addr, uintptr_t& out) -> bool
-    {
-        out = 0;
-        if (!m_uc)
-            return false;
-
-        if (IsInAddr(addr, m_fsBase, m_fsBase + m_fsSize)) // skip fake tid
-            return false;
-
-        if (uc_mem_read(m_uc, addr, &out, static_cast<size_t>(PointerSize())) != UC_ERR_OK)
-            return false;
-
-        if (!m_bX64)
-            out = static_cast<uint32_t>(out);
-
-        return true;
-    };
-
     for (size_t i = begin; i < end; ++i)
     {
         const auto& h = m_RWHistory[i];
         if ((h.bRead && !bRead) || (!h.bRead && !bWrite))
             continue;
 
-        uintptr_t adref = 0;
-        uintptr_t vdref = 0;
-
-        tIEFuncNode* pVIatNode = FindIATNode(h.value);
-        const bool isStackAddr = IsInAddr(h.addr, stackLow, stackHigh); // isStack операнд лежит в стеке
-        const bool isStackValueAddr = IsInAddr(h.value, stackLow, stackHigh); // isStack операнд указывает на стеке
-        const bool bIsMemPtr = (!isStackValueAddr && m_uc && h.size == PointerSize() && readPtr(h.value, vdref));
-
-        // h.addr указатель, возможно на стек // то что где мы читали писали
-        // h.value операнд истории, возможно указатель на стек или на память если читается
-
-        std::ostringstream oss;
-        if (bShortFmt)
-        {
-            // 10 77777777 W 0x17854123 0x123   0x233564546 0x10 16 '.' 1  // N IC RW PC PCRVA DATAPTR DATA16 DATA10 DATAASCII SIZE10
-            // 12 93017871 R 0x629FA0B1 0x1AFA0B1 0x1EBE64  0x20000000 536870912 '... ' 4
-            oss << i << " " << h.ic << " " << (h.bRead ? 'R' : 'W') << " ";
-            if (bRVA)
-            {
-                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
-                    oss << "0x" << std::hex << std::uppercase << (h.pc - m_modStart) << " ";
-                else if (m_bDisasmRVA)
-                    oss << "0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " 0x" << (h.pc - m_modStart) << " ";
-                else
-                    oss << "0x" << std::hex << std::uppercase << h.pc << " ";
-            }
-            else
-                oss << "0x" << std::hex << std::uppercase << h.pc << " ";
-
-            oss << "0x" << std::hex << std::uppercase << h.addr << " ";
-            if (pVIatNode || isStackValueAddr || bIsMemPtr)
-                oss << PrintHexOnly(h.value) << " "; // don't print dec and ascii for pointers
-            else
-                oss << PrintPtrAsciiTag(h.value, PointerSize(), true, false) << " ";
-            oss << std::dec << h.size;
-        }
-        else
-        {
-            oss << "[" << i << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
-            if (bRVA)
-            {
-                if (m_bDisasmRVA && m_DisasmCustomASLR == 0)
-                    oss << "PC 0x" << std::hex << std::uppercase << (h.pc - m_modStart) << ": ";
-                else if (m_bDisasmRVA)
-                    oss << "PC 0x" << std::hex << std::uppercase << CalcWithCASLR(h.pc) << " ( +0x" << (h.pc - m_modStart) << "): ";
-                else
-                    oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
-            }
-            else
-                oss << "PC 0x" << std::hex << std::uppercase << h.pc << ": ";
-
-            oss << "MEM 0x" << std::hex << std::uppercase << h.addr << " ->";
-            if (pVIatNode || isStackValueAddr || bIsMemPtr)
-                oss << " value " << PrintHexOnly(h.value); // don't print dec and ascii for pointers
-            else
-                oss << " value " << PrintPtrAsciiTag(h.value, PointerSize(), true);
-            oss << " size: " << std::dec << h.size;
-
-            if (bValNotice)
-            {
-                // метка характеристики где лежали данные
-                if (isStackAddr) {
-                    //if (readPtr(h.addr, adref))
-                    //    oss << " <- haddr to stack, now its" << valueTag(adref); // h.addr лежит в стеке а там указатель да ещё и рабочий, читаем
-                    //else // when is it? error
-                    oss << " <- haddr to stack"; // h.addr просто лежит в стеке
-                }
-                else {
-                    //oss << " <- haddr to mem"; // и так работаем с памятью в history
-                }
-
-                // метка характеристики самих данных которые читали
-                if (pVIatNode) { // can have dummy memory for hooks in uc
-                    oss << " <- hvalptr iat " << pVIatNode->GetAbsoluteName();
-                }
-                else if (isStackValueAddr) {
-                    //uintptr_t vdref = 0;
-                    //if (readPtr(h.value, vdref))
-                    //    oss << " <- hvalptr to stack, now its" << valueTag(vdref);
-                    //else // when is it? error
-                    oss << " <- hvalptr to stack";
-                }
-                else if (bIsMemPtr) { // не в диапазоне стека, возможно указатель на память
-                    oss << " <- hvalptr to mem, now its" << valueTag(vdref, true);
-                }
-                else {
-                    //oss << " <- data"; // и так лог памяти, по умолчанию data
-                }
-
-                // символ pc
-                if (bSym && IsSymMapInitialised()) {
-                    std::string sAddr = FormatCurrentSymbolSuffix(h.pc);
-                    if (!sAddr.empty())
-                        oss << " (PC " << sAddr << ")";
-                }
-            }
-        }
-
-        out << oss.str() << '\n';
+        out << "[" << i << "] " << FormatRWHistoryLine(h, bValNotice, bRVA, bSym, bShortFmt, bDisasm) << '\n';
+        if (bDisasm && !h.disasm.empty())
+            out << '\n';
     }
 }
 
@@ -7519,7 +7685,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
                 allocated = 0;
             }
             else {
-                allocated = self->AddMemory(dwSize, UC_PROT_ALL);
+                allocated = self->AddMemory(dwSize, UC_PROT_ALL, true);
                 if (!allocated)
                 {
                     printf("[VirtualAlloc] AddMemory failed for size 0x%p\n", (void*)dwSize);
@@ -7904,8 +8070,38 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
             return true;
         }, this, bBefore, false, FindIATNode("HeapFree", "kernel32.dll")->GetAbsoluteName());
 
-    // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
+    SetAnyJmpHook(FindIATNode("GetCurrentProcess", "kernel32.dll")->GetAbsolute(),
+        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
+            ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+        {
+            cb(FindIATNode("GetCurrentProcess", "kernel32.dll"));
 
+            auto* self = static_cast<AsmRunner*>(user_data);
+            if (!self)
+                return true;
+
+            uintptr_t retaddr = 0;
+
+            if (bBefore)
+                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+            else if (!self->StackPop(retaddr))
+                return false;
+
+#ifdef _WIN64
+            constexpr uintptr_t hProcess = static_cast<uintptr_t>(-1ll);
+#else
+            constexpr uintptr_t hProcess = static_cast<uintptr_t>(0xFFFFFFFFu);
+#endif
+
+            printf("[GetCurrentProcess] -> HANDLE=0x%p\n", (void*)hProcess);
+
+            self->SetRegister(self->AxReg(), hProcess);
+            self->UpdatePC(retaddr, true);
+
+            return true;
+        }, this, bBefore, false, FindIATNode("GetCurrentProcess", "kernel32.dll")->GetAbsoluteName());
+    
+    // TODO: SleepEx, NtDelayExecution, WaitForSingleObject
 
 
     // ntdll.dll
@@ -8159,7 +8355,7 @@ void AsmRunner::InstallDefaultHooks(HookNotifyCb cb)
 
             if (dwBytes != 0)
             {
-                result = self->AddMemory(dwBytes, UC_PROT_ALL);
+                result = self->AddMemory(dwBytes, UC_PROT_ALL, true);
 
                 if ((dwFlags & HEAP_ZERO_MEMORY) && result)
                 {
@@ -8539,7 +8735,7 @@ void AsmRunner::InitialiseSymMap(const char* szPath, uintptr_t nSymASLR)
 
     std::ifstream f(szPath);
     if (!f.is_open()) {
-        Log("[!] Не удалось открыть map: %s", szPath);
+        Log("[!] Can't open map: %s", szPath);
         return;
     }
 
@@ -8565,29 +8761,30 @@ void AsmRunner::InitialiseSymMap(const char* szPath, uintptr_t nSymASLR)
         ParseHexPtr(sSize, sizeVal);
 
         tFuncNode e;
-        e.rva = ptr - nSymASLR;
-        e.size = static_cast<size_t>(sizeVal);
-        e.name = sName;
+        e.funcRva = ptr - nSymASLR;
+        e.funcSize = sizeVal;
+        e.funcName = sName;
+        e.moduleBase = m_modStart; // can be 0 when load sym before module
+        e.moduleName = m_modName; // can be "" when load sym before module
         m_sym.push_back(e);
     }
 
-    std::sort(m_sym.begin(), m_sym.end(), [](const tFuncNode& a, const tFuncNode& b) { return a.rva < b.rva; });
+    std::sort(m_sym.begin(), m_sym.end(), [](const tFuncNode& a, const tFuncNode& b) { return a.funcRva < b.funcRva; });
     Log("[+] loaded symbols: %zu", m_sym.size());
 }
 
-tFuncNode AsmRunner::GetSymByName(const char* szName)
+tFuncNode* AsmRunner::GetSymByName(const char* szName)
 {
-    if (!szName || !*szName) return tFuncNode{};
+    if (!szName || !*szName) return nullptr;
     for (size_t i = 0; i < m_sym.size(); ++i) {
-        if (_stricmp(m_sym[i].name.c_str(), szName) == 0) return m_sym[i];
+        if (_stricmp(m_sym[i].funcName.c_str(), szName) == 0) return &m_sym[i];
     }
-    return tFuncNode{};
+    return nullptr;
 }
 
-tFuncNode AsmRunner::GetSymByAddr(uintptr_t pAddr)
+tFuncNode* AsmRunner::GetSymByAddr(uintptr_t pAddr) // wrapper
 {
-    const tFuncNode* s = FindSymbolByRuntime(pAddr);
-    return s ? *s : tFuncNode{};
+    return FindSymbolByRuntime(pAddr);
 }
 
 void AsmRunner::SetBreakpointCode(uintptr_t pAddr, OnOpcodeCb cb, void* data, uint32_t size)
@@ -12223,7 +12420,7 @@ void VMTEST(int a1)
             return false; // halt exit
         }, &runner);
 
-    AsmRunner::HookNotifyCb hcb = [&](tIEFuncNode* pNode) {
+    AsmRunner::HookNotifyCb hcb = [&](tFuncNode* pNode) {
         //MboxSTD("hook call " + pNode->GetAbsoluteName(), "hook");
     };
 
@@ -12473,7 +12670,7 @@ void VMTEST(int a1)
         //printf("JmpCb 0x%p %d\n", (void*)to, mnemonic);
 
         if (!self->IsPCNormal(to)) {
-            tIEFuncNode* pNode = self->FindIATNode(to); // nullable
+            tFuncNode* pNode = self->FindIATNode(to); // nullable
 
             printf("JmpCb 0x%p %d %s\n", (void*)to, mnemonic, pNode ? pNode->GetAbsoluteName().c_str() : "");
             MboxSTD("module escape", "asm runner");
@@ -12553,7 +12750,7 @@ void VMTEST(int a1)
 
             printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
-            tIEFuncNode* pNode = self->FindIATNode(to);
+            tFuncNode* pNode = self->FindIATNode(to);
             if (pNode)
                 printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
 
@@ -12631,7 +12828,7 @@ void VMTEST(int a1)
             printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
 
-            tIEFuncNode* pNode = self->FindIATNode(to);
+            tFuncNode* pNode = self->FindIATNode(to);
             if (pNode)
                 printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
 
@@ -12913,7 +13110,7 @@ void VMTEST(int a1)
 
             printf("[hook] pMalloc hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
-            tIEFuncNode* pNode = self->FindIATNode(to);
+            tFuncNode* pNode = self->FindIATNode(to);
             if (pNode)
                 printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
 
@@ -12976,7 +13173,7 @@ void VMTEST(int a1)
             printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
 
-            tIEFuncNode* pNode = self->FindIATNode(to);
+            tFuncNode* pNode = self->FindIATNode(to);
             if (pNode)
                 printf("hit %s %s\n", pNode->funcName.c_str(), pNode->moduleName.c_str());
 
