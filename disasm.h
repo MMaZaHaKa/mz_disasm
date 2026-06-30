@@ -603,7 +603,7 @@ public:
 		return s;
 	}
 
-	private:
+private:
 	// состояние трасировки Tenet
 	struct tTraceState
 	{
@@ -811,7 +811,7 @@ public:
 	std::map<uintptr_t, tBpInfo> m_breakpoints;
 	bool m_bUsingBp = false;
 	bool m_bUsingBpCodeSizeRange = false;
-	public:
+
 	tTraceState m_trace; // separate run
 	tRTTrace m_rttrace; // default
 
