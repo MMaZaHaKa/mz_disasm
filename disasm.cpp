@@ -6554,7 +6554,7 @@ tFuncNode AsmRunner::GetModuleExport(const char* szModule, const char* szExportN
 
 void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset, uint32_t nAnyJmpMode)
 {
-    if (!szPCTraceFileOutPath || !*szPCTraceFileOutPath) return;
+    if (!szPCTraceFileOutPath || !*szPCTraceFileOutPath || m_rttrace.inited) return;
 
     if (m_rttrace.file.is_open())
         m_rttrace.file.close();
@@ -6606,6 +6606,7 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool
 void AsmRunner::SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset, uint32_t nAnyJmpMode,
     bool bRead, bool bWrite, bool bValNotice, bool bSym, bool bShortFmt, bool bDisasm)
 {
+    if (m_rttrace.inited) return;
     SetPCTrace(szPCTraceFileOutPath, cb, bRVA, pASLR, nICOffset, nAnyJmpMode);
     m_rttrace.rwhistory.bUseRWHistory = true;
     m_rttrace.rwhistory.bRead = bRead;
