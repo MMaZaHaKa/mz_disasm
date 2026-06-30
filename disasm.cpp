@@ -37,6 +37,8 @@ static constexpr bool kBuild64 = false;
 
 AsmRunner::AsmRunner(bool bX64)
 {
+    Shutdown();
+
     //m_bX64 = (sizeof(void*) == 8);
     //m_bX64 = kBuild64;
     m_bX64 = bX64;
@@ -1341,6 +1343,7 @@ void AsmRunner::Shutdown()
     m_rttrace.anyjmpmode = 0;
     m_rttrace.cb = nullptr;
     m_rttrace.rva = false;
+    m_rttrace.disasm = false;
     m_rttrace.inited = false;
     m_rttrace.rwhistory.bUseRWHistory = false;
     m_rttrace.rwhistory.bRead = false;
@@ -1964,7 +1967,12 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             if (m_rttrace.aslr != 0)
                 outPc = curPc - m_modStart + m_rttrace.aslr;
 
-            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+            if (m_rttrace.disasm) {
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << ' ' << DisassembleWithZydis() << '\n';
+            }
+            else {
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+            }
 
             if (m_rttrace.cb)
             {
@@ -2088,7 +2096,13 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             outPc = curPc - m_modStart;
         if (m_rttrace.aslr != 0)
             outPc = curPc - m_modStart + m_rttrace.aslr;
-        m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+
+        if (m_rttrace.disasm) {
+            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << ' ' << DisassembleWithZydis() << '\n';
+        }
+        else {
+            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+        }
 
         if (m_rttrace.cb)
         {
@@ -2343,8 +2357,8 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
             tRWHistory h = makeRWHistory();
 
             m_rttrace.file << FormatRWHistoryLine(h, m_rttrace.rwhistory.bValNotice, m_rttrace.rva, m_rttrace.rwhistory.bSym, m_rttrace.rwhistory.bShortFmt, m_rttrace.rwhistory.bDisasm) << '\n';
-            if (m_rttrace.rwhistory.bDisasm && !h.disasm.empty())
-                m_rttrace.file << '\n';
+            //if (m_rttrace.rwhistory.bDisasm && !h.disasm.empty())
+            //    m_rttrace.file << '\n';
 
             if (m_rttrace.cb)
             {
@@ -2399,8 +2413,8 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
         tRWHistory h = makeRWHistory();
 
         m_rttrace.file << FormatRWHistoryLine(h, m_rttrace.rwhistory.bValNotice, m_rttrace.rva, m_rttrace.rwhistory.bSym, m_rttrace.rwhistory.bShortFmt, m_rttrace.rwhistory.bDisasm) << '\n';
-        if (m_rttrace.rwhistory.bDisasm && !h.disasm.empty())
-            m_rttrace.file << '\n';
+        //if (m_rttrace.rwhistory.bDisasm && !h.disasm.empty())
+        //    m_rttrace.file << '\n';
 
         if (m_rttrace.cb)
         {
@@ -2534,17 +2548,19 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                 outTo = to - m_modStart + m_rttrace.aslr;
             }
 
+            std::string dis = m_rttrace.disasm ? (" " + DisassembleWithZydis()) : "";
+
             if (m_rttrace.anyjmpmode == 1) { // from
                 if (IsInAddr(from, GetModStart(), GetModEnd()))
-                    m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << dis << '\n';
                 else
-                    m_rttrace.file << "0x" << std::hex << std::uppercase << from << '\n'; // skip wrong module rva
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << from << dis << '\n'; // skip wrong module rva
             }
             else if (m_rttrace.anyjmpmode == 2) { // to
                 if (IsInAddr(to, GetModStart(), GetModEnd()))
-                    m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << '\n';
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << outTo << dis << '\n';
                 else
-                    m_rttrace.file << "0x" << std::hex << std::uppercase << to << '\n'; // skip wrong module rva
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << to << dis << '\n'; // skip wrong module rva
             }
             else { // full
                 std::string condStr = "";
@@ -2586,7 +2602,8 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                     }
 
                     // Base
-                    m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr;
+                    //m_rttrace.file << std::dec << m_instrCount << " " << AnyIpTransferTag(mnemonic) << condStr;
+                    m_rttrace.file << std::dec << formatWithSeparator(m_instrCount, m_DisasmSepGroup) << " " << AnyIpTransferTag(mnemonic) << condStr;
 
                     // From
                     if (!bFromInMdl && (pFromIATNode || pFromHNode)) { // !bFromInMdl, fake rva
@@ -2608,7 +2625,7 @@ bool AsmRunner::_OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t 
                     else // default or cant find node info
                         m_rttrace.file << " T 0x" << std::hex << std::uppercase << (bToInMdl ? outTo : to);
 
-                    m_rttrace.file << sTransit << '\n';
+                    m_rttrace.file << sTransit << dis << '\n';
                 }
             }
 
@@ -6552,9 +6569,19 @@ tFuncNode AsmRunner::GetModuleExport(const char* szModule, const char* szExportN
     return empty;
 }
 
-void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset, uint32_t nAnyJmpMode)
+void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset, uint32_t nAnyJmpMode, bool bDisasm)
 {
-    if (!szPCTraceFileOutPath || !*szPCTraceFileOutPath || m_rttrace.inited) return;
+    if (!szPCTraceFileOutPath || !*szPCTraceFileOutPath) {
+        if (m_bLogRunner)
+            Log("[!] SetPCTrace: invalid file path");
+        return;
+    }
+
+    if (m_rttrace.inited) {
+        if (m_bLogRunner)
+            Log("[!] SetPCTrace: trace already initialized");
+        return;
+    }
 
     if (m_rttrace.file.is_open())
         m_rttrace.file.close();
@@ -6572,6 +6599,7 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool
     m_rttrace.anyjmpmode = nAnyJmpMode;
     m_rttrace.cb = cb;
     m_rttrace.rva = bRVA;
+    m_rttrace.disasm = bDisasm;
 
     m_rttrace.rwhistory.bUseRWHistory = false;
     m_rttrace.rwhistory.bRead = false;
@@ -6596,25 +6624,31 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool
 //    0,                     // pASLR
 //    0,                     // nICOffset
 //    0,                     // nAnyJmpMode
+//    true                   // bDisasm
 //    true,                  // bRead
 //    true,                  // bWrite
 //    true,                  // bValNotice
 //    true,                  // bSym
 //    false,                 // bShortFmt
-//    true                   // bDisasm
+//    true,                  // bDisasmRW
 //);
 void AsmRunner::SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool bRVA, uintptr_t pASLR, uintptr_t nICOffset, uint32_t nAnyJmpMode,
-    bool bRead, bool bWrite, bool bValNotice, bool bSym, bool bShortFmt, bool bDisasm)
+    bool bDisasm, bool bRead, bool bWrite, bool bValNotice, bool bSym, bool bShortFmt, bool bDisasmRW)
 {
-    if (m_rttrace.inited) return;
-    SetPCTrace(szPCTraceFileOutPath, cb, bRVA, pASLR, nICOffset, nAnyJmpMode);
+    if (m_rttrace.inited) {
+        if (m_bLogRunner)
+            Log("[!] SetPCTraceFull: trace already initialized");
+        return;
+    }
+
+    SetPCTrace(szPCTraceFileOutPath, cb, bRVA, pASLR, nICOffset, nAnyJmpMode, bDisasm);
     m_rttrace.rwhistory.bUseRWHistory = true;
     m_rttrace.rwhistory.bRead = bRead;
     m_rttrace.rwhistory.bWrite = bWrite;
     m_rttrace.rwhistory.bValNotice = bValNotice;
     m_rttrace.rwhistory.bSym = bSym;
     m_rttrace.rwhistory.bShortFmt = bShortFmt;
-    m_rttrace.rwhistory.bDisasm = bDisasm;
+    m_rttrace.rwhistory.bDisasm = bDisasmRW;
 
     m_rttrace.inited = true;
 }
@@ -6886,6 +6920,79 @@ void AsmRunner::ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, b
     }
 
     restoreColor();
+}
+
+bool AsmRunner::CompressDiffs(std::vector<std::string> files, std::string outFile)
+{
+    if (files.empty() || outFile.empty())
+    {
+        if (m_bLogRunner)
+            Log("[!] CompressDiffs: invalid arguments");
+        return false;
+    }
+
+    auto Load = [](const std::string& path, std::vector<std::string>& lines) -> bool
+    {
+        std::ifstream f(path);
+        if (!f)
+            return false;
+
+        std::string s;
+        while (std::getline(f, s))
+            lines.emplace_back(std::move(s));
+        return true;
+    };
+
+    std::vector<std::vector<std::string>> traces(files.size());
+    size_t minLines = SIZE_MAX;
+
+    for (size_t i = 0; i < files.size(); ++i)
+    {
+        if (!Load(files[i], traces[i]))
+        {
+            if (m_bLogRunner)
+                Log("[!] CompressDiffs: failed to load '%s'", files[i].c_str());
+            return false;
+        }
+
+        minLines = std::min(minLines, traces[i].size());
+    }
+
+    FILE* out = FileOpen(outFile.c_str(), "wb");
+    if (!out)
+    {
+        if (m_bLogRunner)
+            Log("[!] CompressDiffs: failed to create '%s'", outFile.c_str());
+        return false;
+    }
+
+    for (size_t line = 0; line < minLines; ++line)
+    {
+        bool diff = false;
+        for (size_t i = 1; i < traces.size(); ++i)
+        {
+            if (traces[i][line] != traces[0][line])
+            {
+                diff = true;
+                break;
+            }
+        }
+
+        if (!diff)
+            continue;
+
+        for (size_t i = 0; i < traces.size(); ++i)
+            FileAdd(out, "[%zu:%c]%s", line + 1, 'A' + (char)i, traces[i][line].c_str());
+
+        FileAdd(out, "");
+    }
+
+    FileClose(out);
+
+    if (m_bLogRunner)
+        Log("[*] CompressDiffs done");
+
+    return true;
 }
 
 void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
@@ -7396,9 +7503,6 @@ std::string AsmRunner::FormatRWHistoryLine(const AsmRunner::tRWHistory& h, bool 
     }
     else
     {
-        if (bDisasm && !h.disasm.empty())
-            oss << h.disasm << "\n";
-
         //oss << "[" << n << "] [" << h.ic << "] " << (h.bRead ? 'R' : 'W') << "  ";
         //oss << "[" << n << "] [" << formatWithSeparator(h.ic, m_DisasmSepGroup) << "] " << (h.bRead ? 'R' : 'W') << "  ";
         oss << "[" << formatWithSeparator(h.ic, m_DisasmSepGroup) << "] " << (h.bRead ? 'R' : 'W') << "  ";
@@ -7468,6 +7572,9 @@ std::string AsmRunner::FormatRWHistoryLine(const AsmRunner::tRWHistory& h, bool 
                     oss << " (PC " << sAddr << ")";
             }
         }
+
+        if (bDisasm && !h.disasm.empty())
+            oss << " " << h.disasm;
     }
 
     return oss.str();

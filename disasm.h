@@ -376,10 +376,11 @@ public:
 	void AddExecRegion(uintptr_t pStart, uintptr_t pEnd);
 	std::vector<tFuncNode> GetModuleExports();
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
-	void SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0);
-	void SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0,
-		bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bSym = true, bool bShortFmt = false, bool bDisasm = true);
+	void SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0, bool bDisasm = true);
+	void SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0, bool bDisasm = true,
+		bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bSym = true, bool bShortFmt = false, bool bDisasmRW = true);
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
+	bool CompressDiffs(std::vector<std::string> files, std::string outFile);
 	void Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
 	void Pause();
 	void Resume();
@@ -654,6 +655,7 @@ public:
 		uint32_t anyjmpmode; // 0 disable(default full trace), 1 ajfrom, 2 ajto, 3 ajfull
 		OnOpcodeCb cb;
 		bool rva;
+		bool disasm;
 		bool inited;
 
 		struct tRWHistoryArgs
@@ -809,7 +811,7 @@ public:
 	std::map<uintptr_t, tBpInfo> m_breakpoints;
 	bool m_bUsingBp = false;
 	bool m_bUsingBpCodeSizeRange = false;
-
+	public:
 	tTraceState m_trace; // separate run
 	tRTTrace m_rttrace; // default
 
