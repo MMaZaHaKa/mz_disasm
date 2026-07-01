@@ -1367,6 +1367,11 @@ void AsmRunner::Shutdown()
     m_insnHooks.clear();
     m_sections.clear();
     m_FlsSlots.clear();
+#ifdef AR_DFT
+    m_dataTraces.clear();
+    m_nextDataTraceId = 1;
+    m_pendingAfterNodes.clear();
+#endif
 }
 
 void AsmRunner::ShutdownByCallback(uc_engine* uc)
