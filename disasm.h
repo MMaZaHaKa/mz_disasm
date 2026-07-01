@@ -24,6 +24,7 @@
 #define AR_HALT_ADDR_ONLY // fast + correct halt shutdown log, the rest is neat (unmapped execute)
 //#define AR_BP_AFTER_DZ // faster dz
 //#define AR_BP_RANGE // size or range
+#define AR_DFT // BPF verifier per-register parent pointers bpf_reg_state // Data Flow Tracing, Taint Tracking Data Tracking
 
 // windows header hell kek
 #undef CopyMemory
@@ -31,12 +32,14 @@
 #undef max
 
 // TODO: normal seh+frame unwind MSR_FS_BASE, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb, cb UC_HOOK_INSN, UC_HOOK_INTR, cb on register change?, trace deadzone?
+// символьное исполнение LLVM Guided Symbolic Evaluation + BPF verifier per-register parent pointers bpf_reg_state // Data Flow Tracing, Taint Tracking Data Tracking
 // UC bugs: 1 can't set fs: but res ok, 2 update pc + emu_stop() can't stop emu
 // все хуки в Unicorn по умолчанию являются pre-hooks, Разработчики обсуждали добавление пост-хуков, но столкнулись с техническими сложностями из-за JIT-компиляции (особенно с повторяющимися инструкциями вроде REP STOS) .
 // Поэтому официально реализованы только pre-hooks.
 
 #include <vector>
-#include <map>
+#include <map> // X_bound
+#include <unordered_map> // unsorted
 #include <functional>
 #include <fstream>
 #include <iostream>
@@ -47,7 +50,8 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
-#include <unordered_map>
+#include <set>
+#include <memory>
 
 #define ARP(p) ((uintptr_t)p)
 #define ARV(p) ((void*)p)
@@ -114,6 +118,16 @@ struct tFuncNode
 
 	inline uintptr_t GetAbsolute() { return moduleBase + funcRva; }
 	inline std::string GetAbsoluteName() { return funcName + " " + moduleName; }
+};
+
+struct tRange
+{
+	uintptr_t start;
+	uintptr_t end;
+	bool sExcl;
+	bool eExcl;
+	tRange() { start = 0; end = 0; sExcl = false; eExcl = true; }
+	tRange(uintptr_t Start, uintptr_t End) { start = Start; end = End; sExcl = false; eExcl = true; }
 };
 
 enum eBpType : uint32_t
@@ -185,10 +199,14 @@ public:
 	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
 	uintptr_t GetModStart() const { return m_modStart; }
 	uintptr_t GetModEnd() const { return m_modEnd; }
-	uintptr_t GetStackStart() const { return m_stackBase; } // ebp
-	uintptr_t GetStackEnd() const { return m_stackBase + m_stackSize; } // esp
+	uintptr_t GetStackStart() const { return m_stackBase; } // esp, меньший адрес, начало памяти, логический конец стека, push уменшает esp
+	uintptr_t GetStackEnd() const { return m_stackBase + m_stackSize; } // ebp, больший адрес, конец памяти, логическое начало стека
+	uintptr_t GetStackMinAddrBP() const { return GetStackStart(); } // wrapper
+	uintptr_t GetStackMaxAddrSP() const { return GetStackEnd(); } // wrapper
 	uintptr_t GetFSTEBStart() const { return m_fsBase; }
 	uintptr_t GetFSTEBEnd() const { return m_fsBase + m_fsSize; }
+	bool IsStackAddr(uintptr_t p) { return IsInAddr(p, GetStackStart(), GetStackEnd()); }
+	bool IsTEBAddr(uintptr_t p) { return IsInAddr(p, GetFSTEBStart(), GetFSTEBEnd()); }
 	void SetFSTEBLastError(uintptr_t lastError) { m_fsLastError = lastError; }
 	uintptr_t GetFSTEBLastError() const { return m_fsLastError; }
 	uint64_t GetInstructionsPerSecond() const { return m_instructionsPerSecond; }
@@ -203,6 +221,7 @@ public:
 	void ShutdownByHalt(uc_engine* uc);
 	uc_engine* GetCTX();
 	uintptr_t GetInstructionCount() const { return m_instrCount; }
+	void hleEatInsN(intptr_t n) { m_instrCount += n; } // hleEatMicro, use it for module hooks so as not to shift the IC hooks
 
 	// tools
 	static inline uintptr_t AlignUp(uintptr_t x, uintptr_t a) { return (x + a - 1) & ~(a - 1); }
@@ -366,6 +385,7 @@ public:
 	void SetCallbacks(OnOpcodeCb opcode_cb = nullptr, void* opcode_data = nullptr,
 		OnMemCb mem_cb = nullptr, void* mem_data = nullptr,
 		OnJmpCb jmp_cb = nullptr, void* jmp_data = nullptr); // default AsmRunner hooks with disasm bDisasm, after user cb call // +other cbs
+	void SetMemoryRangeCB(tRange r, OnMemCb mem_cb, void* mem_data); // you can use default OnMemCb and filter, or this SetMemoryRangeCB
 	void SetICCallback(uintptr_t nIC, OnOpcodeCb opcode_cb, void* opcode_data);
 	uintptr_t CopyModule(const char* szModule, uintptr_t nSize = 0); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename)
 	bool CopyModule(uintptr_t pFrom, uintptr_t nSize = 0, std::string sModName = ""); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
@@ -491,6 +511,104 @@ public:
 	tMemSnapshot MakeSnapshot(uintptr_t pStart, uintptr_t pEnd);
 	tMemSnapshot MakeSnapshotS(uintptr_t pStart, uintptr_t nSize);
 	void CompareSnapshots(const tMemSnapshot& a, const tMemSnapshot& b, bool bDiffOnly = true);
+
+#ifdef AR_DFT
+	// One node in the data-flow tracking tree.
+	// Each node = state of a tracked operand after the instruction stored in `disasm`.
+	// Root node has no instruction (initial tracking start).
+	struct tDataTraceNode
+	{
+		tDataTraceNode* parent = nullptr;
+		std::vector<tDataTraceNode*> children;
+
+		enum class eKind : uint8_t { Reg, Mem } kind = eKind::Reg;
+		ZydisRegister reg = ZYDIS_REGISTER_NONE; // canonical; valid when kind==Reg
+		uintptr_t     ptr = 0;                   // base address;  valid when kind==Mem
+		uint32_t      opSz = 0;                   // operand size in bytes
+
+		// instruction that created/modified this node
+		std::string disasm;
+		uintptr_t   instrAddr = 0;
+		uint64_t    ic = 0;
+
+		// value of the operand before / after the instruction
+		uintptr_t            valBefore = 0;
+		uintptr_t            valAfter = 0;
+		std::vector<uint8_t> dataBytesBefore; // raw mem bytes (Mem kind)
+		std::vector<uint8_t> dataBytesAfter;  // raw mem bytes (Mem kind)
+
+		bool bActive = true;  // false = invalidated or replaced by a child
+		bool bNeedAfter = false; // true  = valAfter not yet filled (filled next step)
+	};
+
+	using DataTraceHandle = uint32_t;
+
+	// Comparator used by SaveDataTrace for filtering branches.
+	using DTCompCB = std::function<bool(const tDataTraceNode*)>;
+
+	struct tDataTrace
+	{
+		DataTraceHandle id = 0;
+		bool            active = false;
+		std::vector<std::unique_ptr<tDataTraceNode>> pool; // owns all nodes
+		tDataTraceNode* root = nullptr;
+		std::vector<tDataTraceNode*> activeLeaves; // currently monitored leaves
+	};
+
+	// Resolved operand used during _OnOpcodeOperands dispatch
+	struct tDTResolvedOp
+	{
+		ZydisOperandType type = ZYDIS_OPERAND_TYPE_UNUSED;
+		ZydisRegister    reg = ZYDIS_REGISTER_NONE; // canonical
+		uintptr_t        addr = 0;                   // effective address (Mem)
+		uint32_t         sz = 0;                   // size in bytes
+		uintptr_t        val = 0;                   // current value (before exec)
+		std::vector<uint8_t> bytes;                  // raw bytes (Mem)
+	};
+
+	// Data trace build a data-flow tree from a seed register or memory region.
+	// Each branch in the tree is one propagation path of the original value.
+	DataTraceHandle StartDataTrace(uint32_t reg);                  // ZydisRegister seed
+	DataTraceHandle StartDataTrace(uintptr_t ptr, uintptr_t size); // memory seed
+	// Save every branch as a separate file inside `dir` (created if absent).
+	void SaveDataTrace(DataTraceHandle h, const char* dir);
+	// Save only branches that satisfy `cb`; cb==null saves all.
+	// bEndsWith=false: any node in the path matches cb save branch
+	// bEndsWith=true : only the last node (leaf) matches save branch
+	void SaveDataTrace(DataTraceHandle h, const char* dir, DTCompCB cb, bool bEndsWith);
+	void RemoveDataTrace(DataTraceHandle h);
+	// TODO: проверить eaxnode nKey = *(pStaticSbox + eaxnode) станет ли nKey node !!!!!!!!!!!!!!
+
+
+	// data trace helpers
+	inline ZydisRegister _CanonicalReg(ZydisRegister reg) const {
+		return ZydisRegisterGetLargestEnclosing(m_bX64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32, reg);
+	}
+	// Called once per instruction step for any active DataTrace.
+	// dst/src are resolved visible operands; instr/operands needed for addr-index heuristic.
+	void _OnOpcodeOperands(uc_engine* uc, uintptr_t curPc, uint64_t ic,
+		const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* operands,
+		const std::vector<tDTResolvedOp>& dst, const std::vector<tDTResolvedOp>& src,
+		const std::string& disasm);
+	// Fill valAfter for all nodes that were created in the previous step.
+	void _FillPendingAfterValues(uc_engine* uc);
+	// Read the current value (and optionally raw bytes) of a node's operand.
+	bool _ReadNodeCurrentValue(uc_engine* uc, const tDataTraceNode* node,
+		uintptr_t& outVal, std::vector<uint8_t>* outBytes = nullptr) const;
+	// Allocate a new node, add it to the pool, and wire parent link.
+	tDataTraceNode* _AllocNode(tDataTrace& dt, tDataTraceNode* parent);
+	// Recursively collect root leaf paths.
+	static void _CollectBranches(tDataTraceNode* node,
+		std::vector<tDataTraceNode*>& cur,
+		std::vector<std::vector<tDataTraceNode*>>& out);
+	// Write one branch path to an open file.
+	void _SaveBranch(FILE* f, const std::vector<tDataTraceNode*>& path) const;
+	tDataTrace* _FindDataTrace(DataTraceHandle h);
+
+	std::vector<tDataTrace> m_dataTraces;
+	uint32_t m_nextDataTraceId = 1;
+	std::vector<tDataTraceNode*> m_pendingAfterNodes; // nodes awaiting valAfter fill
+#endif
 
 	// Others
 	struct tScanPatternNode
@@ -727,6 +845,12 @@ private:
 		bool executable = false;
 	};
 
+	struct tMemoryRange
+	{
+		tRange range;
+		OnMemCb cbMem;
+		void* cbMemData = nullptr;
+	};
 
 	uc_engine* m_uc = nullptr;
 	bool m_bInitialised = false;
@@ -814,6 +938,9 @@ private:
 
 	tTraceState m_trace; // separate run
 	tRTTrace m_rttrace; // default
+
+	std::vector<tMemoryRange> m_memoryRangeCB;
+	bool m_bUsingMemoryRangeCB = false;
 
 #ifdef AR_IDA_WS
 	tIdaWsBridge m_ws;
