@@ -1,5 +1,6 @@
 #ifdef _WIN32 // AR_IDA_WS
 #define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "Ws2_32.lib")
@@ -1149,6 +1150,7 @@ bool AsmRunner::CopyModuleUC(uintptr_t real_base, uintptr_t emu_base, uintptr_t 
             Log("[!] Memory mapping error: %s", uc_strerror(err));
         return false;
     }
+    m_memMap[emu_base] = { mapSize, UC_PROT_ALL };
 
     err = uc_mem_write(m_uc, emu_base, reinterpret_cast<void*>(real_base), size);
     if (err != UC_ERR_OK) {
@@ -1262,6 +1264,7 @@ void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, boo
         SetFakeSehTeb();
         SetStack();
 #endif
+        //InitialiseSegmentRegisters();
     }
 
     m_bInitialised = true;
@@ -1269,6 +1272,10 @@ void AsmRunner::Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, boo
     m_bStopped = false;
     m_instrCount = 0;
     m_allocCursor = m_allocBase;
+
+#ifdef AR_NTCORE_PATCH
+    //InstallDangerNativeCoreFixes();
+#endif
 
     if (m_bLogRunner) {
         Log("[*] AsmRunner initialised (%s)", m_bX64 ? "x64" : "x86");
@@ -1312,6 +1319,7 @@ void AsmRunner::Shutdown()
     m_bInitialised = false;
     m_bPaused = false;
     m_bStopped = false;
+    m_memMap.clear();
     m_breakpoints.clear();
     m_bUsingBp = false;
     m_bUsingBpCodeSizeRange = false;
@@ -1327,6 +1335,10 @@ void AsmRunner::Shutdown()
     exportsENV.clear();
     m_bInitIAT = false;
     m_bSkipCBCallsWithNewPC = false;
+    m_bRequestShutdown = false;
+#ifdef AR_NTCORE_PATCH
+    m_bNativeCorePatchInstalled = false;
+#endif
     m_iatStart = 0;
     m_iatEnd = 0;
     m_cbIATCall = nullptr;
@@ -1850,6 +1862,12 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
 #endif
     };
 
+    //if (m_bRequestShutdown) {
+    //    ShutdownByCallback(uc);
+    //    m_bRequestShutdown = false;
+    //    return;
+    //}
+
 #ifndef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
     {
@@ -1894,8 +1912,15 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
             std::string disasm = bReadOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, &instr, operands, bDecodeOK) : "[READ ERROR]";
             std::string curSym = FormatCurrentSymbolSuffix(curPc);
 
-            if (!bReadOk || !bDecodeOK)
-                MboxSTD("Error 1 (OnInstructionStep)", AR_SNAME);
+            if (!bReadOk || !bDecodeOK) {
+                DumpMemory(address, size);
+                if (m_bLogRunner) {
+                    Log("AsmRunner::_OnInstructionStep(0x%p, 0x%p, 0x%p, 0x%p), bReadOk %d, bDecodeOK %d", uc, (void*)address, size, user_data, bReadOk, bDecodeOK);
+                }
+                MboxSTD(!bReadOk ? "Error 1 (!bReadOk OnInstructionStep)" : "Error 1 (!bDecodeOK OnInstructionStep)", AR_SNAME);
+                ShutdownByHalt(uc);
+                return;
+            }
 
             bool bOutCondMn = false; // is cond mn
             bool bOutInvMn = false; // is inversed mn
@@ -2055,8 +2080,15 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     std::string disasm = bReadOk ? MakeDisasmLine(bytes.data(), bytes.size(), curPc, &instr, operands, bDecodeOK) : "[READ ERROR]";
     std::string curSym = FormatCurrentSymbolSuffix(curPc);
 
-    if(!bReadOk || !bDecodeOK)
-        MboxSTD("Error 1 (OnInstructionStep)", AR_SNAME);
+    if (!bReadOk || !bDecodeOK) {
+        DumpMemory(address, size);
+        if (m_bLogRunner) {
+            Log("AsmRunner::_OnInstructionStep(0x%p, 0x%p, 0x%X, 0x%p), bReadOk %d, bDecodeOK %d", uc, (void*)address, size, user_data, bReadOk, bDecodeOK);
+        }
+        MboxSTD(!bReadOk ? "Error 1 (!bReadOk OnInstructionStep)" : "Error 1 (!bDecodeOK OnInstructionStep)", AR_SNAME);
+        ShutdownByHalt(uc);
+        return;
+    }
 
 #ifdef AR_DFT
     if (!m_dataTraces.empty() && bDecodeOK)
@@ -2344,6 +2376,24 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 
     uintptr_t addr = static_cast<uintptr_t>(address);
     uintptr_t sz = static_cast<uintptr_t>(size);
+
+    //#ifdef AR_TRY_FIX_TCG
+    //    uc_ctl(uc, UC_CTL_TB_FLUSH);
+    //    uc_ctl(uc, UC_CTL_TB_REMOVE_CACHE, m_modStart, m_modEnd);
+    //    uc_ctl(uc, UC_CTL_TB_FLUSH, 0);
+    //
+    //    uc_ctl(uc, UC_CTL_TB_REMOVE_CACHE, m_modStart, m_modEnd);
+    //    uc_ctl(uc, UC_CTL_TB_FLUSH);
+    //#endif
+
+    // Invalidate the QEMU translation-block cache for any written range to prevent
+    // stale tb_add_jump chains (SMC bug in QEMU backend).
+//#ifdef AR_TRY_FIX_TCG
+//    if (type == UC_MEM_WRITE) {
+//        uc_ctl_remove_cache(uc, address, address + static_cast<uint64_t>(size)); // anti tcg tb_add_jump crash on smc code (not work)
+//        //uc_ctl_flush_tlb(uc);
+//    }
+//#endif
 
 #ifndef AR_BP_AFTER_DZ
     if (m_bUsingBp) // fast, is any bp added
@@ -4752,6 +4802,7 @@ uintptr_t AsmRunner::AddMemory(uintptr_t nSize, uint32_t nType, bool bAlign)
     uintptr_t sz = bAlign ? AlignUp(nSize, 0x1000) : nSize;
     uintptr_t addr = bAlign ? AlignUp(m_allocCursor, 0x1000) : m_allocCursor;
     if (uc_mem_map(m_uc, addr, sz, nType) != UC_ERR_OK) return 0;
+    m_memMap[addr] = { sz, nType };
     m_allocCursor = addr + sz;
     return addr;
 }
@@ -4770,7 +4821,8 @@ bool AsmRunner::AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType, boo
     if (!m_uc || !pVTo || !nSize) return false;
 #if 1
     uintptr_t mapSize = bAlign ? AlignUp(nSize, 0x1000) : nSize;
-    uc_mem_map(m_uc, pVTo, mapSize, nType);
+    if (uc_mem_map(m_uc, pVTo, mapSize, nType) == UC_ERR_OK)
+        m_memMap[pVTo] = { mapSize, nType };
 #else
     const uintptr_t pageSize = 0x1000;
     const uintptr_t base = bAlign ? AlignDown(pVTo, pageSize) : pVTo;
@@ -4785,6 +4837,7 @@ bool AsmRunner::AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType, boo
                 uc_strerror(err), (void*)base, (size_t)mapSize);
         return false;
     }
+    m_memMap[pVTo] = { mapSize, nType };
 #endif
     return true;
 }
@@ -4871,15 +4924,42 @@ uintptr_t AsmRunner::StrLen(uintptr_t pVStr)
 bool AsmRunner::FreeMemory(uintptr_t pVTo)
 {
     if (!m_uc || !pVTo) return false;
-    uc_mem_unmap(m_uc, pVTo, 0x1000);
-    return true;
+    auto it = m_memMap.find(pVTo);
+    if (it == m_memMap.end())
+    {
+        if (m_bLogRunner)
+            Log("[!] FreeMemory: no map entry for 0x%p", (void*)pVTo);
+        return false;
+    }
+    uintptr_t sz = it->second.size;
+    m_memMap.erase(it);
+    return uc_mem_unmap(m_uc, pVTo, sz) == UC_ERR_OK;
+}
+
+bool AsmRunner::FreeMemory(uintptr_t pVTo, uintptr_t nSize)
+{
+    if (!m_uc || !pVTo || !nSize)
+        return false;
+
+    uintptr_t alignedSize = AlignUp(nSize, 0x1000);
+    auto it = m_memMap.find(pVTo);
+    if (it != m_memMap.end())
+        m_memMap.erase(it);
+    else if (m_bLogRunner)
+        Log("[!] FreeMemory(addr,size): no memMap entry for 0x%p", (void*)pVTo);
+
+    return uc_mem_unmap(m_uc, pVTo, alignedSize) == UC_ERR_OK;
 }
 
 bool AsmRunner::ChangeMemoryType(uintptr_t pVTo, uint32_t nType)
 {
     if (!m_uc || !pVTo) return false;
-    uc_mem_protect(m_uc, pVTo, 0x1000, nType);
-    return true;
+    auto it = m_memMap.find(pVTo);
+    uintptr_t sz = (it != m_memMap.end()) ? it->second.size : 0x1000;
+    uc_err err = uc_mem_protect(m_uc, pVTo, sz, nType);
+    if (err == UC_ERR_OK && it != m_memMap.end())
+        it->second.prot = nType;
+    return err == UC_ERR_OK;
 }
 
 void AsmRunner::DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize)
@@ -5027,7 +5107,7 @@ void AsmRunner::UpdatePC(uintptr_t pAddr, bool bSkipCBCallsWithNewPC)
     if (IsHaltAddr(pAddr)) {
         if (m_bLogRunner)
             Log("[!] UpdatePC Set HALT Addr 0x%p! Shutdown", (void*)pAddr);
-        Shutdown();
+        ShutdownByHalt(m_uc);
         return;
     }
 
@@ -5151,6 +5231,7 @@ void AsmRunner::SetStack(uintptr_t pStack, uintptr_t nSize)
     uintptr_t mapSize = AlignUp(nSize, 0x1000);
     uintptr_t pStackEnd = pStack + mapSize;
     if (uc_mem_map(m_uc, pStack, mapSize, UC_PROT_READ | UC_PROT_WRITE) != UC_ERR_OK) return;
+    m_memMap[pStack] = { mapSize, UC_PROT_READ | UC_PROT_WRITE };
     //uintptr_t sp = pStackEnd - (m_bX64 ? 0x20 : 8);
     uintptr_t sp = pStackEnd - m_stackEPSize; // call emu + ep args
     uintptr_t bp = pStackEnd - m_stackEPSize;
@@ -5192,6 +5273,7 @@ void AsmRunner::CopyNTStack(uintptr_t pStack, uintptr_t nSize)
     const uintptr_t mapSize = AlignUp(nSize, 0x1000);
     if (uc_mem_map(m_uc, pStack, mapSize, UC_PROT_READ | UC_PROT_WRITE) != UC_ERR_OK)
         return;
+    m_memMap[pStack] = { mapSize, UC_PROT_READ | UC_PROT_WRITE };
 
     // Копируем безопасное окно вокруг текущих SP/BP.
     // Не лезем в guard page, не пытаемся тащить весь reserved stack.
@@ -5454,6 +5536,49 @@ bool AsmRunner::StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCd
     return StackPeek(v, idx); // cdecl, my func not clear args
 }
 
+// Unicorn keeps GDT/segment defaults internally in the QEMU context but uc_reg_read returns 0
+// before first execution, so SaveRunStateEnv captures 0 and LoadRunStateEnv restores 0 which
+// breaks the runtime.  Write the standard Windows user-mode selectors explicitly so that
+// save/load round-trips produce consistent non-zero values.
+// TODO: Unhandled CPU exception
+#if 0
+void AsmRunner::InitialiseSegmentRegisters()
+{
+    if (!m_uc) return;
+
+    auto wr16 = [&](int reg, uint16_t v) { uc_reg_write(m_uc, reg, &v); };
+    auto wr32 = [&](int reg, uint32_t v) { uc_reg_write(m_uc, reg, &v); };
+
+    if (m_bX64)
+    {
+        // x64 Windows user-mode selectors
+        wr16(UC_X86_REG_CS, 0x0033); // 64-bit code, ring 3
+        wr16(UC_X86_REG_DS, 0x002B); // data, ring 3
+        wr16(UC_X86_REG_ES, 0x002B);
+        wr16(UC_X86_REG_SS, 0x002B);
+        wr16(UC_X86_REG_FS, 0x0053); // TEB / not used directly; FS_BASE carries the address
+        wr16(UC_X86_REG_GS, 0x002B); // GS_BASE carries the address
+    }
+    else
+    {
+        // x86 Windows user-mode selectors
+        wr16(UC_X86_REG_CS, 0x0023); // 32-bit code, ring 3
+        wr16(UC_X86_REG_DS, 0x002B); // data, ring 3
+        wr16(UC_X86_REG_ES, 0x002B);
+        wr16(UC_X86_REG_SS, 0x002B);
+        wr16(UC_X86_REG_FS, 0x0053); // TEB selector
+        wr16(UC_X86_REG_GS, 0x002B);
+    }
+
+    // IF=1 + reserved bit 1 always set — same as post-reset state on real hardware
+    uint32_t eflags = 0x202;
+    wr32(UC_X86_REG_EFLAGS, eflags);
+
+    if (m_bLogRunner)
+        Log("[*] InitialiseSegmentRegisters: CS/DS/ES/SS/FS/GS/EFLAGS set (%s)", m_bX64 ? "x64" : "x86");
+}
+#endif
+
 void AsmRunner::SetEntryPointStackArg(uint32_t nArgIdx, uintptr_t arg)
 {
     StackSetValue(arg, true, static_cast<int32_t>(nArgIdx) + 1);
@@ -5486,6 +5611,7 @@ void AsmRunner::SetFakeSehTeb(uintptr_t pAddr, uintptr_t nSize)
             Log("[!] map zero page failed: %s", uc_strerror(err));
         return;
     }
+    m_memMap[pAddr] = { mapSize, UC_PROT_READ | UC_PROT_WRITE };
 
     uint32_t seh_head = 0;
     err = uc_mem_write(m_uc, pAddr, &seh_head, sizeof(seh_head));
@@ -5520,6 +5646,7 @@ void AsmRunner::SetFakeSehTeb(uintptr_t pAddr, uintptr_t nSize)
             Log("[!] TEB/SEH map failed at 0x%p: %s", (void*)pAddr, uc_strerror(err));
         return;
     }
+    m_memMap[pAddr] = { mapSize, UC_PROT_READ | UC_PROT_WRITE };
 
     std::vector<uint8_t> zero(mapSize, 0);
     err = uc_mem_write(m_uc, pAddr, zero.data(), zero.size());
@@ -5588,6 +5715,7 @@ void AsmRunner::CopyNTSeh(uintptr_t pAddr, uintptr_t nSize)
             Log("[!] CopyNTSeh map failed at 0x%p: %s", (void*)pAddr, uc_strerror(err));
         return;
     }
+    m_memMap[pAddr] = { mapSize, UC_PROT_READ | UC_PROT_WRITE };
 
     std::vector<uint8_t> zero(mapSize, 0);
     uc_mem_write(m_uc, pAddr, zero.data(), zero.size());
@@ -6504,6 +6632,750 @@ void AsmRunner::LoadModule(const char* szModule) // wrapper
     CopyModule(szModule, 0);
 }
 
+void AsmRunner::RemapModule()
+{
+#if 0
+    if (!m_uc || m_modStart == 0) return;
+
+    size_t size = m_modEnd - m_modStart;
+    std::vector<uint8_t> backup(size);
+
+    uc_mem_read(m_uc, m_modStart, backup.data(), size);
+    uc_mem_unmap(m_uc, m_modStart, size);
+    uc_ctl(m_uc, UC_CTL_TB_FLUSH);
+    uc_mem_map(m_uc, m_modStart, size, UC_PROT_ALL);
+    uc_mem_write(m_uc, m_modStart, backup.data(), size);
+#else
+    if (!m_uc || m_modStart == 0 || m_modEnd == 0)
+        return;
+
+    const uintptr_t size = m_modEnd - m_modStart;
+    if (!size)
+        return;
+
+    // Backup
+    std::vector<uint8_t> backup(size);
+    if (!ReadBytes(m_uc, m_modStart, size, backup))
+    {
+        if (m_bLogRunner)
+            Log("[!] RemapModule: failed to backup module");
+        return;
+    }
+
+    //FreeMemory(m_modStart);
+    FreeMemory(m_modStart, m_modEnd - m_modStart);
+    uc_ctl(m_uc, UC_CTL_TB_FLUSH);
+
+    if (!CopyModuleUC((uintptr_t)backup.data(), m_modStart, size))
+    {
+        if (m_bLogRunner)
+            Log("[!] RemapModule: failed to restore module");
+        return;
+    }
+
+    if (m_bLogRunner)
+        Log("[*] RemapModule: module restored");
+#endif
+}
+
+ArRegsBlob AsmRunner::RunStateEnvSaveRegs(uc_engine* uc, bool bX64)
+{
+    ArRegsBlob r{};
+    auto rd32 = [&](int32_t reg) -> uint64_t { uint32_t v = 0; uc_reg_read(uc, reg, &v); return v; };
+    auto rd64 = [&](int32_t reg) -> uint64_t { uint64_t v = 0; uc_reg_read(uc, reg, &v); return v; };
+    auto rd16 = [&](int32_t reg) -> uint16_t { uint16_t v = 0; uc_reg_read(uc, reg, &v); return v; };
+
+    if (bX64) {
+        r.ax = rd64(UC_X86_REG_RAX); r.bx = rd64(UC_X86_REG_RBX);
+        r.cx = rd64(UC_X86_REG_RCX); r.dx = rd64(UC_X86_REG_RDX);
+        r.si = rd64(UC_X86_REG_RSI); r.di = rd64(UC_X86_REG_RDI);
+        r.bp = rd64(UC_X86_REG_RBP); r.sp = rd64(UC_X86_REG_RSP);
+        r.ip = rd64(UC_X86_REG_RIP);
+        r.r8 = rd64(UC_X86_REG_R8);  r.r9 = rd64(UC_X86_REG_R9);
+        r.r10 = rd64(UC_X86_REG_R10); r.r11 = rd64(UC_X86_REG_R11);
+        r.r12 = rd64(UC_X86_REG_R12); r.r13 = rd64(UC_X86_REG_R13);
+        r.r14 = rd64(UC_X86_REG_R14); r.r15 = rd64(UC_X86_REG_R15);
+//#ifdef AR_STATE_SEG
+        r.fs_base = rd64(UC_X86_REG_FS_BASE);
+        r.gs_base = rd64(UC_X86_REG_GS_BASE);
+//#endif
+    }
+    else {
+        r.ax = rd32(UC_X86_REG_EAX); r.bx = rd32(UC_X86_REG_EBX);
+        r.cx = rd32(UC_X86_REG_ECX); r.dx = rd32(UC_X86_REG_EDX);
+        r.si = rd32(UC_X86_REG_ESI); r.di = rd32(UC_X86_REG_EDI);
+        r.bp = rd32(UC_X86_REG_EBP); r.sp = rd32(UC_X86_REG_ESP);
+        r.ip = rd32(UC_X86_REG_EIP);
+    }
+    r.flags = rd32(UC_X86_REG_EFLAGS);
+//#ifdef AR_STATE_SEG // пусть сохраняет, это не сломает
+    r.cs = rd16(UC_X86_REG_CS);
+    r.ds = rd16(UC_X86_REG_DS);
+    r.es = rd16(UC_X86_REG_ES);
+    r.fs_sel = rd16(UC_X86_REG_FS);
+    r.gs_sel = rd16(UC_X86_REG_GS);
+    r.ss = rd16(UC_X86_REG_SS);
+//#endif
+    return r;
+}
+
+void AsmRunner::RunStateEnvLoadRegs(uc_engine* uc, bool bX64, const ArRegsBlob& r)
+{
+    auto wr32 = [&](int32_t reg, uint32_t v) { uc_reg_write(uc, reg, &v); };
+    auto wr64 = [&](int32_t reg, uint64_t v) { uc_reg_write(uc, reg, &v); };
+    auto wr16 = [&](int32_t reg, uint16_t v) { uc_reg_write(uc, reg, &v); };
+
+    if (bX64) {
+        wr64(UC_X86_REG_RAX, r.ax); wr64(UC_X86_REG_RBX, r.bx);
+        wr64(UC_X86_REG_RCX, r.cx); wr64(UC_X86_REG_RDX, r.dx);
+        wr64(UC_X86_REG_RSI, r.si); wr64(UC_X86_REG_RDI, r.di);
+        wr64(UC_X86_REG_RBP, r.bp); wr64(UC_X86_REG_RSP, r.sp);
+        wr64(UC_X86_REG_RIP, r.ip);
+        wr64(UC_X86_REG_R8, r.r8);  wr64(UC_X86_REG_R9, r.r9);
+        wr64(UC_X86_REG_R10, r.r10); wr64(UC_X86_REG_R11, r.r11);
+        wr64(UC_X86_REG_R12, r.r12); wr64(UC_X86_REG_R13, r.r13);
+        wr64(UC_X86_REG_R14, r.r14); wr64(UC_X86_REG_R15, r.r15);
+#ifdef AR_STATE_SEG
+        // warn!! seg может сломать было 0 запись 0 меняет поведение сам факт записи даже тех самых значений лол блять
+        wr64(UC_X86_REG_FS_BASE, r.fs_base);
+        wr64(UC_X86_REG_GS_BASE, r.gs_base);
+#endif
+    }
+    else {
+        wr32(UC_X86_REG_EAX, (uint32_t)r.ax); wr32(UC_X86_REG_EBX, (uint32_t)r.bx);
+        wr32(UC_X86_REG_ECX, (uint32_t)r.cx); wr32(UC_X86_REG_EDX, (uint32_t)r.dx);
+        wr32(UC_X86_REG_ESI, (uint32_t)r.si); wr32(UC_X86_REG_EDI, (uint32_t)r.di);
+        wr32(UC_X86_REG_EBP, (uint32_t)r.bp); wr32(UC_X86_REG_ESP, (uint32_t)r.sp);
+        wr32(UC_X86_REG_EIP, (uint32_t)r.ip);
+    }
+    uint32_t flags32 = (uint32_t)r.flags;
+    wr32(UC_X86_REG_EFLAGS, flags32);
+#ifdef AR_STATE_SEG
+    // warn!! seg может сломать было 0 запись 0 меняет поведение сам факт записи даже тех самых значений лол блять
+    //регистр CS становился равен 0 (вместо правильного 0x23).
+    //В 16-битном режиме инструкция and edx, 0x72CF079E имеет длину 4 байта (вместо 6 в 32-битном), поэтому хук получал size=4.
+    wr16(UC_X86_REG_CS, r.cs); // ломает, 81 E2 9E 07 CF 72 and edx, 72CF079Eh opsize 4 место 6
+    wr16(UC_X86_REG_DS, r.ds); // ломает, MemCb address 0x00000CC0
+    wr16(UC_X86_REG_ES, r.es); // ломает, MemCb address 0x00000CC0
+    wr16(UC_X86_REG_FS, r.fs_sel); // ломает, MemCb address 0x00000CC0
+    wr16(UC_X86_REG_GS, r.gs_sel); // ломает, MemCb address 0x00000CC0
+    wr16(UC_X86_REG_SS, r.ss); // вроде ок
+#endif
+}
+
+// bIncludeModuleData=false  -> module entry saved without bytes (NT variant)
+// bIncludeAllocMap=false    -> only regs+stack+TEB, no module, no generic regions
+void* AsmRunner::SaveRunStateEnvImpl(uintptr_t& nOutSize, bool bIncludeModuleData, bool bIncludeAllocMap)
+{
+    nOutSize = 0;
+    if (!m_uc || !m_bInitialised) {
+        Log("[!] SaveRunStateEnv: not initialised");
+        return nullptr;
+    }
+
+    // Collect hook dummy page bases to skip
+    std::set<uintptr_t> hookPages;
+    for (const auto& h : m_anyJmpHooks) {
+        if (!h.before) {
+            uintptr_t pb = AlignDown(h.pAddr, 0x1000);
+            if (!IsInAddr(pb, m_modStart, m_modEnd) &&
+                !IsInAddr(pb, m_stackBase, m_stackBase + m_stackSize) &&
+                !IsInAddr(pb, m_fsBase, m_fsBase + m_fsSize))
+                hookPages.insert(pb);
+        }
+    }
+
+    std::vector<uint8_t> buf;
+    buf.reserve(4 * 1024 * 1024);
+
+    // Header
+    ArFileHdr hdr{};
+    hdr.magic = kArMagic;
+    hdr.version = kArVersion;
+    hdr.bis64 = (uint8_t)m_bX64;
+    hdr.bHasModuleData = (uint8_t)(bIncludeModuleData ? 1 : 0);
+    hdr.iccount = (uint64_t)(m_instrCount - 1); // -1 save already in current op, load+perform increment
+    hdr.stepsDeep = (uint64_t)m_nRunStepsDeep;
+    hdr.modStart = (uint64_t)m_modStart;
+    hdr.modEnd = (uint64_t)m_modEnd;
+    strncpy(hdr.modName, m_modName.c_str(), sizeof(hdr.modName) - 1);
+    hdr.stackBase = (uint64_t)m_stackBase;
+    hdr.stackSize = (uint64_t)m_stackSize;
+    hdr.fsBase = (uint64_t)m_fsBase;
+    hdr.fsSize = (uint64_t)m_fsSize;
+    hdr.fsLastError = (uint64_t)m_fsLastError;
+    hdr.allocBase = (uint64_t)m_allocBase;
+    hdr.allocCursor = (uint64_t)m_allocCursor;
+    hdr.savedPC = (uint64_t)CurrentPc(m_uc);
+    buf.insert(buf.end(), (const uint8_t*)&hdr, (const uint8_t*)&hdr + sizeof hdr);
+    //_BufAppT(buf, hdr);
+
+    Log("[*] SaveRunStateEnv: bis64=%d iccount=%zu stepsDeep=%zu PC=0x%p modData=%d allocMap=%d",
+        (int)m_bX64, (size_t)m_instrCount, (size_t)m_nRunStepsDeep,
+        (void*)hdr.savedPC, (int)bIncludeModuleData, (int)bIncludeAllocMap);
+
+    // REGS chunk
+    {
+        ArRegsBlob regs = RunStateEnvSaveRegs(m_uc, m_bX64);
+        ArChunkHdr ch{ kChunkREGS, (uint32_t)sizeof(regs) };
+        buf.insert(buf.end(), (const uint8_t*)&ch, (const uint8_t*)&ch + sizeof ch);
+        buf.insert(buf.end(), (const uint8_t*)&regs, (const uint8_t*)&regs + sizeof regs);
+        //_BufAppT(buf, ch);
+        //_BufAppT(buf, regs);
+        Log("[*] SaveRunStateEnv: REGS saved");
+    }
+
+    // MEMS chunk
+    {
+        std::vector<uint8_t> memsPayload;
+
+        // First pass: count regions
+        uint32_t count = 0;
+        for (auto it = m_memMap.begin(); it != m_memMap.end(); ++it) {
+            uintptr_t addr = it->first;
+            const tMemMapEntry& e = it->second;
+
+            if (hookPages.count(addr)) continue;
+            bool isModule = (m_modStart != 0 && addr == m_modStart);
+            bool isStack = (m_bInitedStack && addr == m_stackBase);
+            bool isTeb = (m_bInitedSehFS && addr == m_fsBase);
+            bool isGeneric = !isModule && !isStack && !isTeb;
+            if (!bIncludeAllocMap && isGeneric) continue;
+            count++;
+        }
+        memsPayload.insert(memsPayload.end(), (const uint8_t*)&count, (const uint8_t*)&count + sizeof count);
+        //_BufAppT(memsPayload, count);
+
+        // Second pass: write data
+        uintptr_t totalBytes = 0;
+        for (auto it = m_memMap.begin(); it != m_memMap.end(); ++it) {
+            uintptr_t addr = it->first;
+            const tMemMapEntry& e = it->second;
+
+            if (hookPages.count(addr)) {
+                Log("[*] SaveRunStateEnv: skip hook dummy 0x%p sz=0x%zx", (void*)addr, (size_t)e.size);
+                continue;
+            }
+            bool isModule = (m_modStart != 0 && addr == m_modStart);
+            bool isStack = (m_bInitedStack && addr == m_stackBase);
+            bool isTeb = (m_bInitedSehFS && addr == m_fsBase);
+            bool isGeneric = !isModule && !isStack && !isTeb;
+            if (!bIncludeAllocMap && isGeneric) continue;
+
+            uint8_t rtype = 0;
+            if (isModule) rtype = 3;
+            else if (isStack) rtype = 1;
+            else if (isTeb)   rtype = 2;
+
+            uint8_t hasData = (isModule && !bIncludeModuleData) ? 0 : 1;
+
+            ArMemEntry me{};
+            me.addr = (uint64_t)addr;
+            me.mapSize = (uint64_t)e.size;
+            me.prot = e.prot;
+            me.regionType = rtype;
+            me.hasData = hasData;
+            memsPayload.insert(memsPayload.end(), (const uint8_t*)&me, (const uint8_t*)&me + sizeof me);
+            //_BufAppT(memsPayload, me);
+
+            if (hasData) {
+                std::vector<uint8_t> data(e.size);
+                uc_err err = uc_mem_read(m_uc, addr, data.data(), e.size);
+                if (err != UC_ERR_OK) {
+                    Log("[!] SaveRunStateEnv: uc_mem_read 0x%p sz=0x%zx: %s",
+                        (void*)addr, (size_t)e.size, uc_strerror(err));
+                    memset(data.data(), 0, e.size);
+                }
+                memsPayload.insert(memsPayload.end(), data.data(), data.data() + data.size());
+                //_BufApp(memsPayload, data.data(), data.size());
+                totalBytes += e.size;
+            }
+            Log("[*] SaveRunStateEnv: region 0x%p sz=0x%zx prot=0x%x type=%d hasData=%d",
+                (void*)addr, (size_t)e.size, e.prot, (int)rtype, (int)hasData);
+        }
+
+        ArChunkHdr ch{ kChunkMEMS, (uint32_t)memsPayload.size() };
+        buf.insert(buf.end(), (const uint8_t*)&ch, (const uint8_t*)&ch + sizeof ch);
+        buf.insert(buf.end(), memsPayload.data(), memsPayload.data() + memsPayload.size());
+        //_BufAppT(buf, ch);
+        //_BufApp(buf, memsPayload.data(), memsPayload.size());
+        Log("[*] SaveRunStateEnv: MEMS %u regions, data=%zu bytes", count, (size_t)totalBytes);
+    }
+
+    {
+        ArChunkHdr ch{ kChunkEND, 0 };
+        buf.insert(buf.end(), (const uint8_t*)&ch, (const uint8_t*)&ch + sizeof ch);
+        //_BufAppT(buf, ch);
+    }
+
+    nOutSize = buf.size();
+    void* out = malloc(nOutSize);
+    if (!out) {
+        Log("[!] SaveRunStateEnv: malloc(%zu) failed", (size_t)nOutSize);
+        nOutSize = 0;
+        return nullptr;
+    }
+    memcpy(out, buf.data(), nOutSize);
+    Log("[+] SaveRunStateEnv: done, %zu bytes (%.2f MB)",
+        (size_t)nOutSize, (double)nOutSize / (1024.0 * 1024.0));
+    return out;
+}
+
+void* AsmRunner::SaveRunStateEnv(uintptr_t& nOutSize)
+{
+    return SaveRunStateEnvImpl(nOutSize, true, true);
+}
+
+void* AsmRunner::SaveRunStateEnvNT(uintptr_t& nOutSize)
+{
+    // Minimal: regs + stack + TEB only; iccount/stepsDeep zeroed
+    void* p = SaveRunStateEnvImpl(nOutSize, false, false);
+    if (p && nOutSize >= sizeof(ArFileHdr)) {
+        ArFileHdr* hdr = reinterpret_cast<ArFileHdr*>(p);
+        hdr->iccount = 0;
+        hdr->stepsDeep = 0;
+    }
+    return p;
+}
+
+void AsmRunner::LoadRunStateEnv(void* pReadBuff, bool bRun)
+{
+    if (!pReadBuff) { Log("[!] LoadRunStateEnv: null buffer"); return; }
+    if (!m_uc || !m_bInitialised) { Log("[!] LoadRunStateEnv: not initialised"); return; }
+
+    const uint8_t* p = (const uint8_t*)pReadBuff;
+
+    ArFileHdr hdr{};
+    memcpy(&hdr, p, sizeof hdr);
+    p += sizeof hdr;
+
+    if (hdr.magic != kArMagic) { Log("[!] LoadRunStateEnv: bad magic 0x%08X", hdr.magic); return; }
+    if (hdr.version != kArVersion) { Log("[!] LoadRunStateEnv: unsupported version %u", hdr.version); return; }
+    if ((bool)hdr.bis64 != m_bX64) {
+        Log("[!] LoadRunStateEnv: mode mismatch: file=%s current=%s",
+            hdr.bis64 ? "x64" : "x86", m_bX64 ? "x64" : "x86");
+        return;
+    }
+    Log("[*] LoadRunStateEnv: v=%u bis64=%d PC=0x%p ic=%zu steps=%zu",
+        hdr.version, (int)hdr.bis64, (void*)hdr.savedPC,
+        (size_t)hdr.iccount, (size_t)hdr.stepsDeep);
+
+    // Collect hook dummy page bases — must survive the unmap (same logic as SaveRunStateEnvImpl)
+    std::set<uintptr_t> hookPages;
+    for (const auto& h : m_anyJmpHooks) {
+        if (!h.before) {
+            uintptr_t pb = AlignDown(h.pAddr, 0x1000);
+            if (!IsInAddr(pb, m_modStart, m_modEnd) &&
+                !IsInAddr(pb, m_stackBase, m_stackBase + m_stackSize) &&
+                !IsInAddr(pb, m_fsBase, m_fsBase + m_fsSize))
+                hookPages.insert(pb);
+        }
+    }
+
+    // Unmap all existing regions from UC except hook dummy pages
+    {
+        std::vector<std::pair<uintptr_t, uintptr_t>> toUnmap;
+        for (auto it = m_memMap.begin(); it != m_memMap.end(); ++it) {
+            if (!hookPages.count(it->first))
+                toUnmap.push_back(std::make_pair(it->first, it->second.size));
+        }
+        for (auto it = toUnmap.begin(); it != toUnmap.end(); ++it) {
+            uintptr_t addr = it->first;
+            uintptr_t sz = it->second;
+            uc_err err = uc_mem_unmap(m_uc, addr, sz);
+            if (err != UC_ERR_OK)
+                Log("[!] LoadRunStateEnv: unmap 0x%p sz=0x%zx: %s",
+                    (void*)addr, (size_t)sz, uc_strerror(err));
+            m_memMap.erase(addr);
+        }
+        m_bInitedStack = false;
+        m_bInitedSehFS = false;
+        m_modStart = 0;
+        m_modEnd = 0;
+    }
+
+    // Restore scalar fields from header
+    m_instrCount = (uintptr_t)hdr.iccount;
+    m_nRunStepsDeep = (uintptr_t)hdr.stepsDeep;
+    m_modName = std::string(hdr.modName);
+    m_stackBase = (uintptr_t)hdr.stackBase;
+    m_stackSize = (uintptr_t)hdr.stackSize;
+    m_fsBase = (uintptr_t)hdr.fsBase;
+    m_fsSize = (uintptr_t)hdr.fsSize;
+    m_fsLastError = (uintptr_t)hdr.fsLastError;
+    m_allocBase = (uintptr_t)hdr.allocBase;
+    m_allocCursor = (uintptr_t)hdr.allocCursor;
+
+    ArRegsBlob regs{};
+    bool bGotRegs = false;
+
+    while (true) {
+        ArChunkHdr ch{};
+        memcpy(&ch, p, sizeof ch);
+        p += sizeof ch;
+        if (ch.tag == kChunkEND) break;
+
+        if (ch.tag == kChunkREGS) {
+            if (ch.size >= sizeof(ArRegsBlob)) {
+                memcpy(&regs, p, sizeof regs);
+                bGotRegs = true;
+                Log("[*] LoadRunStateEnv: REGS parsed");
+            }
+            else {
+                Log("[!] LoadRunStateEnv: REGS chunk too small (%u)", ch.size);
+            }
+            p += ch.size;
+        }
+        else if (ch.tag == kChunkMEMS) {
+            const uint8_t* mp = p;
+            uint32_t count = 0;
+            memcpy(&count, mp, sizeof count);
+            mp += sizeof count;
+            Log("[*] LoadRunStateEnv: MEMS %u regions", count);
+
+            for (uint32_t i = 0; i < count; ++i) {
+                ArMemEntry me{};
+                memcpy(&me, mp, sizeof me);
+                mp += sizeof me;
+
+                uc_err err = uc_mem_map(m_uc, me.addr, (size_t)me.mapSize, me.prot);
+                if (err != UC_ERR_OK) {
+                    Log("[!] LoadRunStateEnv: map 0x%p sz=0x%zx: %s — retry after unmap",
+                        (void*)me.addr, (size_t)me.mapSize, uc_strerror(err));
+                    uc_mem_unmap(m_uc, me.addr, (size_t)me.mapSize);
+                    err = uc_mem_map(m_uc, me.addr, (size_t)me.mapSize, me.prot);
+                    if (err != UC_ERR_OK) {
+                        Log("[!] LoadRunStateEnv: retry failed, skip 0x%p", (void*)me.addr);
+                        if (me.hasData) mp += (size_t)me.mapSize;
+                        continue;
+                    }
+                }
+                m_memMap[(uintptr_t)me.addr] = { (uintptr_t)me.mapSize, me.prot };
+
+                if (me.hasData) {
+                    err = uc_mem_write(m_uc, me.addr, mp, (size_t)me.mapSize);
+                    if (err != UC_ERR_OK)
+                        Log("[!] LoadRunStateEnv: write 0x%p sz=0x%zx: %s",
+                            (void*)me.addr, (size_t)me.mapSize, uc_strerror(err));
+                    mp += (size_t)me.mapSize;
+                }
+
+                if (me.regionType == 1) m_bInitedStack = true;
+                else if (me.regionType == 2) m_bInitedSehFS = true;
+                else if (me.regionType == 3) {
+                    m_modStart = (uintptr_t)hdr.modStart;
+                    m_modEnd = (uintptr_t)hdr.modEnd;
+                }
+                Log("[*] LoadRunStateEnv: mapped 0x%p sz=0x%zx prot=0x%x type=%d hasData=%d",
+                    (void*)me.addr, (size_t)me.mapSize, me.prot, (int)me.regionType, (int)me.hasData);
+            }
+            p += ch.size;
+        }
+        else {
+            Log("[!] LoadRunStateEnv: unknown chunk 0x%08X sz=%u, skip", ch.tag, ch.size);
+            p += ch.size;
+        }
+    }
+
+    // Module bounds from header (valid even when no module data in save)
+    if (hdr.modStart && hdr.modEnd) {
+        m_modStart = (uintptr_t)hdr.modStart;
+        m_modEnd = (uintptr_t)hdr.modEnd;
+    }
+
+    if (bGotRegs) {
+        RunStateEnvLoadRegs(m_uc, m_bX64, regs);
+        Log("[*] LoadRunStateEnv: registers restored, PC=0x%p", (void*)hdr.savedPC);
+    }
+
+    uc_ctl(m_uc, UC_CTL_TB_FLUSH);
+    uc_ctl_flush_tlb(m_uc);
+
+    Log("[+] LoadRunStateEnv: done, modStart=0x%p modEnd=0x%p IC=%zu steps=%zu",
+        (void*)m_modStart, (void*)m_modEnd, (size_t)m_instrCount, (size_t)m_nRunStepsDeep);
+
+    if (bRun && m_modStart && m_modEnd) {
+        uintptr_t pc = (uintptr_t)hdr.savedPC;
+        uintptr_t remain = (m_nRunStepsDeep > m_instrCount) ? (m_nRunStepsDeep - m_instrCount) : 0;
+        Log("[*] LoadRunStateEnv: resume PC=0x%p remain=%zu", (void*)pc, (size_t)remain);
+        Run(pc, remain);
+    }
+}
+
+void AsmRunner::SaveRunStateEnvFile(std::string file)
+{
+    uintptr_t sz = 0;
+    void* p = SaveRunStateEnv(sz);
+    if (!p || !sz) { Log("[!] SaveRunStateEnvFile: save failed"); return; }
+    FILE* f = FileOpen(file.c_str(), "wb");
+    if (!f) { Log("[!] SaveRunStateEnvFile: can't open '%s'", file.c_str()); free(p); return; }
+    FileWrite(f, p, sz);
+    FileClose(f);
+    free(p);
+    Log("[+] SaveRunStateEnvFile: '%s' %zu bytes", file.c_str(), (size_t)sz);
+}
+
+void AsmRunner::SaveRunStateEnvNTFile(std::string file)
+{
+    uintptr_t sz = 0;
+    void* p = SaveRunStateEnvNT(sz);
+    if (!p || !sz) { Log("[!] SaveRunStateEnvNTFile: save failed"); return; }
+    FILE* f = FileOpen(file.c_str(), "wb");
+    if (!f) { Log("[!] SaveRunStateEnvNTFile: can't open '%s'", file.c_str()); free(p); return; }
+    FileWrite(f, p, sz);
+    FileClose(f);
+    free(p);
+    Log("[+] SaveRunStateEnvNTFile: '%s' %zu bytes", file.c_str(), (size_t)sz);
+}
+
+void AsmRunner::LoadRunStateEnvFile(std::string file, bool bRun)
+{
+    FILE* f = FileOpen(file.c_str(), "rb");
+    if (!f) { Log("[!] LoadRunStateEnvFile: can't open '%s'", file.c_str()); return; }
+    size_t sz = FileSize(f);
+    if (!sz) { Log("[!] LoadRunStateEnvFile: empty '%s'", file.c_str()); FileClose(f); return; }
+    void* buf = malloc(sz);
+    if (!buf) { Log("[!] LoadRunStateEnvFile: malloc(%zu) failed", sz); FileClose(f); return; }
+    FileRead(f, buf, sz);
+    FileClose(f);
+    Log("[*] LoadRunStateEnvFile: '%s' %zu bytes", file.c_str(), sz);
+    LoadRunStateEnv(buf, bRun);
+    free(buf);
+}
+
+void AsmRunner::HardReset()
+{
+    if (!m_uc) { Log("[!] HardReset: no UC context"); return; }
+    Log("[*] HardReset: saving state...");
+
+    // 1. Save full state from current UC
+    uintptr_t saveSize = 0;
+    void* pSave = SaveRunStateEnv(saveSize);
+    if (!pSave || !saveSize) { Log("[!] HardReset: SaveRunStateEnv failed"); return; }
+    Log("[*] HardReset: saved %zu bytes", (size_t)saveSize);
+
+    // 2. Remove hooks and close engine (AsmRunner state untouched)
+    if (m_hkCode) {
+        uc_hook_del(m_uc, m_hkCode);
+        m_hkCode = 0;
+    }
+    if (m_hkMem) {
+        uc_hook_del(m_uc, m_hkMem);
+        m_hkMem = 0;
+    }
+    for (auto& n : m_insnHooks) {
+        if (n.hk) {
+            uc_hook_del(m_uc, n.hk);
+            n.hk = 0;
+        } 
+    }
+    uc_close(m_uc);
+    m_uc = nullptr;
+    Log("[*] HardReset: old UC closed");
+
+    // 3. Create fresh UC engine
+    uc_mode mode = m_bX64 ? UC_MODE_64 : UC_MODE_32;
+    uc_err err = uc_open(UC_ARCH_X86, mode, &m_uc);
+    if (err != UC_ERR_OK) {
+        Log("[!] HardReset: uc_open failed: %s", uc_strerror(err));
+        free(pSave);
+        return;
+    }
+    m_memMap.clear();
+    m_bInitedStack = false;
+    m_bInitedSehFS = false;
+    m_modStart = 0;
+    m_modEnd = 0;
+    Log("[*] HardReset: new UC created");
+
+    // 4. Restore all memory + registers (bRun=false, we run after hook re-install)
+    LoadRunStateEnv(pSave, false);
+    free(pSave);
+
+    // 5. Re-install UC hooks on the new engine
+    if (!m_hkCode) {
+        err = uc_hook_add(m_uc, &m_hkCode, UC_HOOK_CODE,
+            reinterpret_cast<void*>(HookCodeTrampoline), this, 1, 0);
+        if (err != UC_ERR_OK) Log("[!] HardReset: hkCode: %s", uc_strerror(err));
+    }
+    if (!m_hkMem) {
+        err = uc_hook_add(m_uc, &m_hkMem,
+            UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE |
+            UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
+            UC_HOOK_MEM_FETCH_UNMAPPED | UC_HOOK_MEM_READ_PROT |
+            //UC_HOOK_MEM_READ_AFTER |
+            //UC_HOOK_MEM_FETCH | // чтение самой инструкции, warn! old+unused
+            UC_HOOK_MEM_WRITE_PROT | UC_HOOK_MEM_FETCH_PROT,
+            reinterpret_cast<void*>(HookMemTrampoline), this, 1, 0);
+        if (err != UC_ERR_OK) Log("[!] HardReset: hkMem: %s", uc_strerror(err));
+    }
+    for (auto& n : m_insnHooks) {
+        if (!n.hk) {
+            err = uc_hook_add(m_uc, &n.hk, UC_HOOK_INSN,
+                reinterpret_cast<void*>(HookInsnTrampoline), &n, 1, 0, (int)n.nInsn);
+            if (err != UC_ERR_OK)
+                Log("[!] HardReset: insnHook nInsn=%zu: %s", (size_t)n.nInsn, uc_strerror(err));
+        }
+    }
+    Log("[*] HardReset: hooks re-installed");
+
+    // 6. Resume from saved PC with remaining steps
+    uintptr_t pc = 0;
+    if (m_bX64) uc_reg_read(m_uc, UC_X86_REG_RIP, &pc);
+    else { uint32_t pc32 = 0; uc_reg_read(m_uc, UC_X86_REG_EIP, &pc32); pc = pc32; }
+    uintptr_t remain = (m_nRunStepsDeep > m_instrCount) ? (m_nRunStepsDeep - m_instrCount) : 0;
+    Log("[*] HardReset: resume PC=0x%p remain=%zu", (void*)pc, (size_t)remain);
+    Log("[+] HardReset: complete");
+    Run(pc, remain);
+}
+
+// tmp unused
+//void AsmRunner::HardReset()
+//{
+//    if (!m_uc) return;
+//    if (m_bLogRunner)
+//        Log("[*] HardReset begin");
+//
+//    // 1. Snapshot all mapped memory regions
+//    struct tSavedRegion
+//    {
+//        uintptr_t addr;
+//        uintptr_t size;
+//        uint32_t  prot;
+//        std::vector<uint8_t> data;
+//    };
+//    std::vector<tSavedRegion> savedMem;
+//    savedMem.reserve(m_memMap.size());
+//    for (auto& [addr, entry] : m_memMap)
+//    {
+//        tSavedRegion r;
+//        r.addr = addr;
+//        r.size = entry.size;
+//        r.prot = entry.prot;
+//        r.data.resize(entry.size);
+//        uc_mem_read(m_uc, addr, r.data.data(), entry.size);
+//        savedMem.push_back(std::move(r));
+//    }
+//
+//    // 2. Snapshot registers
+//    static const uint32_t kX86Regs[] = {
+//        UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX,
+//        UC_X86_REG_ESI, UC_X86_REG_EDI, UC_X86_REG_EBP, UC_X86_REG_ESP,
+//        UC_X86_REG_EIP, UC_X86_REG_EFLAGS,
+//        UC_X86_REG_CS,  UC_X86_REG_DS,  UC_X86_REG_ES,
+//        UC_X86_REG_SS,  UC_X86_REG_FS,  UC_X86_REG_GS,
+//        UC_X86_REG_FS_BASE
+//    };
+//    static const uint32_t kX64Regs[] = {
+//        UC_X86_REG_RAX, UC_X86_REG_RBX, UC_X86_REG_RCX, UC_X86_REG_RDX,
+//        UC_X86_REG_RSI, UC_X86_REG_RDI, UC_X86_REG_RBP, UC_X86_REG_RSP,
+//        UC_X86_REG_RIP, UC_X86_REG_EFLAGS,
+//        UC_X86_REG_R8,  UC_X86_REG_R9,  UC_X86_REG_R10, UC_X86_REG_R11,
+//        UC_X86_REG_R12, UC_X86_REG_R13, UC_X86_REG_R14, UC_X86_REG_R15,
+//        UC_X86_REG_CS,  UC_X86_REG_DS,  UC_X86_REG_ES,
+//        UC_X86_REG_SS,  UC_X86_REG_FS,  UC_X86_REG_GS,
+//        UC_X86_REG_FS_BASE, UC_X86_REG_GS_BASE
+//    };
+//    const uint32_t* regList = m_bX64 ? kX64Regs : kX86Regs;
+//    const size_t    regCount = m_bX64 ? (sizeof(kX64Regs) / sizeof(kX64Regs[0]))
+//        : (sizeof(kX86Regs) / sizeof(kX86Regs[0]));
+//    std::vector<uintptr_t> savedRegs(regCount, 0);
+//    for (size_t i = 0; i < regCount; ++i)
+//        uc_reg_read(m_uc, regList[i], &savedRegs[i]);
+//
+//    // 3. Save insn-hook metadata (cb/data/nInsn per node); handles below are stale after uc_close
+//    struct tSavedInsn { uintptr_t nInsn; OnInsnCb cb; void* data; AsmRunner* owner; };
+//    std::vector<tSavedInsn> savedInsn;
+//    savedInsn.reserve(m_insnHooks.size());
+//    for (auto& n : m_insnHooks)
+//        savedInsn.push_back({ n.nInsn, n.cb, n.data, n.owner });
+//    // del handles now (engine still alive here)
+//    for (auto& n : m_insnHooks)
+//        if (n.hk) uc_hook_del(m_uc, n.hk);
+//    m_insnHooks.clear();
+//
+//    // 4. Remove main hooks and destroy unicorn
+//    if (m_hkCode) { uc_hook_del(m_uc, m_hkCode); m_hkCode = 0; }
+//    if (m_hkMem) { uc_hook_del(m_uc, m_hkMem);  m_hkMem = 0; }
+//    uc_close(m_uc);
+//    m_uc = nullptr;
+//
+//    // 5. Create fresh unicorn instance
+//    uc_mode uc_mode_val = m_bX64 ? UC_MODE_64 : UC_MODE_32;
+//    if (uc_open(UC_ARCH_X86, uc_mode_val, &m_uc) != UC_ERR_OK)
+//    {
+//        Log("[!] HardReset: uc_open failed");
+//        return;
+//    }
+//
+//    // 6. Restore memory
+//    m_memMap.clear();
+//    for (auto& r : savedMem)
+//    {
+//        if (uc_mem_map(m_uc, r.addr, r.size, r.prot) == UC_ERR_OK)
+//        {
+//            m_memMap[r.addr] = { r.size, r.prot };
+//            uc_mem_write(m_uc, r.addr, r.data.data(), r.size);
+//        }
+//        else
+//        {
+//            Log("[!] HardReset: re-map failed at 0x%p size=0x%zx", (void*)r.addr, (size_t)r.size);
+//        }
+//    }
+//
+//    // 7. Restore registers
+//    for (size_t i = 0; i < regCount; ++i)
+//        uc_reg_write(m_uc, regList[i], &savedRegs[i]);
+//
+//    // Re-apply TEB/FS/GS base explicitly (x86 FS_BASE write is buggy in UC, fallback)
+//    if (m_fsBase)
+//        SetTebBase(m_fsBase);
+//
+//    // 8. Re-install main UC hooks (only if they were active before reset)
+//    uc_hook_add(m_uc, &m_hkCode, UC_HOOK_CODE,
+//        reinterpret_cast<void*>(HookCodeTrampoline), this, 1, 0);
+//    uc_hook_add(m_uc, &m_hkMem,
+//        UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE |
+//        UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
+//        UC_HOOK_MEM_FETCH_UNMAPPED | UC_HOOK_MEM_READ_PROT |
+//        UC_HOOK_MEM_WRITE_PROT | UC_HOOK_MEM_FETCH_PROT,
+//        reinterpret_cast<void*>(HookMemTrampoline), this, 1, 0);
+//
+//    // 9. Re-install per-insn hooks
+//    for (auto& s : savedInsn)
+//    {
+//        tInsnHookNode node;
+//        node.nInsn = s.nInsn;
+//        node.cb = s.cb;
+//        node.data = s.data;
+//        node.owner = s.owner;
+//        node.hk = 0;
+//        m_insnHooks.push_back(node);
+//        auto* slot = &m_insnHooks.back();
+//        uc_hook_add(m_uc, &slot->hk, UC_HOOK_INSN,
+//            reinterpret_cast<void*>(HookInsnTrampoline), slot,
+//            1, 0, static_cast<int>(s.nInsn));
+//    }
+//
+//    m_bStopped = false;
+//    m_bPaused = false;
+//
+//    if (m_bLogRunner)
+//        Log("[*] HardReset done: %zu regions, %zu regs, %zu insn hooks",
+//            savedMem.size(), regCount, savedInsn.size());
+//}
+
+//// TODO
+//void AsmRunner::HardReset()
+//{
+//    if (!m_uc) {
+//        Log("[!] HardReset: no UC context, nothing to reset");
+//        return;
+//    }
+//
+//    
+//}
+
 void AsmRunner::ResolveIATModule()
 {
     if (!m_uc || !m_modStart || m_modEnd <= m_modStart)
@@ -7148,11 +8020,30 @@ bool AsmRunner::CompressDiffs(std::vector<std::string> files, std::string outFil
     return true;
 }
 
-void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
+bool AsmRunner::RunCurrentPC(uintptr_t nStepsDeep)
+{
+    if (!m_uc)
+        return false;
+
+    uintptr_t pc = 0;
+    if (m_bX64) {
+        uc_reg_read(m_uc, UC_X86_REG_RIP, &pc);
+    }
+    else {
+        uint32_t pc32 = 0;
+        uc_reg_read(m_uc, UC_X86_REG_EIP, &pc32);
+        pc = pc32;
+    }
+
+    return Run(pc, nStepsDeep);
+}
+
+
+bool AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
 {
     if (!m_uc || m_modStart == 0 || m_modEnd == 0 || !m_bInitialised) {
         Log("[!] AsmRunner::Run ERROR: m_uc 0x%p, m_modStart 0x%p, m_modEnd 0x%p, m_bInitialised %d", m_uc, m_modStart, m_modEnd, m_bInitialised);
-        return;
+        return false;
     }
 
     uintptr_t pc = pEntry;
@@ -7163,7 +8054,7 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
         uc_err err = uc_hook_add(m_uc, &m_hkCode, UC_HOOK_CODE, reinterpret_cast<void*>(HookCodeTrampoline), this, 1, 0);
         if (err != UC_ERR_OK) {
             Log("[!] uc_hook_add CODE failed: %s", uc_strerror(err));
-            return;
+            return false;
         }
     }
 
@@ -7178,15 +8069,16 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             reinterpret_cast<void*>(HookMemTrampoline), this, 1, 0);
         if (err != UC_ERR_OK) {
             Log("[!] uc_hook_add MEM failed: %s", uc_strerror(err));
-            return;
+            return false;
         }
     }
 
-    // TODO? UC_HOOK_INSN  UC_HOOK_INTR
+    // TODO? UC_HOOK_INTR  // UC_HOOK_INSN(done)
 
     m_bPaused = false;
     m_bStopped = false;
     m_bSkipCBCallsWithNewPC = false;
+    m_nRunStepsDeep = nStepsDeep;
 
     if (m_bLogRunner) {
         Log("[*] Entry = 0x%p", (void*)pc);
@@ -7197,11 +8089,13 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
     uint64_t count = nStepsDeep ? static_cast<uint64_t>(nStepsDeep) : 0;
     uc_err err = uc_emu_start(m_uc, pc, m_modEnd ? m_modEnd : 0, 0, count);
 
-    if (m_bLogRunner) {
+    if (m_bLogRunner)
+    {
         SetConsoleColor(1);
         Log("[*] emu end, err=%s, IC instr=%zu", uc_strerror(err), static_cast<size_t>(m_instrCount));
 
-        if (err != UC_ERR_OK) {
+        if (err != UC_ERR_OK)
+        {
             SetConsoleColor(0);
             const char* errMsg = uc_strerror(err);
             uintptr_t pc_stop = CurrentPc(m_uc);
@@ -7239,8 +8133,26 @@ void AsmRunner::Run(uintptr_t pEntry, uintptr_t nStepsDeep)
             DumpSegmentRegisters();
             DumpStack(50);
             SetConsoleColor(6);
+
+            return false;
         }
     }
+
+    return true;
+}
+
+bool AsmRunner::TryRun(uintptr_t pEntry, uintptr_t nStepsDeep)
+{
+    try {
+        return Run(pEntry, nStepsDeep);
+    }
+    catch (const std::exception& e) {
+        printf("std::exception: %s\n", e.what());
+    }
+    catch (...) {
+        printf("Unknown C++ exception\n");
+    }
+    return false;
 }
 
 void AsmRunner::Pause()
@@ -7263,6 +8175,14 @@ void AsmRunner::Stop()
     if (!m_uc) return;
     m_bStopped = true;
     uc_emu_stop(m_uc);
+}
+
+void AsmRunner::Restart()
+{
+    if (!m_uc) return;
+    uc_emu_stop(m_uc);
+    uintptr_t pc = CurrentPc(m_uc);
+    uc_emu_start(m_uc, pc, m_modEnd ? m_modEnd : 0, 0, 0);
 }
 
 void AsmRunner::B(intptr_t nOps)
@@ -7377,19 +8297,47 @@ void AsmRunner::DumpSegmentRegisters()
 {
     if (!m_uc) return;
 
-    uint64_t fs_base = 0;
-    uint64_t gs_base = 0;
+    uint16_t cs = 0, ds = 0, es = 0, ss = 0, fs_sel = 0, gs_sel = 0;
+    uint64_t fs_base = 0, gs_base = 0;
+
+    uc_reg_read(m_uc, UC_X86_REG_CS, &cs);
+    uc_reg_read(m_uc, UC_X86_REG_DS, &ds);
+    uc_reg_read(m_uc, UC_X86_REG_ES, &es);
+    uc_reg_read(m_uc, UC_X86_REG_SS, &ss);
+    uc_reg_read(m_uc, UC_X86_REG_FS, &fs_sel);
+    uc_reg_read(m_uc, UC_X86_REG_GS, &gs_sel);
 
     printf("=== SEGMENT REGISTERS ===\n");
-    if (m_bX64) {
+    printf("CS = 0x%04X  DS = 0x%04X  ES = 0x%04X  SS = 0x%04X  FS = 0x%04X  GS = 0x%04X\n",
+        cs, ds, es, ss, fs_sel, gs_sel);
+
+    if (!m_bX64) {
+        uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
+        Log("FS_BASE = 0x%08X", (uint32_t)fs_base);
+    }
+    else {
         uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
         uc_reg_read(m_uc, UC_X86_REG_GS_BASE, &gs_base);
         Log("FS_BASE = 0x%016llX", fs_base);
         Log("GS_BASE = 0x%016llX", gs_base);
     }
+
+    if (!m_bX64) {
+        const char* mode = "???";
+        if (cs == 0x23) mode = "32-bit protected (user)";
+        else if (cs == 0x1B) mode = "32-bit protected (kernel)";
+        else if (cs == 0x08) mode = "16-bit protected";
+        else if (cs == 0x10) mode = "16-bit protected (data)";
+        else if (cs == 0x33) mode = "64-bit (long mode)"; // x64
+        Log("Current mode (CS): %s", mode);
+    }
     else {
-        uc_reg_read(m_uc, UC_X86_REG_FS_BASE, &fs_base);
-        Log("FS_BASE = 0x%08X", (uint32_t)fs_base);
+        const char* mode = (cs == 0x33) ? "64-bit (long mode)" : "unknown";
+        Log("Current mode (CS): %s", mode);
+    }
+
+    if (!m_bX64 && cs != 0x23 && cs != 0x1B) {
+        Log("[!] WARNING: CS=0x%04X may cause 16-bit emulation. Expected 0x23 or 0x1B.", cs);
     }
 }
 
@@ -7871,6 +8819,84 @@ void AsmRunner::DumpRWHistoryFile(std::string fName, uintptr_t nLimSize, bool bS
     }
 }
 
+void AsmRunner::DumpRWHistorySelfModifying(uintptr_t pTextSec, uintptr_t pTextSecEnd)
+{
+    if (m_RWHistory.empty())
+    {
+        Log("[RW] history is empty");
+        return;
+    }
+
+    // Count how many writes are within the specified range
+    size_t count = 0;
+    for (const auto& h : m_RWHistory)
+    {
+        if (!h.bRead && IsInAddr(h.addr, pTextSec, pTextSecEnd))
+            count++;
+    }
+
+    if (count == 0)
+    {
+        Log("[RW] No self-modifying writes found in range [0x%p, 0x%p)", (void*)pTextSec, (void*)pTextSecEnd);
+        return;
+    }
+
+    Log("[RW] Self-modifying writes in range [0x%p, 0x%p) (total: %zu)",
+        (void*)pTextSec, (void*)pTextSecEnd, count);
+
+#ifdef _WIN32
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    bool bHaveConsole = (hConsole != INVALID_HANDLE_VALUE) &&
+        (hConsole != nullptr) &&
+        GetConsoleScreenBufferInfo(hConsole, &csbi);
+    const WORD savedAttrs = bHaveConsole ? csbi.wAttributes : 0;
+#endif
+
+    auto setColor = [&](WORD attrs)
+    {
+#ifdef _WIN32
+        if (bHaveConsole)
+            SetConsoleTextAttribute(hConsole, attrs);
+#else
+        (void)attrs;
+#endif
+    };
+
+    auto resetColor = [&]()
+    {
+#ifdef _WIN32
+        if (bHaveConsole)
+            SetConsoleTextAttribute(hConsole, savedAttrs);
+#endif
+    };
+
+    // Display each matching write with highlighting
+    for (size_t i = 0; i < m_RWHistory.size(); ++i)
+    {
+        const auto& h = m_RWHistory[i];
+
+        // Skip reads and writes outside the range
+        if (h.bRead || !IsInAddr(h.addr, pTextSec, pTextSecEnd))
+            continue;
+
+        // Highlight self-modifying writes in red
+#ifdef _WIN32
+        setColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
+#endif
+
+        Log("[%zu] SELF-MOD: %s", i,
+            FormatRWHistoryLine(h, true, false, true, false, true).c_str());
+
+        if (!h.disasm.empty())
+            Log("    disasm: %s\n", h.disasm.c_str());
+
+        resetColor();
+    }
+
+    resetColor();
+}
+
 void AsmRunner::ClearRWHistory()
 {
     m_RWHistory.clear();
@@ -7885,6 +8911,119 @@ void AsmRunner::AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC, 
 
     if (m_bLogRunner)
         Log("[*] DeadzoneIC added: 0x%p - 0x%p (skipAll=%d)", startIC, endIC, skipAll);
+}
+
+// try fix qemu сшивание TCG Translation Blocks tb_add_jump chaining translation blocks (TB chaining)  краш на SMC коде
+void AsmRunner::InstallDangerNativeCoreFixes()
+{ // native core patch for noncrash at SMC
+#ifdef AR_NTCORE_PATCH
+
+    if (m_bNativeCorePatchInstalled) {
+        if (m_bLogRunner)
+            Log("[*] InstallDangerNativeCoreFixes failed! Already Patched!");
+        return;
+    }
+
+#define AR_COREPTR(pidb) (pidb - 0x56EE0000 + hModule)
+        uintptr_t hModule = (uintptr_t)GetModuleHandleA("unicorn.dll");
+
+        if (hModule == 0) {
+            if (m_bLogRunner)
+                Log("[*] InstallDangerNativeCoreFixes: Failed to find core library!");
+            return;
+        }
+
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hModule;
+        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)hModule + dos->e_lfanew);
+        DWORD moduleSize = nt->OptionalHeader.SizeOfImage;
+
+        {
+            if (sizeof(uintptr_t) != 4) {
+                if (m_bLogRunner)
+                    Log("[*] InstallDangerNativeCoreFixes: Failed to patch non x86!");
+                return;
+            }
+        }
+
+        // отключаем в tb_find tb_add_jump(краш tb_target_set_jmp_target), page_collection_lock page_collection_unlock бо крашит там, а в qemu они и сами это отключили
+
+        // SMC crash (write to 0x0) tb_find -> tb_target_set_jmp_target/tb_set_jmp_target/tb_add_jump/tb_find/cpu_exec  // disable tb_add_jump (inlined), no TranslationBlock link
+        //void* jz__tb_find__last_tb = (void*)AR_COREPTR(0x56F3D976); // if (last_tb) See if we can patch the calling TB. tb_add_jump
+        void* jz__tb_find__last_tb = (void*)SearchPointerByPattern(hModule, moduleSize, "74 5D 8B 45 38 83 F8 02 72 1A 68");
+        // near "n < (sizeof(tb->jmp_list_next) / sizeof(tb->jmp_list_next[0]))"
+
+        //После того как QEMU сгенерировал новый TB(текущий блок), он пытается пропатчить
+        //предыдущий TB(last_tb), чтобы тот сразу прыгал на этот новый блок, минуя диспетчер.
+        //Это сильно ускоряет выполнение циклов и частых переходов.
+        //Когда код пересекает границу страницы, возникает проблема с самомодифицирующимся кодом(SMC).
+        //Если мы пропатчим предыдущий TB так, чтобы он прыгал на этот двухстраничный TB, а потом одна из этих страниц будет изменена
+        //(например, код перезапишется), то прыжок станет невалидным — он будет указывать на старый, уже недействительный код.
+        //Это приведёт к крашу или непредсказуемому поведению.
+        //Поэтому разработчики QEMU приняли решение : если текущий TB занимает две страницы, мы не будем патчить предыдущий TB.
+        //Вместо этого last_tb обнуляется, и прыжок не добавляется.Это защита от SMC - проблем, связанных с межстраничными блоками.
+        //Ограничение размера Translation Block
+        //Одна из ключевых проблем SMC в QEMU связана с тем, что один Translation Block(TB) может покрывать несколько страниц памяти.
+        //Патчи, исправляющие эту проблему, есть в коде[translate - all.c].Чтобы минимизировать вероятность ошибки, можно принудительно уменьшить размер TB.
+        //Где править : В файле accel / tcg / translate - all.c(в старых версиях translate - all.c).
+        //Что править : Нужно найти место, где определяется максимальное количество инструкций в блоке(max_insns).
+        //Обычно это внутри функции tb_gen_code.Можно попробовать жестко задать 1. // TCG_MAX_INSNS + TCG_MAX_TEMPS
+        //TCG_MAX_TEMPS — максимальное количество временных переменных(регистров), которые TCG может использовать при генерации кода.
+        //TCG_MAX_INSNS — максимальное количество инструкций гостя в одном Translation Block(TB).
+        //Этот параметр определяет, сколько инструкций гостя будет скомпилировано в один блок.
+        //Для "чистого runtime" тебе нужно, чтобы блоки были как можно меньше.
+        //Если каждый TB содержит всего 1 инструкцию, то при модификации кода ты теряешь максимум 1 инструкцию из кэша.
+        //Unicorn / QEMU будет перекомпилировать код каждый раз, когда встречает новую инструкцию.Кэширование практически перестает существовать.
+        //Это дает тебе "чистый runtime" — каждая инструкция выполняется как будто в первый раз.
+        if (!CheckNT<unsigned char>(jz__tb_find__last_tb, 0x74)) // jz
+        {
+            if (m_bLogRunner)
+                Log("InstallDangerNativeCoreFixes failed! Could not find jump opcode.");
+            MboxSTD("InstallDangerNativeCoreFixes failed! Could not find jump opcode.", AR_SNAME);
+            return;
+        }
+
+        // Lets disable tb_add_jump in tb_find by if (last_tb) cond for prevent native crash in tb_set_jmp_target
+        WriteNT<unsigned char>(jz__tb_find__last_tb, 0xEB); // jmp, never call crashly tb_add_jump
+
+
+        // crash in page_collection_lock read 0xC0000005 page_collection_lock (disabled curr in qemu) // патч от самих qemu #if 0 отключили
+        //void* page_collection_lock = (void*)AR_COREPTR(0x56EE99A0); // __cdecl
+        void* page_collection_lock = (void*)SearchPointerByPattern(hModule, moduleSize, "83 EC 10 53 55 56 57 6A 08 E8");
+        //void* page_collection_unlock = (void*)AR_COREPTR(0x56EE9BE0); // __cdecl
+        void* page_collection_unlock = (void*)SearchPointerByPattern(hModule, moduleSize, "56 8B 74 24 08 FF 36 E8");
+        // mov eax, 0; ret; // 0xB8 0x00 0x00 0x00 0x00; 0xC3
+        // xor eax, eax; ret; // 0x31 0xC0; 0xC3
+        // if stdcall like -> ret (sizeof(void*) * Nargs) // remove args from stack
+        unsigned int patch_no_func_cdecl = 0x90'C3'C0'31; // little-endian xor eax, eax; ret; nop;
+
+        if (!CheckNT<unsigned char>(page_collection_lock, 0x83)) // sub
+        {
+            if (m_bLogRunner)
+                Log("InstallDangerNativeCoreFixes failed! Could not find page_collection_lock opcode.");
+            MboxSTD("InstallDangerNativeCoreFixes failed! Could not find page_collection_lock opcode.", AR_SNAME);
+            return;
+        }
+
+        WriteNT<unsigned int>(page_collection_lock, patch_no_func_cdecl);
+
+        if (!CheckNT<unsigned char>(page_collection_unlock, 0x56)) // push
+        {
+            if (m_bLogRunner)
+                Log("InstallDangerNativeCoreFixes failed! Could not find page_collection_unlock opcode.");
+            MboxSTD("InstallDangerNativeCoreFixes failed! Could not find page_collection_unlock opcode.", AR_SNAME);
+            return;
+        }
+
+        WriteNT<unsigned int>(page_collection_unlock, patch_no_func_cdecl);
+
+
+        if (m_bLogRunner)
+            Log("[*] InstallDangerNativeCoreFixes: Successfully patched.");
+
+        m_bNativeCorePatchInstalled = true;
+
+#undef AR_COREPTR
+#endif
 }
 
 // TODO: others ntdll, ws
@@ -8969,6 +10108,15 @@ bool AsmRunner::ParseModuleSections()
     //}
 
     return !m_sections.empty();
+}
+
+void AsmRunner::Dump()
+{
+    DumpRegisters();
+    DumpFlags();
+    DumpSegmentRegisters();
+    DumpStack(20);
+    DisassembleWithZydis(true);
 }
 
 void AsmRunner::TrimInPlace(std::string& s)
@@ -12981,10 +14129,11 @@ void TESTA()
     static uintptr_t pRedLogEnd = _TADDR(0x630DD000); // size: 0x708000
 #endif
     const bool bBefore = false;
+    const bool bFromState = true;
     AsmRunner runner(false);
 
-    runner.Initialise(true, false, false, true);
-    runner.DumpRegisters();
+    runner.Initialise(true, false, false, true, !bFromState);
+    //runner.DumpRegisters();
 #ifdef T93
     runner.LoadIATEnv(szModIAT);
 #else
@@ -12994,20 +14143,30 @@ void TESTA()
     //runner.CompressDiffs({ "trace_0.txt", "trace_1.txt" }, "trace_cmp2.txt");
     //MboxSTD("CompressDiffs", "CompressDiffs");
 
-    //runner.CopyModule(szMod); // from nt
-    FILE* f = runner.FileOpen(szMod, "rb");
-    if (f) {
-        uintptr_t sz = (uintptr_t)runner.FileSize(f);
-        char* buf = (char*)malloc(sz);
-        runner.FileRead(f, buf, sz);
-        runner.FileClose(f);
-        runner.CopyModule(pModBase, (uintptr_t)buf, sz);
-        free(buf);
+    if (!bFromState)
+    {
+        //runner.CopyModule(szMod); // from nt
+        FILE* f = runner.FileOpen(szMod, "rb");
+        if (f) {
+            uintptr_t sz = (uintptr_t)runner.FileSize(f);
+            char* buf = (char*)malloc(sz);
+            runner.FileRead(f, buf, sz);
+            runner.FileClose(f);
+            runner.CopyModule(pModBase, (uintptr_t)buf, sz);
+            free(buf);
+        }
+    }
+    else {
+        runner.LoadRunStateEnvFile("1-800-000.bin", false); // try avoid fakin crash smc code with broken tcg qemu
     }
 
     //pEntry = _TADDR(0x123BD890);
     //pEntryArg = runner.AddMemory(0x1A0, UC_PROT_ALL, true);
     //runner.WriteMemory<uint32_t>(_TADDR(0x1260F444), 440);
+    runner.MemSet(_TADDR(0x12347891), 0x90, 5); // vmentry build post args
+    //runner.SetRWHistory(true);
+    //1'953'613
+    //[9'160'676] BFCB 0x139BBC25 ( +0x172BC25): ret 0x00 ; [0xC2 0x00 0x00]
 
     auto OpcodeCb = [&](uc_engine* uc, uintptr_t address, uint32_t size, ZydisMnemonic mnemonic, void* user_data) -> bool {
         auto* self = static_cast<AsmRunner*>(user_data);
@@ -13021,13 +14180,45 @@ void TESTA()
             SetConsoleColor(1);
         }
 
-        if (self->GetInstructionCount() > 4'304'723) {
+        //if (self->GetInstructionCount() > 1'953'610)
+        if (self->GetInstructionCount() > 1'825'000) // 1'825'433
+        {
             //self->SetLogDisasm(true);
+            //self->DumpStack(10);
+            //self->DumpRegisters();
+            //printf("OpcodeCb 0x%p (%d)\n", (void*)address, mnemonic);
+            //MboxSTD("GetInstructionCount", "OpcodeCb");
         }
         else {
             self->SetLogDisasm(false);
             //self->SetRWHistory(true);
         }
+
+        if (self->GetInstructionCount() == 1'800'000 && !bFromState) {
+            self->Dump();
+            printf("s 0x%p %d\n", address, size);
+            self->DumpMemory(address, size);
+            self->SaveRunStateEnvFile("1-800-000.bin");
+            MboxSTD("saved", "OpcodeCb");
+        }
+
+        //if (self->GetInstructionCount() == 1'825'433)
+        if (self->GetInstructionCount() > 1'825'425)
+        {
+            //self->Pause();
+            //self->Resume();
+            //if(!self->IsLogDisasm()) self->SaveRunStateEnvFile("1-825-425.bin");
+            self->SetLogDisasm(true);
+            //self->DumpRWHistorySelfModifying(_TADDR(0x13960000), _TADDR(0x14194000));
+            //self->UpdatePC(_TADDR(0x13B54BFA), true); // это пиздец, крашит прыжок tb_add_jump
+            MboxSTD("warnnn", "OpcodeCb");
+            //self->RequestShutdown(true);
+            //self->RemapModule();
+            //self->HardReset();
+            //self->DumpRegisters();
+            return true;
+        }
+        // todo env save+load, allocfreemap
 
         //if (address == _TADDR(0x12520AB8)) { // srand
         //	self->DumpStack(10);
@@ -13055,11 +14246,11 @@ void TESTA()
             //return false;
         }
 
-        uintptr_t outReg = 0;
-        std::string outName = "";
-        if (self->IsAnyReg((uintptr_t)'$eJ%', outReg, outName)) {
-            MboxSTD("IsAnyReg", "OpcodeCb");
-        }
+        //uintptr_t outReg = 0;
+        //std::string outName = "";
+        //if (self->IsAnyReg((uintptr_t)'$eJ%', outReg, outName)) {
+        //	MboxSTD("IsAnyReg", "OpcodeCb");
+        //}
 
         // log change funcs
         if (self->IsSymMapInitialised()) {
@@ -13108,37 +14299,37 @@ void TESTA()
         if (slpSystemTimeAsFileTime != 0 && self->IsInAddr(address, slpSystemTimeAsFileTime, slpSystemTimeAsFileTime + 8)) {
             printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
             //self->SetLogDisasm(true);
-            self->DisassembleWithZydis(true);
+            //self->DisassembleWithZydis(true);
             MboxSTD("slpSystemTimeAsFileTime", "MemCb");
 
         }
 
         //$eJ%sY^7DkIbD%e#
-        if (self->IsInAddr(address, 0x001F0D3C, 0x001F0D3C + 16) && isWrite) {
-            n1++;
-            if (n1 > 5) {
-                self->DumpMemory(0x001F0D3C, 16);
-                //self->SetRWHistory(true);
-                //self->SetPCTraceFull("trace.txt", nullptr, true, 0, 0, 0, true, true, true, true, true, false, true);
-                if (n1 > 7) { // 6 before time
-                    //self->SetPCTrace("trace.txt", nullptr, true, 0x12290000, /*9'500'000*/0, 3 * 0); // def
-                    //self->DumpStack(50);
-                    //self->DumpRegisters();
-                    //self->WaitBuff(self->GetStackMinAddrBP(), self->GetStackMaxAddrSP() - self->GetStackMinAddrBP());
-                    //self->DumpRWHistoryFile("_HIS" + std::to_string(n1) + ".txt");
-                    //self->ClearRWHistory();
-                }
-                if (n1 > 8) {
-                    //return false;
-                }
+        //if (self->IsInAddr(address, 0x001F0D3C, 0x001F0D3C + 16) && isWrite) {
+        //	n1++;
+        //	if (n1 > 5) {
+        //		self->DumpMemory(0x001F0D3C, 16);
+        //		//self->SetRWHistory(true);
+        //		//self->SetPCTraceFull("trace.txt", nullptr, true, 0, 0, 0, true, true, true, true, true, false, true);
+        //		if (n1 > 7) { // 6 before time
+        //			//self->SetPCTrace("trace.txt", nullptr, true, 0x12290000, /*9'500'000*/0, 3 * 0); // def
+        //			//self->DumpStack(50);
+        //			//self->DumpRegisters();
+        //			//self->WaitBuff(self->GetStackMinAddrBP(), self->GetStackMaxAddrSP() - self->GetStackMinAddrBP());
+        //			//self->DumpRWHistoryFile("_HIS" + std::to_string(n1) + ".txt");
+        //			//self->ClearRWHistory();
+        //		}
+        //		if (n1 > 8) {
+        //			//return false;
+        //		}
 
-                printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
-                self->DumpMemoryVal(value, size);
-                //self->SetLogDisasm(true);
-                self->DisassembleWithZydis(true);
-                MboxSTD("0x001F0D3C", "MemCb");
-            }
-        }
+        //		printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n", (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
+        //		self->DumpMemoryVal(value, size);
+        //		//self->SetLogDisasm(true);
+        //		//self->DisassembleWithZydis(true);
+        //		//MboxSTD("0x001F0D3C", "MemCb");
+        //	}
+        //}
 
 
         //////std::vector<uint8_t> bytes(size);
@@ -13172,7 +14363,7 @@ void TESTA()
                 (void*)address, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
 
             self->DumpRegisters();
-            self->DumpRWHistory();
+            //self->DumpRWHistory();
             SetConsoleColor(3);
             tFuncNode* sym = self->FindSymbolByRuntime(address); // iat and symmap
             if (sym) printf("%s\n", sym->GetAbsoluteName().c_str());
@@ -13255,28 +14446,28 @@ void TESTA()
 
     runner.SetCallbacks(OpcodeCb, &runner, MemCb, &runner, JmpCb, &runner);
 
-    runner.SetMemoryRangeCB(tRange(_TADDR(0x12544000), _TADDR(0x1395D000)), [&](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size,
-        uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
-            auto* self = static_cast<AsmRunner*>(user_data);
-            bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT || type == UC_MEM_READ_AFTER);
-            bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
-            bool isAnyFetch = (type == UC_MEM_FETCH || type == UC_MEM_FETCH_UNMAPPED || type == UC_MEM_FETCH_PROT); // code read
+    //runner.SetMemoryRangeCB(tRange(_TADDR(0x12544000), _TADDR(0x1395D000)), [&](uc_engine* uc, int32_t type, uintptr_t address, uintptr_t size,
+    //		uintptr_t value, ZydisMnemonic mnemonic, void* user_data) -> bool {
+    //			auto* self = static_cast<AsmRunner*>(user_data);
+    //			bool isRead = (type == UC_MEM_READ || type == UC_MEM_READ_UNMAPPED || type == UC_MEM_READ_PROT || type == UC_MEM_READ_AFTER);
+    //			bool isWrite = (type == UC_MEM_WRITE || type == UC_MEM_WRITE_UNMAPPED || type == UC_MEM_WRITE_PROT);
+    //			bool isAnyFetch = (type == UC_MEM_FETCH || type == UC_MEM_FETCH_UNMAPPED || type == UC_MEM_FETCH_PROT); // code read
 
-            uintptr_t a = self->CalcWithCASLR(address);
+    //			uintptr_t a = self->CalcWithCASLR(address);
 
-            if (self->GetInstructionCount() >= 4'495'273) {
-                //self->SetPCTraceFull("trace.txt", nullptr, true, 0, 0, 0, true, true, true, true, true, false, false);
+    //			if (self->GetInstructionCount() >= 4'495'273) {
+    //				//self->SetPCTraceFull("trace.txt", nullptr, true, 0, 0, 0, true, true, true, true, true, false, false);
 
-                printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n",
-                    (void*)a, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
+    //				printf("MemCb address 0x%p type %d size %d value %d pc 0x%p mn %d r %d w %d\n",
+    //					(void*)a, type, size, value, (void*)self->CurrentPc(uc), mnemonic, isRead, isWrite);
 
-                MboxSTD("SetMemoryRangeCB", "asm runner");
-            }
+    //				MboxSTD("SetMemoryRangeCB", "asm runner");
+    //			}
 
 
-            return true;
-        },
-        &runner);
+    //			return true;
+    //	},
+    //	&runner);
 
     {
         runner.SetAnyJmpHook(runner.FindIATNode("RtlEnterCriticalSection", "ntdll.dll")->GetAbsolute(),
@@ -13591,8 +14782,8 @@ void TESTA()
                 //ft = 0x01DD0590972804C6; // NERzZEBYQkt4ZF5nSzcoUxCs_gLK6Bh50pc3tWiZeX3AtcgFUaPqVyEDkWnASFj2
                 ft.dwHighDateTime = 0x01DD0590; // 4Dsd@XBKxd^gK7(S
                 ft.dwLowDateTime = 0x972804C6;
-                ft.dwHighDateTime = 0x0; // $eJ%sY^7DkIbD%e#
-                ft.dwLowDateTime = 0x0; // $eJ%sY^7DkIbD%e#
+                //ft.dwHighDateTime = 0x0; // $eJ%sY^7DkIbD%e#
+                //ft.dwLowDateTime = 0x0; // $eJ%sY^7DkIbD%e#
                 //ft.dwLowDateTime = 0x1; // &wfu93)s0eIT40*n
                 //ft.dwLowDateTime = 0x2; // &wfu93)s0eIT40*n
                 //ft.dwLowDateTime = 0x6; // &wfu93)s0eIT40*n
@@ -13653,6 +14844,39 @@ void TESTA()
 
                 return true;
             }, & runner, bBefore, false, runner.FindIATNode("GetSystemTimeAsFileTime", "kernel32.dll")->GetAbsoluteName());
+
+        runner.SetAnyJmpHook(runner.FindIATNode("Sleep", "kernel32.dll")->GetAbsolute(),
+            [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+            {
+                auto* self = static_cast<AsmRunner*>(user_data);
+                if (!self)
+                    return true;
+
+                //hcb(self->FindIATNode("Sleep", "kernel32.dll"));
+
+                printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
+                    (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+
+                const bool bShouldPopArgs_NoCdecl = true; // true=stdcall pop like, false=cdecl peek
+
+                // Получаем аргументы
+                uintptr_t dwMilliseconds = 0;
+                uintptr_t retaddr = 0;
+                if (bBefore) {
+                    retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+                }
+                else if (!self->StackPop(retaddr)) {
+                    return false;
+                }
+
+                if (!self->StackGetArg(dwMilliseconds, 0, bShouldPopArgs_NoCdecl)) return false;
+
+                printf("[Sleep] dwMilliseconds=0x%X\n", dwMilliseconds);
+
+                self->UpdatePC(retaddr, true);
+
+                return true;
+            }, & runner, bBefore, false, runner.FindIATNode("Sleep", "kernel32.dll")->GetAbsoluteName());
 
         runner.SetAnyJmpHook(runner.FindIATNode("GetLastError", "kernel32.dll")->GetAbsolute(),
             [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size,
@@ -13866,11 +15090,12 @@ void TESTA()
             if (!self->StackGetArg(pUrl, 0, bShouldPopArgs_NoCdecl)) return false;
 
             uintptr_t pTicket = self->GetRegister(self->CxReg());
+
             self->DumpMemory(pUrl, 250);
             self->DumpMemory(pTicket, 250);
 
+            uintptr_t paPostAnswer = pTicket + 0x00000408;
             //uintptr_t pbDoneRequest = pData + 0x00000754;
-            //uintptr_t paPostAnswer = pData + 0x00018E00;
             //self->WriteMemory<bool>(pbDoneRequest, true);
 
             //const char* filename = "answ.bin";
@@ -13882,9 +15107,9 @@ void TESTA()
             //delete[] buffer;
             //buffer = nullptr;
             //self->FileClose(file);
-            //self->DumpMemory(paPostAnswer, 150);
+            self->DumpMemory(paPostAnswer, 150);
 
-            //self->SetRegister(self->AxReg(), paPostAnswer);
+            self->SetRegister(self->AxReg(), paPostAnswer);
 
             MboxSTD("custom wait", "post");
 
@@ -13944,7 +15169,7 @@ void TESTA()
                 self->UpdatePC(retaddr, true);
 
                 return true;
-        }, &runner, bBefore, true, "pMd5");
+            }, &runner, bBefore, true, "pMd5");
 
     static int nmc = 0;
     runner.SetAnyJmpHook(pMemcpy,
@@ -13956,8 +15181,9 @@ void TESTA()
 
             //MboxSTD("custom wait", "Free");
 
-            printf("[hook] hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
+            printf("[hook] pMemcpy hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
                 (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+            MboxSTD("custom wait", "pMemcpy");
 
             tFuncNode* pNode = self->FindIATNode(to);
             if (pNode)
@@ -13988,10 +15214,10 @@ void TESTA()
 
             self->MemCpy(_dst, _src, _size);
             self->DumpMemory(_src, _size);
-            nmc++;
-            printf("memcpy %d\n", nmc);
-            if (nmc > 12)
-                MboxSTD("custom wait", "pMemcpy");
+            //nmc++;
+            //printf("memcpy %d\n", nmc);
+            //if(nmc > 12)
+            //MboxSTD("custom wait", "pMemcpy");
 
             self->SetRegister(self->AxReg(), _dst);
             self->UpdatePC(retaddr, true);
@@ -14108,51 +15334,52 @@ void TESTA()
                 self->UpdatePC(retaddr, true);
 
                 return true;
-            }, &runner, bBefore, true, "pAes128U");
-
-    runner.SetAnyJmpHook(pRand,
-        [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
-        {
-            auto* self = static_cast<AsmRunner*>(user_data);
-            if (!self)
-                return true;
-
-            printf("[hook] pRand hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
-                (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
-
-            //MboxSTD("custom wait", "pRand");
-            //self->DumpRegisters();
-            //self->DumpStack(7);
-
-            const bool bShouldPopArgs_NoCdecl = false; // true=stdcall pop like, false=cdecl peek
-
-
-
-            uintptr_t retaddr = 0;
-            if (bBefore) {
-                retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
-            }
-            else if (!self->StackPop(retaddr)) {
-                return false;
-            }
-
-
-
-            //uintptr_t pbDoneRequest = pData + 0x00000754;
-            //uintptr_t paPostAnswer = pData + 0x00018E00;
-            //self->WriteMemory<bool>(pbDoneRequest, true);
-            static uintptr_t rnd = 70;
-            printf("rnd %d\n", rnd);
-            self->SetRegister(self->AxReg(), rnd);
-            ++rnd;
-
-            MboxSTD("custom wait", "pRand");
-
-            // Устанавливаем возврат
-            self->UpdatePC(retaddr, true);
-
-            return true;
         }, &runner, bBefore, true, "pAes128U");
+
+    if (0)
+        runner.SetAnyJmpHook(pRand,
+            [&](uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data) -> bool
+            {
+                auto* self = static_cast<AsmRunner*>(user_data);
+                if (!self)
+                    return true;
+
+                printf("[hook] pRand hit: from=0x%p to=0x%p size=%u mnemonic=%u pc=0x%p\n",
+                    (void*)from, (void*)to, (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
+
+                //MboxSTD("custom wait", "pRand");
+                //self->DumpRegisters();
+                //self->DumpStack(7);
+
+                const bool bShouldPopArgs_NoCdecl = false; // true=stdcall pop like, false=cdecl peek
+
+
+
+                uintptr_t retaddr = 0;
+                if (bBefore) {
+                    retaddr = self->ExtractAnyIpTransferReturn(mnemonic, from, size);
+                }
+                else if (!self->StackPop(retaddr)) {
+                    return false;
+                }
+
+
+
+                //uintptr_t pbDoneRequest = pData + 0x00000754;
+                //uintptr_t paPostAnswer = pData + 0x00018E00;
+                //self->WriteMemory<bool>(pbDoneRequest, true);
+                static uintptr_t rnd = 70;
+                printf("rnd %d\n", rnd);
+                self->SetRegister(self->AxReg(), rnd);
+                ++rnd;
+
+                MboxSTD("custom wait", "pRand");
+
+                // Устанавливаем возврат
+                self->UpdatePC(retaddr, true);
+
+                return true;
+            }, &runner, bBefore, true, "pAes128U");
 
 #ifdef T93
     runner.SetRegister(runner.CxReg(), pEntryArg);
@@ -14168,11 +15395,26 @@ void TESTA()
     runner.SetLogDisasmICNotice(100'000);
     runner.SetDisasmSepGroup(3);
 
-    runner.WriteMemory<uint32_t>(pnSteamID_SHL1, 0x47CE6816); // 1204709398
+    //runner.WriteMemory<uint32_t>(pnSteamID_SHL1, 0x47CE6816); // 1204709398
     //runner.WriteMemory<uint32_t>(pnSteamID_SHL1, 3531943054); // 3531943054 1765971527
     //runner.WriteMemory<uint32_t>(pnSteamID_SHL1, 0x0E8B0D6C6); // orig
 
-    runner.Run(pEntry, 0);
+    try
+    {
+        if (!bFromState)
+            runner.Run(pEntry, 0);
+        else
+            runner.RunCurrentPC(0);
+        //while (!runner.Run(pEntry, 0)) {
+        //	runner.HardReset();
+        //}
+    }
+    catch (const std::exception& e) {
+        printf("std::exception: %s\n", e.what());
+    }
+    catch (...) {
+        printf("Unknown C++ exception\n");
+    }
     runner.DumpMemory(pEntryArg, 0x1A0);
 
     runner.Shutdown();
@@ -14398,6 +15640,9 @@ void VMTEST(int a1)
             self->SetLogDisasm(false);
         }
 
+        //if (self->GetInstructionCount() == (nA1 - 50))
+        //	self->SaveRunStateEnvFile("nA1.bin");
+
         if (self->GetInstructionCount() > 143'353'261) //0-142'917'282 //id-143'353'281
         {
             printf("size=%u mnemonic=%u pc=0x%p\n", (unsigned)size, (unsigned)mnemonic, (void*)self->CurrentPc(uc));
@@ -14412,7 +15657,7 @@ void VMTEST(int a1)
             //self->DumpFlags();
             //self->DumpSegmentRegisters();
             self->DumpStack(7);
-            MboxSTD("apply this opcode", "disasm");
+            //MboxSTD("apply this opcode", "disasm");
         }
 
 
@@ -15175,6 +16420,8 @@ void VMTEST(int a1)
 
     runner.ParseModuleSections();
     runner.SetLogDisasmSection(true);
+    runner.SetDisasmSepGroup(3);
+    //runner.LoadRunStateEnvFile("nA1.bin");
     runner.Run(reinterpret_cast<uintptr_t>(pEntry), 0); // 0 = без лимита по шагам // 800 000 crc copy
     runner.DumpMemory(pToken, 50);
     runner.DumpMemory(pTokenProt, 50);

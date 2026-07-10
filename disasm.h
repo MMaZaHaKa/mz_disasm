@@ -3,6 +3,47 @@
 #define UNICORN //  .\vcpkg install unicorn:x86-windows unicorn:x64-windows  // .\vcpkg integrate install
 //#define CAPSTONE
 #define ZYDIS //  .\vcpkg install zydis:x86-windows zydis:x64-windows  // .\vcpkg integrate install
+//vcpkg install unicorn:x64-windows-static zydis:x64-windows-static
+//vcpkg install unicorn:x86-windows-static zydis:x86-windows-static
+
+#if 0
+#define ZYDIS_STATIC_BUILD
+
+#ifdef _DEBUG // (/MTd)
+#pragma comment(linker, "/NODEFAULTLIB:msvcrt.lib")
+#pragma comment(linker, "/NODEFAULTLIB:msvcrtd.lib")
+#pragma comment(linker, "/NODEFAULTLIB:msvcp140.lib")
+#pragma comment(linker, "/NODEFAULTLIB:vcruntime.lib")
+#pragma comment(linker, "/NODEFAULTLIB:ucrt.lib")
+
+#pragma comment(linker, "/DEFAULTLIB:libcmtd.lib")
+#pragma comment(linker, "/DEFAULTLIB:libvcruntimed.lib")
+#pragma comment(linker, "/DEFAULTLIB:libucrtd.lib")
+
+#pragma comment(lib, "zycore.lib")
+#pragma comment(lib, "zydis.lib")
+#pragma comment(lib, "unicorn.lib")
+#else
+#pragma comment(linker, "/NODEFAULTLIB:msvcrt.lib")
+#pragma comment(linker, "/NODEFAULTLIB:msvcrtd.lib")
+#pragma comment(linker, "/NODEFAULTLIB:msvcp140.lib")
+#pragma comment(linker, "/NODEFAULTLIB:vcruntime.lib")
+#pragma comment(linker, "/NODEFAULTLIB:ucrt.lib")
+
+#pragma comment(linker, "/DEFAULTLIB:libcmt.lib")
+#pragma comment(linker, "/DEFAULTLIB:libvcruntime.lib")
+#pragma comment(linker, "/DEFAULTLIB:libucrt.lib")
+
+#pragma comment(lib, "zycore.lib")
+#pragma comment(lib, "zydis.lib")
+#pragma comment(lib, "unicorn.lib")
+#endif
+#pragma comment(linker, "/IGNORE:2038")
+#pragma comment(linker, "/IGNORE:4099")
+#pragma comment(linker, "/IGNORE:4217")
+#pragma comment(linker, "/IGNORE:4049")
+#pragma comment(linker, "/FORCE:MULTIPLE")
+#endif
 
 #ifdef UNICORN // эмулятор
 #include <unicorn/unicorn.h>
@@ -25,6 +66,8 @@
 //#define AR_BP_AFTER_DZ // faster dz
 //#define AR_BP_RANGE // size or range
 #define AR_DFT // BPF verifier per-register parent pointers bpf_reg_state // Data Flow Tracing, Taint Tracking Data Tracking
+#define AR_NTCORE_PATCH // SMC crash fix
+//#define AR_STATE_SEG // не включать, ломает уебанские нерабочие сегменты, size не тот и тд
 
 // windows header hell kek
 #undef CopyMemory
@@ -33,9 +76,13 @@
 
 // TODO: normal seh+frame unwind MSR_FS_BASE, tls UC_X86_REG_FS_BASE in SetTebBase, breakpoint condition cb, cb UC_HOOK_INSN, UC_HOOK_INTR, cb on register change?, trace deadzone?
 // символьное исполнение LLVM Guided Symbolic Evaluation + BPF verifier per-register parent pointers bpf_reg_state // Data Flow Tracing, Taint Tracking Data Tracking
+// todo FreeMemory alloc map + size
 // UC bugs: 1 can't set fs: but res ok, 2 update pc + emu_stop() can't stop emu
 // все хуки в Unicorn по умолчанию являются pre-hooks, Разработчики обсуждали добавление пост-хуков, но столкнулись с техническими сложностями из-за JIT-компиляции (особенно с повторяющимися инструкциями вроде REP STOS) .
 // Поэтому официально реализованы только pre-hooks.
+// сшивания TCG Translation Blocks tb_add_jump chaining translation blocks (TB chaining)  краш на SMC коде
+// 
+//#define AR_TRY_FIX_TCG // self-modifying SMC
 
 #include <vector>
 #include <map> // X_bound
@@ -138,6 +185,64 @@ enum eBpType : uint32_t
 	BP_MEM_RW = 3   // чтение или запись // access
 };
 
+static constexpr uint32_t kArMagic = 0x41535452u; // 'ASTR'
+static constexpr uint32_t kArVersion = 1u;
+
+static constexpr uint32_t kChunkREGS = 0x53474552u; // 'REGS'
+static constexpr uint32_t kChunkMEMS = 0x534D454Du; // 'MEMS'
+static constexpr uint32_t kChunkEND = 0x444E4524u; // '$END'
+
+#pragma pack(push, 1)
+struct ArFileHdr
+{
+	uint32_t magic;
+	uint32_t version;
+	uint8_t  bis64;
+	uint8_t  bHasModuleData;
+	uint8_t  reserved[2];
+	uint64_t iccount;
+	uint64_t stepsDeep;
+	uint64_t modStart;
+	uint64_t modEnd;
+	char     modName[256];
+	uint64_t stackBase;
+	uint64_t stackSize;
+	uint64_t fsBase;
+	uint64_t fsSize;
+	uint64_t fsLastError;
+	uint64_t allocBase;
+	uint64_t allocCursor;
+	uint64_t savedPC;
+};
+
+struct ArRegsBlob
+{
+	uint64_t ax, bx, cx, dx, si, di, bp, sp, ip;
+	uint64_t flags;
+	uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+	uint64_t fs_base, gs_base;
+	uint16_t cs, ds, es, fs_sel, gs_sel, ss;
+	uint8_t  _pad[4];
+};
+
+struct ArMemEntry
+{
+	uint64_t addr;
+	uint64_t mapSize;
+	uint32_t prot;
+	uint8_t  regionType; // 0=generic 1=stack 2=teb 3=module
+	uint8_t  hasData;
+	uint8_t  _pad[2];
+	// followed by mapSize bytes if hasData==1
+};
+
+struct ArChunkHdr
+{
+	uint32_t tag;
+	uint32_t size;
+};
+#pragma pack(pop)
+
 
 class AsmRunner // x86 x64 with macro
 {
@@ -196,6 +301,8 @@ public:
 	bool IsSkipCBCallsWithNewPC() const { return m_bSkipCBCallsWithNewPC; }
 	void SetRWHistory(bool enabled) { m_bRWHistory = enabled; }
 	bool IsRWHistory() const { return m_bRWHistory; }
+	//void RequestShutdown(bool enabled) { m_bRequestShutdown = enabled; }
+	//bool IsRequestedShutdown() const { return m_bRequestShutdown; }
 	bool IsSymMapInitialised() const { return m_sym.size() != 0; }
 	uintptr_t GetModStart() const { return m_modStart; }
 	uintptr_t GetModEnd() const { return m_modEnd; }
@@ -287,6 +394,7 @@ public:
 	uintptr_t MemCpy(uintptr_t pVTo, uintptr_t pVFrom, uintptr_t nSize);
 	uintptr_t StrLen(uintptr_t pVStr);
 	bool FreeMemory(uintptr_t pVTo);
+	bool FreeMemory(uintptr_t pVTo, uintptr_t nSize);
 	bool ChangeMemoryType(uintptr_t pVTo, uint32_t nType = UC_PROT_ALL);
 	void DumpMemory(const char* szFileOutPath, uintptr_t pStart, uintptr_t nSize); // file
 	void DumpMemory(uintptr_t pStart, uintptr_t nSize); // to console DataToHexString
@@ -349,6 +457,7 @@ public:
 	bool StackSetValue(uintptr_t v, bool bEsp = true, int32_t nIdx = 0);
 	// вызывать StackGetArg после call перед эпилогом, после stackpop return address
 	bool StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl); // true=stdcall pop like, false=cdecl peek
+	void InitialiseSegmentRegisters();
 	uintptr_t ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size);
 	void SetFakeSehTeb(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	void CopyNTSeh(uintptr_t pAddr = 0, uintptr_t nSize = 0);
@@ -391,6 +500,14 @@ public:
 	bool CopyModule(uintptr_t pFrom, uintptr_t nSize = 0, std::string sModName = ""); // if nSize 0 GetMappedModuleBounds, after CopyModuleToUnicorn(rename), 
 	bool CopyModule(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, std::string sModName = "");
 	void LoadModule(const char* szModule); // mz pe? (exe+dll)
+	void RemapModule();
+	void* SaveRunStateEnv(uintptr_t& nOutSize);
+	void* SaveRunStateEnvNT(uintptr_t& nOutSize);
+	void LoadRunStateEnv(void* pReadBuff, bool bRun = false);
+	void SaveRunStateEnvFile(std::string file);
+	void SaveRunStateEnvNTFile(std::string file);
+	void LoadRunStateEnvFile(std::string file, bool bRun = false);
+	void HardReset();
 	void ResolveIATModule();
 	uintptr_t GetRandomEntryPoint();
 	void AddExecRegion(uintptr_t pStart, uintptr_t pEnd);
@@ -401,10 +518,13 @@ public:
 		bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bSym = true, bool bShortFmt = false, bool bDisasmRW = true);
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
 	bool CompressDiffs(std::vector<std::string> files, std::string outFile);
-	void Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
+	bool RunCurrentPC(uintptr_t nStepsDeep);
+	bool Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
+	bool TryRun(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
 	void Pause();
 	void Resume();
 	void Stop();
+	void Restart();
 	void B(intptr_t nOps); // -2 +2 b branch like mips, update eip, manual jmp // pause, eip, Resume?
 	void TraceInstruction(const char* szTraceFileOutPath, uintptr_t pStart, uint32_t nMaxCount = 0, TraceCb cb = nullptr, bool bPCArray = false); // 0 until end, cb can null autofalse
 	void DumpRegisters(bool bFull = true); // and flags
@@ -416,10 +536,13 @@ public:
 	std::string FormatRWHistoryLine(const tRWHistory& h, bool bValNotice, bool bRVA, bool bSym, bool bShortFmt, bool bDisasm);
 	void DumpRWHistory(uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false, bool bDisasm = true);
 	void DumpRWHistoryFile(std::string fName, uintptr_t nLimSize = 0, bool bStartLim = false, bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bRVA = true, bool bSym = true, bool bShortFmt = false, bool bDisasm = true);
+	void DumpRWHistorySelfModifying(uintptr_t pTextSec, uintptr_t pTextSecEnd);
 	void ClearRWHistory();
 	void AddDeadzoneIC(uintptr_t startIC, uintptr_t endIC, bool checkPC = true, bool showEnterMessage = true, bool skipAll = true, bool skipJmps = true, bool skipMem = true, bool skipOpcode = true, bool skipTrace = true, bool skipHistory = true);
+	void InstallDangerNativeCoreFixes();
 	void InstallDefaultHooks(HookNotifyCb cb);
 	bool ParseModuleSections();
+	void Dump();
 
 	// Disasm (Capstone, Zydis) // if not InitialiseSymMap default disasm, else macro
 	void InitialiseSymMap(const char* szPath, uintptr_t nSymASLR = 0); // ppsspp sym map like // fmt: 0xptr NAME // example [0x60F2F0DA] 0x126FDF68: call 0x1288231E  [0x60F2F0DA] 0x126FDF68: call FUNC_23
@@ -721,6 +844,40 @@ public:
 		return s;
 	}
 
+	// Native
+	template<typename T> void* WriteNT(void* address, T value, int offset = 0)
+	{
+		if (address == nullptr) {
+			if (m_bLogRunner)
+				Log("Write: Incorrect address.");
+
+			return nullptr;
+		}
+
+		uintptr_t new_address = reinterpret_cast<uintptr_t>(address) + offset;
+
+		DWORD oldProtect;
+		if (!VirtualProtect(reinterpret_cast<void*>(new_address), sizeof(T), PAGE_READWRITE, &oldProtect)) {
+			if (m_bLogRunner)
+				Log("Write: Erorr while calling VirtualProtect.");
+			return nullptr;
+		}
+
+		memcpy(reinterpret_cast<void*>(new_address), &value, sizeof(T));
+
+		VirtualProtect(reinterpret_cast<void*>(new_address), sizeof(T), oldProtect, &oldProtect);
+
+		return reinterpret_cast<void*>(new_address + sizeof(T));
+	}
+
+	template<typename T> bool CheckNT(void* address, T value, int offset = 0)
+	{
+		if (!address)
+			return false;
+
+		return *(T*)&((unsigned char*)address)[offset] == value;
+	}
+
 private:
 	// состояние трасировки Tenet
 	struct tTraceState
@@ -871,6 +1028,11 @@ private:
 	uintptr_t m_DisasmSepGroup = 0;
 	bool m_bInitIAT = false;
 	bool m_bSkipCBCallsWithNewPC = false;
+	bool m_bRequestShutdown = false;
+#ifdef AR_NTCORE_PATCH
+	bool m_bNativeCorePatchInstalled = false;
+#endif
+
 
 	std::vector<tFuncNode> m_sym;
 	std::vector<tAnyJmpHookNode> m_anyJmpHooks; // when any call smth from here
@@ -910,8 +1072,15 @@ private:
 	uintptr_t m_lastPC = 0;
 
 	uintptr_t m_instrCount = 0;
+	uintptr_t m_nRunStepsDeep = 0;
 	uc_hook m_hkCode = 0;
 	uc_hook m_hkMem = 0;
+	struct tMemMapEntry
+	{
+		uintptr_t size;
+		uint32_t prot;
+	};
+	std::unordered_map<uintptr_t, tMemMapEntry> m_memMap; // addr -> {mapped_size, prot}
 
 	uint64_t m_instructionsPerSecond = 0;
 	uint64_t m_filetimeUnitsPerSecond = 10000000ULL;
@@ -987,6 +1156,9 @@ private:
 	std::string FormatCurrentSymbolSuffix(uintptr_t rtAddr);
 
 	// more helpers
+	void* SaveRunStateEnvImpl(uintptr_t& nOutSize, bool bIncludeModuleData, bool bIncludeAllocMap);
+	void RunStateEnvLoadRegs(uc_engine* uc, bool bX64, const ArRegsBlob& r);
+	ArRegsBlob RunStateEnvSaveRegs(uc_engine* uc, bool bX64);
 	bool ReadBytes(uc_engine* uc, uint64_t address, uint32_t size, std::vector<uint8_t>& out) const;
 	std::string RegName(uint32_t reg) const;
 	bool IsInModule(uintptr_t addr) const;
