@@ -316,10 +316,18 @@ public:
 	bool IsTEBAddr(uintptr_t p) { return IsInAddr(p, GetFSTEBStart(), GetFSTEBEnd()); }
 	void SetFSTEBLastError(uintptr_t lastError) { m_fsLastError = lastError; }
 	uintptr_t GetFSTEBLastError() const { return m_fsLastError; }
+	void SetUnhandledExceptionFilter(uintptr_t unhandledExceptionFilter) { m_unhandledExceptionFilter = unhandledExceptionFilter; }
+	uintptr_t GetUnhandledExceptionFilter() const { return m_unhandledExceptionFilter; }
 	uint64_t GetInstructionsPerSecond() const { return m_instructionsPerSecond; }
 	uint64_t GetFiletimeUnitsPerSecond() const { return m_filetimeUnitsPerSecond; }
 	void SetFlsValue(uintptr_t index, uintptr_t value);
 	uintptr_t GetFlsValue(uintptr_t index);
+	void SetDebugCanarySecurityInitCookie(const uint8_t* pattern, size_t size) { m_DebugCanarySecurityInitCookie.assign(pattern, pattern + size); }
+	void SetDebugCanarySecurityInitCookie(const std::vector<uint8_t>& pattern) { m_DebugCanarySecurityInitCookie = pattern; }
+	const std::vector<uint8_t>& GetDebugCanarySecurityInitCookie() const { return m_DebugCanarySecurityInitCookie; }
+	void AddRestartICPoints(uintptr_t ic) { m_RestartICPoints.push_back(ic); }
+	std::vector<uintptr_t>& GetRestartICPoints() { return m_RestartICPoints; }
+	void SetSecurityCookieRWNotify(uintptr_t sc) { __security_cookie = sc; }
 
 	// core lifecycle
 	void Initialise(bool bLogDisasm, bool bLogMemRW, bool bLogAnyJmp, bool bLogRunner, bool bInitUC = true); // set log, init unicorn, init disasms, alloc stack, alloc seh(:fs)
@@ -383,14 +391,18 @@ public:
 	static std::vector<tMemoryRegion> FindRegions(SIZE_T targetSize = 0, DWORD targetType = 0, DWORD targetProtect = 0, DWORD targetState = MEM_COMMIT);
 	static void CompareRegionsSnapshots(const std::vector<tMemoryRegion>& oldRegions, const std::vector<tMemoryRegion>& newRegions, bool bExtra = true);
 	static bool IsNTMemoryReadable(uintptr_t address, uintptr_t size = 1);
+	static std::string CleanFileName(std::string name);
+	static uint32_t fast_hash32(const void* key, uint32_t len, uint32_t seed = 0);
+	static uint32_t hash_combine(uint32_t seed, uint32_t value);
 
 	// Mem
 	uintptr_t AddMemory(uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/, bool bAlign /*= true*/);
 	uintptr_t AddMemory(uintptr_t pFrom, uintptr_t nSize, uint32_t nType/* = UC_PROT_ALL*/, bool bAlign /*= true*/);
 	bool AddMemoryTo(uintptr_t pVTo, uintptr_t nSize, uint32_t nType = UC_PROT_ALL, bool bAlign = true);
 	bool AddMemoryFromBuff(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize, uint32_t nType = UC_PROT_ALL, bool bAlign = true);
+	void InitNewMemory(uintptr_t pAddr, uintptr_t nSize);
 	void CopyMemory(uintptr_t pVTo, uintptr_t pFrom, uintptr_t nSize); // memcpy
-	uintptr_t MemSet(uintptr_t pAddr, int32_t nVal, uintptr_t nSize);
+	uintptr_t MemSet(uintptr_t pAddr, int8_t nVal, uintptr_t nSize);
 	uintptr_t MemCpy(uintptr_t pVTo, uintptr_t pVFrom, uintptr_t nSize);
 	uintptr_t StrLen(uintptr_t pVStr);
 	bool FreeMemory(uintptr_t pVTo);
@@ -403,7 +415,8 @@ public:
 	void DumpMemory(uintptr_t pNativeStart, uintptr_t pVTStart, uintptr_t nSize);
 	uintptr_t DumpMemoryNTAlloc(uintptr_t pStart, uintptr_t nSize);
 	uintptr_t DumpMemoryAlloc(uintptr_t pStart, uintptr_t nSize); // ?
-	void WaitBuff(uintptr_t pVaddr, uintptr_t size);
+	void EditBuff(uintptr_t pVaddr, uintptr_t size);
+	void WaitBuff(uintptr_t pVaddr, uintptr_t size) { EditBuff(pVaddr, size); } // wrapper
 	bool IsModuleAddr(uintptr_t pAddr);
 	bool IsHaltAddr(uintptr_t pAddr);
 	bool InExtraRegion(uintptr_t pAddr);
@@ -459,7 +472,7 @@ public:
 	bool StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl); // true=stdcall pop like, false=cdecl peek
 	void InitialiseSegmentRegisters();
 	uintptr_t ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size);
-	void SetFakeSehTeb(uintptr_t pAddr = 0, uintptr_t nSize = 0);
+	void SetTeb(uintptr_t pAddr = 0, uintptr_t nSize = 0, bool bUseDefaultAddr = false);
 	void CopyNTSeh(uintptr_t pAddr = 0, uintptr_t nSize = 0);
 	bool SetTebBase(uintptr_t base);
 	uintptr_t GetTebBase() const;
@@ -480,6 +493,7 @@ public:
 		std::string disasm;
 	};
 	void SetAnyJmpHook(uintptr_t pAddr, OnJmpCb cb, void* data = nullptr, bool callBefore = false, bool moduleHook = false, std::string sFuncName = ""); // !moduleHook for new dummy region
+	void GenerateIDCIATFix(std::string outfile, uintptr_t pIATStart, uintptr_t pIATEnd, uintptr_t pIDBASLR, uintptr_t nMaxDeep = 3000, bool bGenSectionDummy = true);
 	void SetIAT(uintptr_t pStart, uintptr_t pEnd, bool bTryResolveInModule = true, bool bRIMEscapeHook = true, bool bSaveRIM = false);
 	bool SaveIATEnv(const char* szIATEnvFile, bool bRecaptureEnv = true);
 	bool LoadIATEnv(const char* szIATEnvFile, uintptr_t nMaxSize = AR_MAX_FSIZE);
@@ -518,9 +532,10 @@ public:
 		bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bSym = true, bool bShortFmt = false, bool bDisasmRW = true);
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
 	bool CompressDiffs(std::vector<std::string> files, std::string outFile);
-	bool RunCurrentPC(uintptr_t nStepsDeep);
-	bool Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
-	bool TryRun(uintptr_t pEntry, uintptr_t nStepsDeep = 0); // 0 - unlim
+	bool RunCurrentPC(uintptr_t nStepsDeep, bool bSeh = true);
+	bool TryRun(uintptr_t pEntry, uintptr_t nStepsDeep = 0, bool bSeh = true); // 0 - unlim
+	bool Run(uintptr_t pEntry, uintptr_t nStepsDeep = 0, bool bSeh = true); // 0 - unlim
+	bool RunOnly(uintptr_t pEntry, uintptr_t nStepsDeep, bool bSeh); // 0 - unlim
 	void Pause();
 	void Resume();
 	void Stop();
@@ -1065,11 +1080,15 @@ private:
 	uintptr_t m_stackEPSize = 0x100; // m_bX64 ? 0x20 : 8
 	uintptr_t m_allocBase = 0x20000000;
 	uintptr_t m_allocCursor = 0x20000000;
-	uintptr_t m_fsBase = 0; // 0x7FFDF000 TEB normal when?? fs:/MSR TEB TB FS SEH PEB MSR_FS_BASE MSR IRP
+	uintptr_t m_fsBase = 0; // 0x7FFDF000 0x000000007FFDF000 TEB normal when?? fs:/MSR TEB TB FS SEH PEB MSR_FS_BASE MSR IRP
 	uintptr_t m_fsSize = 0;
 	uintptr_t m_fsLastError = ERROR_SUCCESS; // TODO: move into fs:teb
 	uintptr_t m_halt = 0x0; // 0x0 0x13371337 0xDEADBEEF
 	uintptr_t m_lastPC = 0;
+	std::vector<uint8_t> m_DebugCanarySecurityInitCookie;
+	uintptr_t __security_cookie = 0;
+	std::vector<uintptr_t> m_RestartICPoints;
+	uintptr_t m_unhandledExceptionFilter = 0;
 
 	uintptr_t m_instrCount = 0;
 	uintptr_t m_nRunStepsDeep = 0;
