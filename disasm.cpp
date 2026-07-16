@@ -1358,6 +1358,7 @@ void AsmRunner::Shutdown()
     m_rttrace.cb = nullptr;
     m_rttrace.rva = false;
     m_rttrace.disasm = false;
+    m_rttrace.bin = false;
     m_rttrace.inited = false;
     m_rttrace.rwhistory.bUseRWHistory = false;
     m_rttrace.rwhistory.bRead = false;
@@ -1995,17 +1996,26 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
         // dz default trace
         if (!dz->skipTrace && m_rttrace.inited && m_rttrace.anyjmpmode == 0 && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
         {
-            uintptr_t outPc = curPc;
-            if (m_rttrace.rva)
-                outPc = curPc - m_modStart;
-            if (m_rttrace.aslr != 0)
-                outPc = curPc - m_modStart + m_rttrace.aslr;
-
-            if (m_rttrace.disasm) {
-                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << ' ' << DisassembleWithZydis() << '\n';
+            if (m_rttrace.bin) // asm
+            {
+                std::vector<uint8_t> bytes;
+                bool bReadOk = ReadBytes(uc, address, size, bytes);
+                m_rttrace.file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             }
-            else {
-                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+            else // text
+            {
+                uintptr_t outPc = curPc;
+                if (m_rttrace.rva)
+                    outPc = curPc - m_modStart;
+                if (m_rttrace.aslr != 0)
+                    outPc = curPc - m_modStart + m_rttrace.aslr;
+
+                if (m_rttrace.disasm) {
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << ' ' << DisassembleWithZydis() << '\n';
+                }
+                else {
+                    m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+                }
             }
 
             if (m_rttrace.cb)
@@ -2185,18 +2195,28 @@ void AsmRunner::_OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t siz
     }
 
     // default trace
-    if (m_rttrace.inited && m_rttrace.anyjmpmode == 0 && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset) {
-        uintptr_t outPc = curPc;
-        if (m_rttrace.rva)
-            outPc = curPc - m_modStart;
-        if (m_rttrace.aslr != 0)
-            outPc = curPc - m_modStart + m_rttrace.aslr;
-
-        if (m_rttrace.disasm) {
-            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << ' ' << DisassembleWithZydis() << '\n';
+    if (m_rttrace.inited && m_rttrace.anyjmpmode == 0 && m_rttrace.file.is_open() && m_instrCount > m_rttrace.icoffset)
+    {
+        if (m_rttrace.bin) // asm
+        {
+            std::vector<uint8_t> bytes;
+            bool bReadOk = ReadBytes(uc, address, size, bytes);
+            m_rttrace.file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }
-        else {
-            m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+        else // text
+        {
+            uintptr_t outPc = curPc;
+            if (m_rttrace.rva)
+                outPc = curPc - m_modStart;
+            if (m_rttrace.aslr != 0)
+                outPc = curPc - m_modStart + m_rttrace.aslr;
+
+            if (m_rttrace.disasm) {
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << ' ' << DisassembleWithZydis() << '\n';
+            }
+            else {
+                m_rttrace.file << "0x" << std::hex << std::uppercase << outPc << '\n';
+            }
         }
 
         if (m_rttrace.cb)
@@ -2397,7 +2417,7 @@ bool AsmRunner::_OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uin
 //    }
 //#endif
 
-    if (address == __security_cookie) {
+    if (__security_cookie != 0 && address == __security_cookie) {
         const char* typeStr = isRead ? "READ" : (isWrite ? "WRITE" : (isAnyFetch ? "FETCH" : "UNKNOWN"));
         char msg[256];
         snprintf(msg, sizeof(msg), "OnMemory %s __security_cookie trigger at 0x%p (size=%u, value=0x%p)", typeStr, (void*)address, size, value);
@@ -5565,12 +5585,15 @@ bool AsmRunner::StackSetValue(uintptr_t v, bool bEsp, int32_t nIdx)
     return uc_mem_write(m_uc, addr, &v, ptrSize) == UC_ERR_OK;
 }
 
-bool AsmRunner::StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl)
+bool AsmRunner::StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl, bool bSkipRetAddrInStack)
 {
     v = 0;
 
     if (!m_uc || !m_bInitedStack)
         return false;
+
+    if (bSkipRetAddrInStack)
+        ++idx; // in stack not extracted return addr
 
     if (IsX64())
     {
@@ -8035,6 +8058,7 @@ void AsmRunner::SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb, bool
     m_rttrace.cb = cb;
     m_rttrace.rva = bRVA;
     m_rttrace.disasm = bDisasm;
+    m_rttrace.bin = false;
 
     m_rttrace.rwhistory.bUseRWHistory = false;
     m_rttrace.rwhistory.bRead = false;
@@ -8084,6 +8108,20 @@ void AsmRunner::SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb, 
     m_rttrace.rwhistory.bSym = bSym;
     m_rttrace.rwhistory.bShortFmt = bShortFmt;
     m_rttrace.rwhistory.bDisasm = bDisasmRW;
+
+    m_rttrace.inited = true;
+}
+
+void AsmRunner::SetPCTraceBin(const char* szPCTraceFileOutPath, OnOpcodeCb cb, uintptr_t nICOffset)
+{
+    if (m_rttrace.inited) {
+        if (m_bLogRunner)
+            Log("[!] SetPCTraceBin: trace already initialized");
+        return;
+    }
+
+    SetPCTrace(szPCTraceFileOutPath, cb, false, 0, nICOffset, 0, false);
+    m_rttrace.bin = true;
 
     m_rttrace.inited = true;
 }
@@ -11851,6 +11889,36 @@ void AsmRunner::FileClose(FILE* file)
 {
     if (file)
         fclose(file);
+}
+
+bool AsmRunner::SaveBuffer(const char* filename, uintptr_t pBuff, uintptr_t size)
+{
+    if (!filename || !pBuff || size == 0) return false;
+
+    FILE* file = FileOpen(filename, "wb");
+    if (!file) return false;
+
+    bool success = true;
+    size_t written = fwrite(reinterpret_cast<const void*>(pBuff), 1, size, file);
+
+    if (written != size) {
+        success = false;
+    }
+
+    FileClose(file);
+    return success;
+}
+
+void* AsmRunner::LoadBuffer(const char* filename, uintptr_t& size)
+{
+    if (!filename) return nullptr;
+    FILE* file = FileOpen(filename, "rb");
+    if (!file) return nullptr;
+    size = FileSize(file);
+    char* buffer = (char*)malloc(size);
+    size_t bytesRead = FileRead(file, buffer, size);
+    FileClose(file);
+    return buffer;
 }
 
 AsmRunner::tMemSnapshot AsmRunner::MakeSnapshot(uintptr_t pStart, uintptr_t pEnd)

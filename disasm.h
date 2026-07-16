@@ -65,7 +65,7 @@
 #define AR_HALT_ADDR_ONLY // fast + correct halt shutdown log, the rest is neat (unmapped execute)
 //#define AR_BP_AFTER_DZ // faster dz
 //#define AR_BP_RANGE // size or range
-#define AR_DFT // BPF verifier per-register parent pointers bpf_reg_state // Data Flow Tracing, Taint Tracking Data Tracking
+#define AR_DFT // BPF verifier per-register parent pointers bpf_reg_state // Data Flow Tracing, Taint Tracking Data Tracking // TODO: SMT-решатель Z3 Bitwuzla
 #define AR_NTCORE_PATCH // SMC crash fix
 //#define AR_STATE_SEG // не включать, ломает уебанские нерабочие сегменты, size не тот и тд
 
@@ -83,6 +83,8 @@
 // сшивания TCG Translation Blocks tb_add_jump chaining translation blocks (TB chaining)  краш на SMC коде
 // 
 //#define AR_TRY_FIX_TCG // self-modifying SMC
+
+//unicorn qemu triton titan remill MogVMP SMT-решатели mba llvm ir Z3 Bitwuzla
 
 #include <vector>
 #include <map> // X_bound
@@ -279,7 +281,7 @@ public:
 	uintptr_t GetDisasmCASLR() const { return m_DisasmCustomASLR; }
 	void SetDisasmSepGroup(uintptr_t disasmSepGroup) { m_DisasmSepGroup = disasmSepGroup; }
 	bool IsDisasmSepGroup() const { return m_DisasmSepGroup; }
-	uintptr_t CalcWithCASLR(uintptr_t p) const { return p - GetModStart() + GetDisasmCASLR(); }
+	uintptr_t CalcWithCASLR(uintptr_t p) const { return (p - GetModStart()) + GetDisasmCASLR(); }
 	void SetLogDisasm(bool enabled) { m_bLogDisasm = enabled; }
 	bool IsLogDisasm() const { return m_bLogDisasm; }
 	void SetLogDisasmRawBytes(bool enabled) { m_bLogDisasmRawBytes = enabled; }
@@ -469,7 +471,7 @@ public:
 	uintptr_t StackAt(bool bEsp = true, int32_t nIdx = 0);
 	bool StackSetValue(uintptr_t v, bool bEsp = true, int32_t nIdx = 0);
 	// вызывать StackGetArg после call перед эпилогом, после stackpop return address
-	bool StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl); // true=stdcall pop like, false=cdecl peek
+	bool StackGetArg(uintptr_t& v, uint32_t idx, bool bShouldPopArgs_NoCdecl, bool bSkipRetAddrInStack = false); // true=stdcall pop like, false=cdecl peek
 	void InitialiseSegmentRegisters();
 	uintptr_t ExtractAnyIpTransferReturn(ZydisMnemonic mn, uintptr_t from, uint32_t size);
 	void SetTeb(uintptr_t pAddr = 0, uintptr_t nSize = 0, bool bUseDefaultAddr = false);
@@ -529,7 +531,8 @@ public:
 	tFuncNode GetModuleExport(const char* szModule, const char* szExportName);
 	void SetPCTrace(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0, bool bDisasm = true);
 	void SetPCTraceFull(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, bool bRVA = true, uintptr_t pASLR = 0, uintptr_t nICOffset = 0, uint32_t nAnyJmpMode = 0, bool bDisasm = true,
-		bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bSym = true, bool bShortFmt = false, bool bDisasmRW = true);
+		bool bRead = true, bool bWrite = true, bool bValNotice = true, bool bSym = true, bool bShortFmt = false, bool bDisasmRW = true); // asm+rwhistory
+	void SetPCTraceBin(const char* szPCTraceFileOutPath, OnOpcodeCb cb = nullptr, uintptr_t nICOffset = 0); // pc unroll для static SMT-решателя and (DSE)
 	void ComparePCTrace(const char* szPCTraceA, const char* szPCTraceB, bool bAll, const char* szOutFileCompare = nullptr); // лучше юзай WinMerge
 	bool CompressDiffs(std::vector<std::string> files, std::string outFile);
 	bool RunCurrentPC(uintptr_t nStepsDeep, bool bSeh = true);
@@ -638,6 +641,8 @@ public:
 	static void FileWrite(FILE* file, void* pb, size_t sz);
 	static void FileAdd(FILE* file, const char* fmt, ...);
 	static void FileClose(FILE* file);
+	static bool SaveBuffer(const char* filename, uintptr_t pBuff, uintptr_t size);
+	static void* LoadBuffer(const char* filename, uintptr_t& size);
 
 	// Snapshot
 	struct tMemSnapshot
@@ -946,6 +951,7 @@ private:
 		OnOpcodeCb cb;
 		bool rva;
 		bool disasm;
+		bool bin;
 		bool inited;
 
 		struct tRWHistoryArgs
@@ -1166,7 +1172,7 @@ private:
 	void _OnInstructionStep(uc_engine* uc, uint64_t address, uint32_t size, void* user_data); // дизасм + user cb + брейкпоинты + трасировка
 	bool _OnMemory(uc_engine* uc, uc_mem_type type, uint64_t address, uint32_t size, int64_t value, void* user_data); // лог rw + user cb + трасировка mem
 	bool _OnInsn(tInsnHookNode* hook, uc_engine* uc);
-	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data); // jmp/call/ret детектируется в _OnInstructionStep
+	bool _OnAnyJmp(uc_engine* uc, uintptr_t from, uintptr_t to, uint32_t size, ZydisMnemonic mnemonic, bool bIsCondMn, bool bCond, bool bIsInvMn, void* user_data); // jmp/call/ret детектируется в _OnInstructionStep // ещё можно сохранить nextpc pc+len и сверить на некст опкоде с предиктом - не значит onanyjmp (priority after)
 	bool _OnBreakpoint(const tBpInfo& bp, uc_engine* uc, uint64_t address, uint32_t size, void* user_data, bool bMemory, uc_mem_type type, int64_t value);
 	void _OnTraceStep(uc_engine* uc, uintptr_t address, uint32_t sz); // запись шага трасировки в Tenet-файл
 
